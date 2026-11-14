@@ -933,6 +933,238 @@ check(
 }
 
 // ===========================================================================
+// Part A.2 — Account pool priority (§2.2).
+// ===========================================================================
+
+// A31: highest priority tier is picked first among available accounts
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-highest-"));
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      low: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+      high: { cooldownUntilMs: 0, lastUsedMs: 200, lastError: null, priority: 20 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "low", home: join(dir, "accounts", "low"), proxy: null },
+    { label: "high", home: join(dir, "accounts", "high"), proxy: null },
+  ];
+  const picked = pickAccount(l, homes);
+  check(
+    "priority/highest-tier-picked-first",
+    picked?.label === "high",
+    `picked: ${picked?.label}`,
+  );
+}
+
+// A32: equal priorities follow LRU by lastUsedMs, with label tie-break
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-lru-"));
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 20 },
+      a2: { cooldownUntilMs: 0, lastUsedMs: 200, lastError: null, priority: 20 },
+      a3: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 20 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "a1", home: join(dir, "accounts", "a1"), proxy: null },
+    { label: "a2", home: join(dir, "accounts", "a2"), proxy: null },
+    { label: "a3", home: join(dir, "accounts", "a3"), proxy: null },
+  ];
+  const picked1 = pickAccount(l, homes);
+  // a2 has lowest lastUsedMs (200 vs 500)
+  markAccountUse(l, "a2");
+  // now a1 and a3 both have 500, label tie-break chooses a1
+  const picked2 = pickAccount(l, homes);
+  check(
+    "priority/equal-priority-lru-and-tiebreak",
+    picked1?.label === "a2" && picked2?.label === "a1",
+    `picked1: ${picked1?.label}, picked2: ${picked2?.label}`,
+  );
+}
+
+// A33: cooled-down higher tier yields to available lower tier
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-cooldown-fallback-"));
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      high: { cooldownUntilMs: Date.now() + 60_000, lastUsedMs: 100, lastError: "quota 429", priority: 20 },
+      low: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "high", home: join(dir, "accounts", "high"), proxy: null },
+    { label: "low", home: join(dir, "accounts", "low"), proxy: null },
+  ];
+  const picked = pickAccount(l, homes);
+  check(
+    "priority/cooled-higher-tier-yields-to-lower",
+    picked?.label === "low",
+    `picked: ${picked?.label}`,
+  );
+}
+
+// A34: priority 0 is NEVER picked, even if only free account, and excluded from "whole pool cooling" fallback
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-zero-never-"));
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      p0: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+      coolingHigh: { cooldownUntilMs: Date.now() + 60_000, lastUsedMs: 100, lastError: "quota", priority: 20 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "p0", home: join(dir, "accounts", "p0"), proxy: null },
+    { label: "coolingHigh", home: join(dir, "accounts", "coolingHigh"), proxy: null },
+  ];
+  // p0 is free, but priority 0 is NEVER picked; fallback picks coolingHigh whose window opens in tier 20
+  const picked1 = pickAccount(l, homes);
+
+  // If only priority 0 accounts exist, pickAccount returns null honestly
+  const pickedNull = pickAccount(l, [{ label: "p0", home: join(dir, "accounts", "p0"), proxy: null }]);
+
+  // Even when all accounts are cooling down, priority 0 is not picked in fallback
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      p0: { cooldownUntilMs: Date.now() + 10_000, lastUsedMs: 0, lastError: null, priority: 0 },
+      coolingLow: { cooldownUntilMs: Date.now() + 30_000, lastUsedMs: 0, lastError: null, priority: 10 },
+    },
+  });
+  const l2 = loadLedger(dir);
+  const pickedFallback = pickAccount(l2, [
+    { label: "p0", home: join(dir, "accounts", "p0"), proxy: null },
+    { label: "coolingLow", home: join(dir, "accounts", "coolingLow"), proxy: null },
+  ]);
+
+  check(
+    "priority/zero-never-picked-and-not-in-fallback",
+    picked1?.label === "coolingHigh" && pickedNull === null && pickedFallback?.label === "coolingLow",
+    `picked1: ${picked1?.label}, pickedNull: ${pickedNull}, fallback: ${pickedFallback?.label}`,
+  );
+}
+
+// A35: missing or invalid priority defaults to 10
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-default-"));
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      missing: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null },
+      negative: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: -5 },
+      nonInt: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 15.5 },
+      str: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: "99" },
+      high: { cooldownUntilMs: 0, lastUsedMs: 200, lastError: null, priority: 15 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "missing", home: join(dir, "accounts", "missing"), proxy: null },
+    { label: "negative", home: join(dir, "accounts", "negative"), proxy: null },
+    { label: "nonInt", home: join(dir, "accounts", "nonInt"), proxy: null },
+    { label: "str", home: join(dir, "accounts", "str"), proxy: null },
+    { label: "high", home: join(dir, "accounts", "high"), proxy: null },
+  ];
+  // high has priority 15, beats defaults (10)
+  const picked1 = pickAccount(l, homes);
+  // among the defaults (10), LRU applies
+  const defaultsOnly = homes.filter((h) => h.label !== "high");
+  const picked2 = pickAccount(l, defaultsOnly);
+  check(
+    "priority/invalid-or-missing-defaults-to-10",
+    picked1?.label === "high" && ["missing", "negative", "nonInt", "str"].includes(picked2?.label ?? ""),
+    `picked1: ${picked1?.label}, picked2: ${picked2?.label}`,
+  );
+}
+
+// A36: lower tier writes markAccountUse and participates in LRU within its tier
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-lower-lru-"));
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      high: { cooldownUntilMs: Date.now() + 60_000, lastUsedMs: 100, lastError: "quota", priority: 20 },
+      low1: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+      low2: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "high", home: join(dir, "accounts", "high"), proxy: null },
+    { label: "low1", home: join(dir, "accounts", "low1"), proxy: null },
+    { label: "low2", home: join(dir, "accounts", "low2"), proxy: null },
+  ];
+  // low1 picked by tie-break
+  const picked1 = pickAccount(l, homes);
+  markAccountUse(l, picked1.label);
+  // next pick must be low2 because low1 now has higher lastUsedMs
+  const picked2 = pickAccount(l, homes);
+  check(
+    "priority/lower-tier-writes-use-and-participates-in-tier-lru",
+    picked1?.label === "low1" && picked2?.label === "low2" && l.accounts.low1.lastUsedMs > 100,
+    `picked1: ${picked1?.label}, picked2: ${picked2?.label}, low1 used: ${l.accounts.low1?.lastUsedMs}`,
+  );
+}
+
+// A37: shared-owned: overlay does not carry priority, merge leaves priority intact, helpers do not touch priority
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-shared-owned-"));
+  mkdirSync(join(dir, "accounts", "a1"), { recursive: true });
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 25 },
+    },
+  });
+  const l = loadLedger(dir);
+  markAccountCooldown(l, "a1", Date.now() + 3_600_000, "quota 429");
+  markAccountUse(l, "a1");
+  markAccountIneligible(l, "a1", { parkedReason: "auth-dead" });
+  saveLedger(dir, l);
+
+  const ov = readJson(join(dir, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(dir, "accounts-state.json"))?.accounts ?? {};
+  const l2 = loadLedger(dir);
+
+  check(
+    "priority/shared-owned-overlay-discipline",
+    ov.a1?.priority === undefined &&
+      sh.a1?.priority === 25 &&
+      l2.accounts.a1?.priority === 25,
+    JSON.stringify({ ovPriority: ov.a1?.priority, shPriority: sh.a1?.priority, l2Priority: l2.accounts.a1?.priority }),
+  );
+}
+
+// A38: fallback when all candidates cooling down operates strictly within the highest present tier
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-fallback-highest-tier-"));
+  const now = Date.now();
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      // Tier 20: windows open later (2000 and 3000 ms)
+      high1: { cooldownUntilMs: now + 3000, lastUsedMs: 100, lastError: "quota", priority: 20 },
+      high2: { cooldownUntilMs: now + 2000, lastUsedMs: 100, lastError: "quota", priority: 20 },
+      // Tier 10: window opens earlier (1000 ms)
+      low: { cooldownUntilMs: now + 1000, lastUsedMs: 100, lastError: "quota", priority: 10 },
+    },
+  });
+  const l = loadLedger(dir);
+  const homes = [
+    { label: "high1", home: join(dir, "accounts", "high1"), proxy: null },
+    { label: "high2", home: join(dir, "accounts", "high2"), proxy: null },
+    { label: "low", home: join(dir, "accounts", "low"), proxy: null },
+  ];
+  // Fallback must pick high2 (earliest window within tier 20), NOT low (even though low opens sooner)
+  const picked = pickAccount(l, homes);
+  check(
+    "priority/all-cooling-fallback-within-highest-tier",
+    picked?.label === "high2",
+    `picked: ${picked?.label}`,
+  );
+}
+
+// ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================
 const workspace = join(rootA, "ws");

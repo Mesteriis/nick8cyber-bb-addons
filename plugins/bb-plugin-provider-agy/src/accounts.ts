@@ -54,6 +54,25 @@ export interface AccountLedgerEntry {
   ineligibleAtMs?: number;
   /** Why the account is parked, when the cause is finer than eligibility. */
   parkedReason?: "auth-dead" | string;
+  /**
+   * Numeric pool priority: integer >= 0, default 10.
+   * 0 = disabled from rotation (never picked).
+   * Shared-owned field: lives in accounts-state.json only, ignored by overlay.
+   */
+  priority?: number;
+}
+
+export const DEFAULT_ACCOUNT_PRIORITY = 10;
+
+/**
+ * Returns account priority: integer >= 0, default 10 if missing, not an integer, or < 0.
+ */
+export function accountPriority(entry: AccountLedgerEntry | undefined): number {
+  const p = entry?.priority;
+  if (typeof p === "number" && Number.isInteger(p) && p >= 0) {
+    return p;
+  }
+  return DEFAULT_ACCOUNT_PRIORITY;
 }
 
 export interface AccountsLedger {
@@ -240,6 +259,7 @@ export function loadLedger(dataDir: string): AccountsLedger {
         lastError: o.lastError ?? null,
         ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
         ...(parkedReason !== undefined ? { parkedReason } : {}),
+        ...(s?.priority !== undefined ? { priority: s.priority } : {}),
       });
     } else if (s !== undefined) {
       setOwn(accounts, label, s);
@@ -415,9 +435,16 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
 
   writeJsonAtomic(sharedPath, {
     accounts: Object.fromEntries(
-      Object.entries(ledger.accounts).filter(
-        ([label]) => !isGhostLabel(label),
-      ),
+      Object.entries(ledger.accounts)
+        .filter(([label]) => !isGhostLabel(label))
+        .map(([label, entry]) => {
+          const diskPriority = diskSharedAccounts[label]?.priority;
+          const priority = diskPriority !== undefined ? diskPriority : entry.priority;
+          return [
+            label,
+            priority !== undefined ? { ...entry, priority } : entry,
+          ];
+        }),
     ),
   });
 }
@@ -519,10 +546,13 @@ export function conversationAccount(
 }
 
 /**
- * Pick the account a session should run on: not cooling, least recently
- * used, never the excluded one (the account that just burnt). When every
- * account is cooling, the one whose window opens first is still returned —
- * a rough estimate beats refusing to spawn.
+ * Pick the account a session should run on (§2.2):
+ * - Candidates: not excludeLabel and priority > 0 (priority 0 is never picked).
+ * - Choose highest priority among available accounts (cooldownUntilMs <= now).
+ * - Within that tier: LRU by lastUsedMs, tie-break label.
+ * - When every candidate is cooling down: fallback to the account whose window
+ *   opens first within the highest present tier (priority 0 not included).
+ * - When all candidates have priority 0: returns null.
  */
 export function pickAccount(
   ledger: AccountsLedger,
@@ -530,24 +560,45 @@ export function pickAccount(
   excludeLabel?: string | null,
 ): AccountHome | null {
   const now = Date.now();
-  const candidates = accounts.filter((a) => a.label !== excludeLabel);
+  const entryOf = (label: string): AccountLedgerEntry | undefined =>
+    Object.hasOwn(ledger.accounts, label) ? ledger.accounts[label] : undefined;
+  const priorityOf = (a: AccountHome): number =>
+    accountPriority(entryOf(a.label));
+  const cooldown = (a: AccountHome): number =>
+    entryOf(a.label)?.cooldownUntilMs ?? 0;
+
+  const candidates = accounts.filter(
+    (a) => a.label !== excludeLabel && priorityOf(a) > 0,
+  );
   if (candidates.length === 0) {
     return null;
   }
-  const entryOf = (label: string): AccountLedgerEntry | undefined =>
-    Object.hasOwn(ledger.accounts, label) ? ledger.accounts[label] : undefined;
-  const cooldown = (a: AccountHome): number =>
-    entryOf(a.label)?.cooldownUntilMs ?? 0;
+
   const available = candidates.filter((a) => cooldown(a) <= now);
-  const pool = available.length > 0 ? available : candidates;
-  pool.sort(
+  if (available.length > 0) {
+    const maxPriority = Math.max(...available.map(priorityOf));
+    const tier = available.filter((a) => priorityOf(a) === maxPriority);
+    tier.sort(
+      (a, b) =>
+        (entryOf(a.label)?.lastUsedMs ?? 0) -
+          (entryOf(b.label)?.lastUsedMs ?? 0) ||
+        a.label.localeCompare(b.label),
+    );
+    return tier[0];
+  }
+
+  // All candidates are cooling down: fallback to the account whose window
+  // opens first within the highest present tier.
+  const maxPriority = Math.max(...candidates.map(priorityOf));
+  const tier = candidates.filter((a) => priorityOf(a) === maxPriority);
+  tier.sort(
     (a, b) =>
       cooldown(a) - cooldown(b) ||
       (entryOf(a.label)?.lastUsedMs ?? 0) -
         (entryOf(b.label)?.lastUsedMs ?? 0) ||
       a.label.localeCompare(b.label),
   );
-  return pool[0];
+  return tier[0];
 }
 
 export function accountByLabel(

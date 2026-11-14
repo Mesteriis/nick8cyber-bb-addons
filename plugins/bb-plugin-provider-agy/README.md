@@ -400,6 +400,17 @@ which also remembers which account owns which conversation) and:
   reopens (the quota auto-retry bounds below apply); the conversation
   resumes.
 
+#### Account priority and pool tiers
+
+Account selection order in the pool is governed by a numeric priority — layered on top of LRU:
+
+- **`accounts[label].priority` in `accounts-state.json`**: integer `≥ 0`. Missing, non-number, or `< 0` defaults to `10`. The field is **shared-owned**: it lives only in `accounts-state.json`, is set by operators on the owner instance (atomic write), and syncs to satellites via the keeper sync; `accounts-overlay.json` never carries it and local merges do not touch it.
+- **`priority: 0`**: the account is **never** picked for new sessions or rotations (excluded from candidate selection without setting cooldowns or parking). Existing pinned conversations, `thread/resume` on the owner, and explicit label requests remain unaffected.
+- **Tier selection (`pickAccount`)**: candidates (`≠ excludeLabel` and `priority > 0`) are grouped into priority tiers. The pool selects the LRU account (least recently used by `lastUsedMs`, tie-break by `label`) from the **highest available tier** (`cooldownUntilMs ≤ now`). Lower priority tiers act as reserve classes: they only take turns when all accounts in higher tiers are cooling down.
+- **Whole pool cooling fallback**: when all candidates across all tiers are cooling down, the fallback ("window opens earliest") is evaluated strictly within the **highest present tier** (not across the entire pool); `priority: 0` accounts are excluded.
+- **Honest failure**: if all pool accounts have `priority: 0` (or the pool is empty), `pickAccount` returns `null` and the spawn fails honestly.
+- **Backward compatibility**: a pool with no `priority` fields defaults every account to tier 10, preserving pure LRU selection.
+
 #### Account not eligible
 
 If agy reports `not eligible for Antigravity` or `verify your account`, the bridge parks that pool account and re-runs the failed turn on a free sibling after about one second. Verification refusals use a 24-hour cooldown. The refusal `not eligible for Antigravity, because it is not currently available in your location` uses a separate 2-hour cooldown and is logged with reason `location`; it may have no verification URL. A refusal that also requests verification or supplies a verification URL uses the verification cooldown.
