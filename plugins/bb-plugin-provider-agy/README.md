@@ -408,7 +408,7 @@ Account selection order in the pool is governed by a numeric priority — layere
 - **`priority: 0`**: the account is **never** picked for new sessions or rotations (excluded from candidate selection without setting cooldowns or parking). Existing pinned conversations, `thread/resume` on the owner, and explicit label requests remain unaffected.
 - **Tier selection (`pickAccount`)**: candidates (`≠ excludeLabel` and `priority > 0`) are grouped into priority tiers. The pool selects the LRU account (least recently used by `lastUsedMs`, tie-break by `label`) from the **highest available tier** (`cooldownUntilMs ≤ now`). Lower priority tiers act as reserve classes: they only take turns when all accounts in higher tiers are cooling down.
 - **Whole pool cooling fallback**: when all candidates across all tiers are cooling down, the fallback ("window opens earliest") is evaluated strictly within the **highest present tier** (not across the entire pool); `priority: 0` accounts are excluded.
-- **Honest failure**: if all pool accounts have `priority: 0` (or the pool is empty), `pickAccount` returns `null` and the spawn fails honestly.
+- **Pool-less fallback**: if all pool accounts have `priority: 0` (or the pool is empty), `pickAccount` returns `null` and the session is not pinned to a pool account — like an empty pool it runs through the cliproxy relay if configured, or in direct mode on the machine's default credential.
 - **Backward compatibility**: a pool with no `priority` fields defaults every account to tier 10, preserving pure LRU selection.
 
 #### Account not eligible
