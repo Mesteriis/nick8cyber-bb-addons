@@ -29,6 +29,7 @@ process.env.AGY_CLIPROXY = "0";
 process.env.AGY_AUTO_RETRY_MAX = "1";
 process.env.AGY_FAKE_ERROR_MODE = "pool-retry";
 process.env.AGY_IDLE_KILL_MS = "1500";
+process.env.AGY_TRANSPORT ??= "stream-json";
 
 // The pool: a2 is the one with an egress proxy.
 for (const label of ["a1", "a2", "a3"]) {
@@ -143,6 +144,32 @@ const ledger = (() => {
 })();
 const replacedList = replaced();
 
+const { pickAccount, accountPriority } = await import(
+  new URL("./src/accounts.ts", import.meta.url).href
+);
+const prioTestHomes = [
+  { label: "prio-low", home: join(root, "accounts", "a1"), proxy: null },
+  { label: "prio-high", home: join(root, "accounts", "a2"), proxy: null },
+  { label: "prio-zero", home: join(root, "accounts", "a3"), proxy: null },
+];
+const prioTestLedger = {
+  accounts: {
+    "prio-low": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    "prio-high": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 20 },
+    "prio-zero": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+  },
+  conversations: {},
+};
+const prioPickedHigh = pickAccount(prioTestLedger, prioTestHomes);
+prioTestLedger.accounts["prio-high"].cooldownUntilMs = Date.now() + 60_000;
+const prioPickedLow = pickAccount(prioTestLedger, prioTestHomes);
+prioTestLedger.accounts["prio-low"].cooldownUntilMs = Date.now() + 60_000;
+const prioFallbackHigh = pickAccount(prioTestLedger, prioTestHomes);
+const prioZeroOnly = pickAccount(
+  { accounts: { z: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 } }, conversations: {} },
+  [{ label: "z", home: "", proxy: null }],
+);
+
 const checks = [
   ["pool/homes-visited-in-order", envs.length === 5 && ["a1", "a2", "a3", "a3", "a3"].every((l, i) => envs[i]?.__env?.HOME === join(root, "accounts", l)), JSON.stringify(envs.map((e) => e?.__env?.HOME))],
   ["pool/failures-then-completion", bs.length === 5 && bs.slice(0, 3).every((b) => b.status === "failed") && bs[3].status === "completed" && bs[4].status === "completed", JSON.stringify(bs.map((b) => b.status))],
@@ -153,6 +180,14 @@ const checks = [
   ["pool/conversation-mapped-to-a3", ledger.conversations["fake-conv-errors"] === "a3", JSON.stringify(ledger.conversations)],
   ["pool/idle-released-the-child", spawnsBeforeTurnTwo === 4, `${spawnsBeforeTurnTwo} spawns before the idle gap`],
   ["pool/idle-restore-same-home-resume", envs.length === 5 && envs[4]?.__env?.HOME === join(root, "accounts", "a3") && envs[4]?.__argv?.includes("--conversation") === true, JSON.stringify(envs[4] ?? {})],
+  ["pool/priority-tier-high-over-low", prioPickedHigh?.label === "prio-high", prioPickedHigh?.label ?? "none"],
+  ["pool/priority-cooldown-yields-to-lower", prioPickedLow?.label === "prio-low", prioPickedLow?.label ?? "none"],
+  ["pool/priority-all-cooling-fallback-highest-tier", prioFallbackHigh?.label === "prio-high", prioFallbackHigh?.label ?? "none"],
+  ["pool/priority-zero-never-picked-null", prioZeroOnly === null, String(prioZeroOnly)],
+  ["pool/priority-backward-compat-default-10",
+    accountPriority(ledger.accounts.a1) === 10 &&
+    (ledger.accounts.a1?.priority ?? undefined) === undefined,
+    `a1 priority default: ${accountPriority(ledger.accounts.a1)}`],
 ];
 
 say("==== account pool report ====");
