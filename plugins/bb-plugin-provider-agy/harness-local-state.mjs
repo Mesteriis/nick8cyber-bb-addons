@@ -1164,6 +1164,50 @@ check(
   );
 }
 
+// A39: operator deletes priority from disk -> next saveLedger does not resurrect it
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-priority-operator-deleted-"));
+  mkdirSync(join(dir, "accounts", "a1"), { recursive: true });
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 25 },
+    },
+  });
+  const l = loadLedger(dir);
+  check(
+    "priority/loaded-initial-priority",
+    l.accounts.a1?.priority === 25,
+    `initial: ${l.accounts.a1?.priority}`,
+  );
+
+  // Operator deletes priority on disk
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+
+  // Next saveLedger must not resurrect priority from in-memory stale record
+  markAccountUse(l, "a1");
+  saveLedger(dir, l);
+
+  const sh = readJson(join(dir, "accounts-state.json"))?.accounts ?? {};
+  check(
+    "priority/operator-deleted-not-resurrected",
+    Object.hasOwn(sh, "a1") && !Object.hasOwn(sh.a1, "priority"),
+    JSON.stringify(sh.a1),
+  );
+
+  // Subsequent saveLedger also does not resurrect priority
+  saveLedger(dir, l);
+  const sh2 = readJson(join(dir, "accounts-state.json"))?.accounts ?? {};
+  check(
+    "priority/operator-deleted-stays-absent-subsequent-save",
+    Object.hasOwn(sh2, "a1") && !Object.hasOwn(sh2.a1, "priority"),
+    JSON.stringify(sh2.a1),
+  );
+}
+
 // ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================

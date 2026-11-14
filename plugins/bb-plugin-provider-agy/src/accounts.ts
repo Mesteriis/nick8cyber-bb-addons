@@ -438,11 +438,22 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
       Object.entries(ledger.accounts)
         .filter(([label]) => !isGhostLabel(label))
         .map(([label, entry]) => {
-          const diskPriority = diskSharedAccounts[label]?.priority;
-          const priority = diskPriority !== undefined ? diskPriority : entry.priority;
+          const hasDisk = Object.hasOwn(diskSharedAccounts, label);
+          const diskPriority = hasDisk
+            ? diskSharedAccounts[label]?.priority
+            : undefined;
+          const priority = hasDisk ? diskPriority : entry.priority;
+          if (hasDisk) {
+            if (diskPriority !== undefined) {
+              entry.priority = diskPriority;
+            } else {
+              delete entry.priority;
+            }
+          }
+          const { priority: _stalePriority, ...rest } = entry;
           return [
             label,
-            priority !== undefined ? { ...entry, priority } : entry,
+            priority !== undefined ? { ...rest, priority } : rest,
           ];
         }),
     ),
