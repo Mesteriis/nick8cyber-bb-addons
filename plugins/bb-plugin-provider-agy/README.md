@@ -380,11 +380,12 @@ accounts/<label>/.gemini/antigravity-cli/antigravity-oauth-token   the credentia
 accounts/<label>/proxy                                             optional egress proxy
 ```
 
-Every parallel thread session gets pinned to its own account (least
-recently used among the healthy ones), so its requests, token refreshes and
-installation identity all live in that home — nothing shared, nothing to
-race on (agy REWRITES its token file on refresh, which is exactly why the
-pool is homes and not one swapped file). A `proxy` file next to the home
+Every parallel thread session gets pinned to its own account (the least
+recently used healthy account in the highest available priority tier —
+see "Account priority and pool tiers" below), so its requests, token
+refreshes and installation identity all live in that home — nothing
+shared, nothing to race on (agy REWRITES its token file on refresh, which
+is exactly why the pool is homes and not one swapped file). A `proxy` file next to the home
 (one URL per line worth: `socks5://user:pass@host:port`) gives that account
 its own egress IP via the standard proxy envs.
 
@@ -397,8 +398,10 @@ which also remembers which account owns which conversation) and:
   it; `session/replaced` goes out with `contextLost: true`), and the
   session stays on the new account;
 - **the whole pool is burnt** — the turn re-runs when the earliest window
-  reopens (the quota auto-retry bounds below apply); the conversation
-  resumes.
+  within the highest priority tier present reopens (or the burnt
+  account's own window, if that is sooner); `priority: 0` accounts are
+  ignored — see "Account priority and pool tiers" (the quota auto-retry
+  bounds below apply); the conversation resumes.
 
 #### Account priority and pool tiers
 
