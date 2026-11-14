@@ -2,7 +2,8 @@
 title: provider-agy — восстановление после сбоев и сжатие
 status: approved
 owner: coordinator
-date: 2026-11-01
+date: 2026-11-14
+revision: 2 (§2 — выбор по тирам priority, PLUG-253)
 tags: [bb, plugins, provider-agy, recovery, compaction]
 ---
 
