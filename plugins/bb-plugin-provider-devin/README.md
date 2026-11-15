@@ -8,7 +8,7 @@
 |---|---|
 | `server.ts` | Объявление провайдера `acp-devin` и регистрация центральных настроек |
 | `src/resolve-devin-bin.mjs` | Динамический выбор бинарника и автоматический откат с `KNOWN_BAD_VERSIONS`, включая `3000.12.57`, на старшую здоровую сборку в `~/.local/share/devin/cli/_versions/<ver>/bin/devin` |
-| `host.ts` + `src/vendor/acp-bridge.js` | ACP-мост из `@get-bb/plugin-sdk` (собирается `npm run vendor`) с диалектом `devin`: фазовый вотчдог хода, двухступенчатое самовосстановление сессии (`Stage 1` с сохранением контекста через `session/load` и `Stage 2` через `~/.local/state/bb-devin/wedged-sessions.json` + `session/new`), мягкая очередь для `[bb system]` / `[orchestrator]`, синхронизация `permissionMode` (`full` → `bypass`, `accept-edits` → `accept-edits`) и сохранение правил bb треда в `~/.local/state/bb-devin/instructions/<thr>.md` |
+| `host.ts` + `src/vendor/acp-bridge.js` | ACP-мост из `@get-bb/plugin-sdk` (собирается `npm run vendor`) с диалектом `devin`: пересборка сессии при смене модели между ходами с переносом контекста через `session/load`, автоматическая изоляция заклинивших сессий при исчерпании квоты (`resource_exhausted` / `-32011`) через `wedged-sessions.json`, фазовый вотчдог хода, двухступенчатое самовосстановление сессии (`Stage 1` с сохранением контекста через `session/load` и `Stage 2` через `session/new`), мягкая очередь для `[bb system]` / `[orchestrator]`, синхронизация `permissionMode` (`full` → `bypass`, `accept-edits` → `accept-edits`) и сохранение правил bb треда в `~/.local/state/bb-devin/instructions/<thr>.md` |
 | `devin-hooks/` | Хуки Devin CLI: правила bb возвращаются после сжатия и при восстановлении сессии; защита конфигов (`~/.config/devin`, `~/.claude`, хуки); запрет блокирующего ожидания (если он есть у Claude пользователя). Раздача задач и привязка тредов — через плагин `orchestrator` (`bb orchestrator delegate`) |
 
 ## Центральная настройка субагентов
@@ -32,6 +32,12 @@ acp` локального рычага памяти нет. Memory Drive и auto
 в реестре `devin acp` нет — стемпить имена наугад значило бы врать про эффект).
 Гейт логирует «nothing applied» при запросе OFF; когда devin добавит рычаг —
 он подключается в `applyMemoryGate` (host.ts).
+
+## Смена модели и восстановление при исчерпании квоты
+
+Devin CLI не поддерживает RPC-метод динамической смены модели (`session/set_model`). При переключении модели в опциях треда мост автоматически пересобирает сессию (`rebuildAgentSession`): дочерний процесс перезапускается, а история треда прозрачно загружается через `session/load` с новой моделью.
+
+При исчерпании квоты удалённой модели (`-32011` / `resource_exhausted`) сервер Cognition навсегда блокирует сессию. Мост мгновенно изолирует её в `~/.local/state/bb-devin/wedged-sessions.json` и завершает процесс; следующий ход треда автоматически создаёт свежую сессию (`session/new`), минуя заблокированный `sessionId`.
 
 ## Переменные окружения
 

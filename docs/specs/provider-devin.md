@@ -199,7 +199,30 @@ if (session.devinCancelSent) {
      - если `contextLost === true` (новая пустая сессия `session/new`): повторяется `{ ...pending, requestId: null, alreadyAccepted: true }` с полным исходным `pending.input`, а вся очередь `session.queuedInputs` сохраняется следом.
 5. **Самоисцеление:** строго внутри `emitSessionUpdate(session, update, rawUpdate)` при `session.activePromptKind === "turn"`, `!session.devinCancelSent` и `isTurnOutputUpdate(update) === true` счётчик `stallStreak` для `session.providerThreadId` сбрасывается в `0`, а при наличии этого `sessionId` в `wedged-sessions.json` он удаляется оттуда.
 
-## 8. Права доступа и атомарность локального состояния
+## 8. Смена модели на уровне хода и автовосстановление при исчерпании квоты
+
+### 8.1. Сверка и пересборка сессии при смене модели (`reconcileExecutionSettings`)
+
+1. Devin ACP не поддерживает метод `session/set_model` (`-32601 Method not found`). Модель сессии задаётся опцией `model` из `configOptions` через `session/set_config_option` при создании или загрузке сессии.
+2. В `reconcileExecutionSettings(session, options)`:
+   - `effectiveLaunchSpec` принудительно сохраняет `options.model` (даже если `options.providerOptions.acpLaunchSpec` опущен на `turn/start`);
+   - из `session.nativeConfig?.selectedValues?.model` извлекается текущая модель сессии `prevDevinModel`, а из `nextModel ?? prevDevinModel` — целевая модель `nextDevinModel`;
+   - если `session.dialect.id === "devin"` и `prevDevinModel !== nextDevinModel`, взводится признак `devinModelChanged = true`, который принудительно выставляет `restart = true`;
+   - при `restart === true` мост инициирует `rebuildAgentSession(session)`: процесс CLI перезапускается, и история восстанавливается через `session/load` с передачей новой целевой модели в опциях сессии.
+
+### 8.2. Определение и изоляция исчерпания квоты (`isDevinResourceExhaustedError`, `wedged-sessions.json`)
+
+1. Функция `isDevinResourceExhaustedError(err)` идентифицирует отказ удалённой квоты Cognition:
+   - код ошибки `-32011`;
+   - `data?.errorKind === "resource_exhausted"`;
+   - текстовое сообщение, содержащее подстроку `/quota.*exhausted/i`.
+2. При возникновении ошибки исчерпания квоты во время `session/prompt` (`runTurn`) либо при попытке `session/load`:
+   - идентификатор сессии немедленно заносится в список заблокированных через `addWedgedDevinSession(session.providerThreadId)` (`~/.local/state/bb-devin/wedged-sessions.json`);
+   - мёртвое соединение процесса немедленно закрывается с `session.connection.kill()`;
+   - ход завершается ошибкой без зависания;
+   - последующие запросы (`turn/start`, `thread/resume`) обнаруживают `session.providerThreadId` в `wedged-sessions.json` и создают новую сессию (`session/new`), минуя заблокированный `sessionId`.
+
+## 9. Права доступа и атомарность локального состояния
 
 Все собственные файлы состояния и журналов плагина и хуков размещаются внутри каталога `~/.local/state/bb-devin/` (базовый каталог состояния может переопределяться через `BB_DEVIN_STATE_DIR` для изолированных тестов):
 
@@ -213,9 +236,9 @@ if (session.devinCancelSent) {
 | `~/.local/state/bb-devin/compacted/<session_id>` | `0o600` | создание через `os.open(..., 0o600)` |
 | `~/.local/state/bb-devin/hooks.log` | `0o600` | журнал хуков по умолчанию; если путь переопределён через `DEVIN_BB_LOG`, родительский каталог создаётся без изменения его прав (`chmod` на внешний родительский каталог вроде `/tmp` или `~/.local/state` **запрещён**) |
 
-## 9. Пользовательские хуки `devin-hooks/`
+## 10. Пользовательские хуки `devin-hooks/`
 
-### 9.1. Устойчивость к формату `stdin` и защита от обхода `GUARD_RE`
+### 10.1. Устойчивость к формату `stdin` и защита от обхода `GUARD_RE`
 
 Единый список перехватываемых инструментов записи и исполнения (совпадает в `matcher` `devin-hooks/install.py` и в логике `devin-hooks/bb_subagents.py`):
 `^(exec|write|edit|MultiEdit|apply_patch|notebook_edit|NotebookEdit|write_file|edit_file)$`.
@@ -228,14 +251,14 @@ if (session.devinCancelSent) {
 3. В `no_blocking_wait.py` при `not isinstance(tool_input, dict)` хук штатно возвращает `0`.
 4. В `bb_instructions.py` строго валидируются `BB_THREAD_ID` (`^thr_[a-z0-9]+$`) и `session_id` (`^[A-Za-z0-9_-]{1,128}$`), все типы полей события обрабатываются без необработанных исключений.
 
-### 9.2. Установщик `devin-hooks/install.py`
+### 10.2. Установщик `devin-hooks/install.py`
 
 1. **Чтение JSONC, резервная копия и отсутствующий конфиг:** если `~/.config/devin/config.json` отсутствует, установщик считает исходный объект пустым `{}` (создавая `~/.config/devin` с `0o700` при записи). При чтении существующего файла перед `json.loads` удаляются комментарии JSONC (`// ...` и `/* ... */` вне строковых литералов) и завершающие запятые; если в исходном тексте присутствовали комментарии JSONC и требуется перезапись файла, `install.py` предварительно сохраняет однократную резервную копию `<realTarget>.bak` (`0o600`), так как сериализация `json.dumps` нормализует файл в чистый JSON (документируется в `README.md`).
 2. **Режим `--check`:** формирует диагностический вывод `{"would_write_keys": {k: new[k] for k in ("hooks", "subagents_enabled", "read_config_from") if k in new}}` без `KeyError`, когда `subagents_enabled` отсутствует в исходном конфиге, и завершается кодом `0` (в том числе при отсутствующем `config.json`).
 3. **Атомарная запись, симлинки и права:** если `config.json` является симлинком, запись выполняется в `os.path.realpath(CONFIG)` без разрушения симлинка; права существующего файла сохраняются (`stat.st_mode & 0o777`), для нового файла выставляется `0o600`; временный файл создаётся уникальным (`<target>.<pid>.<rand>.tmp`) в той же директории с атомарным `os.replace`.
 4. **Тестовые переменные окружения:** для изолированного тестирования установщик поддерживает переопределение путей через переменные окружения `DEVIN_CONFIG_PATH` (путь к файлу конфигурации вместо `~/.config/devin/config.json`), `DEVIN_HOOKS_DEST` (каталог установки хуков вместо `~/.local/share/bb-devin/hooks`) и `DEVIN_LEGACY_HOOKS` (путь к устаревшему симлинку вместо `~/.config/devin/hooks`).
 
-## 10. Матрица обязательных проверок
+## 11. Матрица обязательных проверок
 
 Скрипт `"test"` в `plugins/bb-plugin-provider-devin/package.json` запускает и Node-тесты, и изолированные Python-тесты единой командой:
 
@@ -254,7 +277,8 @@ if (session.devinCancelSent) {
    - классификация субагентов Devin в `delegation`;
    - сохранение инструкций треда с правами `0600` и каталогом `0700` при уникальных временных файлах;
    - `applyDevinAcpSessionMode` (включая защитные строки `"workspace-write"` и `"auto"`, обновление `configOptions` и fail-open);
-   - мягкая очередь `[bb system]` / `[orchestrator]` без `requestSteerCancel`.
+   - мягкая очередь `[bb system]` / `[orchestrator]` без `requestSteerCancel`;
+   - распознавание ошибок квоты `isDevinResourceExhaustedError` (код `-32011`, `errorKind: "resource_exhausted"`, regex `quota exhausted`).
 3. **`scripts/acp-bridge-e2e.test.mjs` (реальный спавн `host.ts` / вендорного моста поверх дочернего фейкового ACP-агента по stdio JSON-RPC):**
    - длинный открытый `tool_call` дольше `BB_DEVIN_LLM_IDLE_MS` успешно завершается без срабатывания `devinIdleTimer`;
    - зависший открытый `tool_call` без ожидания человека срабатывает по `BB_DEVIN_OPEN_WORK_MAX_MS`;
@@ -266,7 +290,9 @@ if (session.devinCancelSent) {
    - сбой спавна нового процесса при пересборке внутри восстановления: однократная штатная ошибка без повторного цикла и с корректным отклонением элементов очереди через `dropTurnInput`;
    - повторный срыв подряд переводит сессию на Ступень 2 (`wedged-sessions.json` + `session/new` + `contextLost: true` + переигрывание исходного ввода), а последующий `thread/resume` этого `providerThreadId` сразу обходит `session/load`;
    - третий срыв подряд в одном ходе останавливается по `MAX_TURN_RECYCLES = 2` со штатной ошибкой, после чего следующий пользовательский `turn/start` в том же треде штатно проходит и пересобирает сессию;
-   - после нормального завершения хода ни один таймер вотчдога не остаётся активным.
+   - после нормального завершения хода ни один таймер вотчдога не остаётся активным;
+   - смена модели между ходами (`reconcileExecutionSettings`): перезапуск процесса и восстановление истории через `session/load` с новой моделью;
+   - исчерпание квоты (`resource_exhausted` / `-32011`): мгновенная запись в `wedged-sessions.json`, `kill()` процесса и успешный старт следующего хода через чистый `session/new`.
 4. **`scripts/subagent-gate.test.mjs`:**
    - JSONC с начальными `//` и `/* { } */` комментариями, отсутствующий конфиг, симлинкованный `config.json`, сохранение прав и атомарный round-trip.
 5. **Python-тесты (`devin-hooks/*.test.py`):**
