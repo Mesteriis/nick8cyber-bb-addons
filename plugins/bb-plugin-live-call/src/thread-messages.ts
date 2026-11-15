@@ -8,6 +8,8 @@ export interface ThreadMessage {
   role: "owner" | "agent";
   text: string;
   createdAt: number;
+  /** seq события-источника (client/turn/requested — владелец, item/completed — агент). Якорь звонка по сообщению §12.13. */
+  seq: number;
 }
 
 export function formatMessageTime(ts: number): string {
@@ -40,7 +42,13 @@ export function formatAllThreadMessagesText(messages: ThreadMessage[]): string {
   return messages.map(formatSingleMessage).join("\n\n");
 }
 
-export function formatThreadMessagesBlock(messages: ThreadMessage[]): FormattedThreadBlock {
+/** Окна блока сообщений: звонок по треду — 10+20 (§12.2), звонок по сообщению — 10+10 (§12.13). */
+export interface MessageWindows {
+  first: number;
+  last: number;
+}
+
+export function formatThreadMessagesBlock(messages: ThreadMessage[], windows: MessageWindows = { first: 10, last: 20 }): FormattedThreadBlock {
   if (messages.length === 0) {
     const block = "(нет сообщений)";
     return {
@@ -51,7 +59,7 @@ export function formatThreadMessagesBlock(messages: ThreadMessage[]): FormattedT
     };
   }
 
-  if (messages.length <= 30) {
+  if (messages.length <= windows.first + windows.last) {
     const lastN = messages[messages.length - 1].number;
     const header = `ПОСЛЕДНИЕ СООБЩЕНИЯ (1–${lastN})`;
     const formatted = messages.map(formatSingleMessage).join("\n\n");
@@ -64,21 +72,21 @@ export function formatThreadMessagesBlock(messages: ThreadMessage[]): FormattedT
     };
   }
 
-  const first10 = messages.slice(0, 10).map(formatSingleMessage).join("\n\n");
-  const skipped = messages.length - 30;
+  const firstPart = messages.slice(0, windows.first).map(formatSingleMessage).join("\n\n");
+  const skipped = messages.length - windows.first - windows.last;
   const marker = `… пропущено ${skipped} (дочитай \`thread_read_messages\`) …`;
-  const last20Messages = messages.slice(messages.length - 20);
-  const last20 = last20Messages.map(formatSingleMessage).join("\n\n");
-  const k = last20Messages[0].number;
-  const n = last20Messages[last20Messages.length - 1].number;
+  const lastMessages = messages.slice(messages.length - windows.last);
+  const lastPart = lastMessages.map(formatSingleMessage).join("\n\n");
+  const k = lastMessages[0].number;
+  const n = lastMessages[lastMessages.length - 1].number;
 
-  const headerFirst = "НАЧАЛО ТРЕДА (1–10)";
+  const headerFirst = `НАЧАЛО ТРЕДА (1–${windows.first})`;
   const headerLast = `ПОСЛЕДНИЕ СООБЩЕНИЯ (${k}–${n})`;
 
-  const block = `${headerFirst}\n\n${first10}\n\n${marker}\n\n${headerLast}\n\n${last20}`;
+  const block = `${headerFirst}\n\n${firstPart}\n\n${marker}\n\n${headerLast}\n\n${lastPart}`;
   return {
     block,
-    messagesCount: 30,
+    messagesCount: windows.first + windows.last,
     skippedCount: skipped,
     chars: block.length,
   };
@@ -137,6 +145,7 @@ export async function fetchThreadMessages(
           role: "owner",
           text,
           createdAt: Number(e.createdAt ?? 0),
+          seq: Number(e.seq ?? 0),
         });
       }
     } else if (e.type === "item/completed") {
@@ -150,6 +159,7 @@ export async function fetchThreadMessages(
             role: "agent",
             text,
             createdAt: Number(e.createdAt ?? 0),
+            seq: Number(e.seq ?? 0),
           });
         }
       }

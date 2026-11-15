@@ -36,24 +36,28 @@ describe("сбор сообщений треда (контракт §12.2)", () 
       role: "owner",
       text: "Привет агент",
       createdAt: 1000,
+      seq: 1,
     });
     expect(msgs[1]).toEqual({
       number: 2,
       role: "agent",
       text: "Здравствуйте! Чем помочь?",
       createdAt: 1030,
+      seq: 5,
     });
     expect(msgs[2]).toEqual({
       number: 3,
       role: "owner",
       text: "Посчитай сумму",
       createdAt: 1060,
+      seq: 8,
     });
     expect(msgs[3]).toEqual({
       number: 4,
       role: "agent",
       text: "Сумма равна 42.",
       createdAt: 1070,
+      seq: 9,
     });
   });
 
@@ -118,6 +122,7 @@ describe("сбор сообщений треда (контракт §12.2)", () 
         role: i % 2 === 0 ? "owner" : "agent",
         text: `Сообщение ${i + 1}`,
         createdAt: 1700000000000 + i * 60000,
+        seq: i + 1,
       }));
 
       const res = formatThreadMessagesBlock(messages);
@@ -135,6 +140,7 @@ describe("сбор сообщений треда (контракт §12.2)", () 
         role: i % 2 === 0 ? "owner" : "agent",
         text: `Текст сообщения ${i + 1}`,
         createdAt: 1700000000000 + i * 60000,
+        seq: i + 1,
       }));
 
       const res = formatThreadMessagesBlock(messages);

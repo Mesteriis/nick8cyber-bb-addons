@@ -67,6 +67,10 @@ export const clientFrame = z.discriminatedUnion("type", [
     resume: z.string().min(1).optional(),
     threadId: z.string().min(1).optional(),
     projectId: z.string().min(1).optional(),
+    /** §12.13: звонок по сообщению — seq события-источника сообщения треда (только с threadId). */
+    messageSeq: z.number().int().min(1).optional(),
+    /** §12.13: выделенный фрагмент предмета (только с messageSeq; пустой клиент не шлёт). */
+    selectedText: z.string().min(1).max(4000).optional(),
     token: z.string().min(1).optional(),
   }),
   z.object({ type: z.literal("mute"), muted: z.boolean() }),
