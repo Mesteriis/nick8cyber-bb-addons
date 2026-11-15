@@ -1294,6 +1294,12 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
                 apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
                 quotaInfo: { remainingFraction: 1, resetTime: "2023-11-15T02:00:00Z" },
               },
+              // Internal chat models carry a share but no reset; they must not
+              // displace the family's timed window.
+              "chat_20706": {
+                apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+                quotaInfo: { remainingFraction: 1 },
+              },
               "claude-sonnet-5-5-low": {
                 apiProvider: "API_PROVIDER_ANTHROPIC_VERTEX",
                 quotaInfo: { remainingFraction: 0, resetTime: "2026-11-18T05:18:41Z" },
