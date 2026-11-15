@@ -2,31 +2,34 @@
   "name": "bb-plugin-hide-dispatched",
   "version": "0.1.0",
   "type": "module",
-  "description": "Автоматически прячет из сайдбара треды, порождённые раздачей задач (bb tasks dispatch), переводя их в visibility: hidden.",
+  "description": "Автоматически прячет из сайдбара служебные треды — любой тред с родителем и треды раздачи задач (bb tasks dispatch) — переводя их в visibility: hidden.",
   "scripts": {
     "build": "npm run typecheck",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --import ./tests/ts-resolver.mjs --test tests/*.test.ts"
   },
   "engines": {
     "bb": ">=0.39",
-    "bbPluginSdk": ">=0.4.8"
+    "bbPluginSdk": ">=0.6.132"
   },
   "bb": {
     "name": "Hide Dispatched",
-    "description": "Автоматически прячет из сайдбара треды, порождённые раздачей задач (bb tasks dispatch), переводя их в visibility: hidden.",
+    "description": "Автоматически прячет из сайдбара служебные треды — любой тред с родителем и треды раздачи задач (bb tasks dispatch) — переводя их в visibility: hidden.",
     "branding": {
       "icon": "EyeOff"
     },
     "server": "./server.ts"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.87",
+    "@get-bb/plugin-sdk": "0.6.132",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.18",
     "better-sqlite3": "^12.11.1",
+    "cron-parser": "^5.10.6",
     "hono": "^4.13.7",
     "react": "^19.2.8",
+    "react-dom": "^19.3.1",
     "typescript": "^5.7.0",
     "zod": "^4.5.4"
   }
