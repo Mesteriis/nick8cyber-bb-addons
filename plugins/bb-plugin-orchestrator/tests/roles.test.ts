@@ -38,6 +38,7 @@ function makeStore() {
     threadRole: (id) => store.threadRole(id),
     pendingRole: (projectId) => store.pendingRole(projectId),
     activeDelegationByTaskKey: (key) => store.activeByTaskKey(key),
+    bareProviders: () => ["acp-argon"],
   };
   const warnings: string[] = [];
   const hook = (ctx: MessageDispatchHookContext) =>
@@ -66,6 +67,7 @@ const facts = (
   attempt: "start-turn",
   origin: "app",
   projectId: "proj_a",
+  providerId: null,
   ...over,
 });
 
@@ -125,6 +127,38 @@ test("decideRole: not the first message → no decision", () => {
     }),
     null,
   );
+});
+
+test("decideRole: bare provider stays undecided (re-decidable on provider switch)", () => {
+  const bare = { ...noProbes, bareProviders: () => ["acp-argon"] };
+  // app chat on a bare provider — no role recorded at all
+  assert.equal(decideRole(facts({ providerId: "acp-argon" }), bare), null);
+  // a non-listed provider decides normally
+  assert.equal(decideRole(facts({ providerId: "acp-opencode" }), bare), "orchestrator");
+  // no provider id → rule untouched
+  assert.equal(decideRole(facts({ providerId: null }), bare), "orchestrator");
+});
+
+test("handleMessageDispatch: bare-provider thread records nothing", () => {
+  const { store, hook } = makeStore();
+  hook(
+    dispatch({
+      thread: {
+        id: "thr_bare",
+        status: "pending",
+        providerId: "acp-argon",
+        title: null,
+        titleFallback: null,
+        parentThreadId: null,
+        sourceThreadId: null,
+        originPluginId: null,
+      },
+      // The per-turn resolution is the authoritative provider for the gate.
+      requestedExecution: { providerId: "acp-argon" },
+      attempt: "start-turn",
+    }),
+  );
+  assert.equal(store.threadRole("thr_bare"), undefined);
 });
 
 test("decideRole: tasks origin wins over everything else", () => {

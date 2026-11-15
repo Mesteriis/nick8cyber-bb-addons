@@ -49,6 +49,21 @@ test("a root app thread is a coordinator: gets tools and the rule", () => {
 RULE`);
 });
 
+test("a bare-provider thread gets the empty issuance", () => {
+  const bare = { ...deps, bareProviders: ["acp-argon"] };
+  const config = buildAgentConfiguration(
+    ctx({ provider: { id: "acp-argon" } }),
+    bare,
+  );
+  assert.deepEqual(config, { tools: [], skills: [] });
+  // a non-listed provider is untouched
+  const other = buildAgentConfiguration(
+    ctx({ provider: { id: "acp-opencode" } }),
+    bare,
+  );
+  assert.equal(other.tools.length, 4);
+});
+
 test("injectInstructions=false silences texts but keeps the tools", () => {
   const config = buildAgentConfiguration(ctx({}), {
     ...deps,

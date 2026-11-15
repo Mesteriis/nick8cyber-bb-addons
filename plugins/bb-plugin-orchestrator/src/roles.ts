@@ -338,6 +338,12 @@ export interface RoleDecisionFacts {
   /** `origin` — `"app"` names a thread born in the new-chat window. */
   origin: string | null;
   projectId: string;
+  /**
+   * The thread's resolved provider id (`thread.providerId`) — a "bare"
+   * provider (a plain chat model without agent tooling, the
+   * `bareProviders` setting) never gets a role.
+   */
+  providerId: string | null;
 }
 
 /**
@@ -364,6 +370,12 @@ export interface RoleDecisionProbes {
    * `["handoff", "external-compact"]`.
    */
   userThreadPlugins?(): readonly string[];
+  /**
+   * Provider ids that are plain chat models with no agent tooling — a
+   * thread on one gets NO_ROLE: there is nothing to delegate, execute
+   * or audit through it. Absent probe = no bare providers.
+   */
+  bareProviders?(): readonly string[];
 }
 
 /** §17.1: the recorded "no orchestrator role" verdict for plugin-/sdk-
@@ -396,6 +408,17 @@ export function decideRole(
   // §17.1 r26 (PLUG-211 Б2): plugins that continue a human chat.
   const userPlugins =
     probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
+
+  // 0. A bare provider is a plain chat model — no tools, no dispatch
+  //    surface, nothing a role could govern. Undecided, not `none`: the row
+  //    would freeze the thread role-less even after a provider switch, and
+  //    `configure` already withholds the issuance by `provider.id` anyway.
+  if (
+    facts.providerId &&
+    (probes.bareProviders?.() ?? []).includes(facts.providerId)
+  ) {
+    return null;
+  }
 
   // 1. A thread created by `bb tasks dispatch` — or spawned by this
   //    plugin itself (§4 r30 д: `originPluginId = "orchestrator"`) — is an
@@ -481,6 +504,8 @@ export function handleMessageDispatch(
         attempt: context.attempt,
         origin: context.origin,
         projectId: context.project.id,
+        // Per-turn resolution — the thread may have switched providers.
+        providerId: context.requestedExecution?.providerId ?? context.thread.providerId,
       },
       probes,
     );

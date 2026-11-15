@@ -231,12 +231,21 @@ export interface AgentConfigDeps {
   /** §18.1 (PLUG-247a): the skill ids to declare — default the English
    * set (tests and bare calls keep the historical names). */
   skills?: SkillSet;
+  /**
+   * Bare providers — plain chat models without agent tooling (the
+   * `bareProviders` setting). A thread on one gets an empty issuance:
+   * no role text, tools or skills, since the session cannot act on them.
+   */
+  bareProviders?: readonly string[];
 }
 
 export function buildAgentConfiguration(
   context: PluginAgentConfigurationContext,
   deps: AgentConfigDeps,
 ): PluginAgentConfiguration {
+  if (deps.bareProviders?.includes(context.provider.id)) {
+    return { tools: [], skills: [] };
+  }
   const facts: ThreadFacts = {
     threadId: context.thread.id,
     parentThreadId: context.thread.parentThreadId,
@@ -315,7 +324,12 @@ export function fallbackAgentConfiguration(
   orchestratorText: string = ROLES.orchestrator.instructions,
   /** §18.1 (PLUG-247a): the skill set to declare — default English. */
   skills: SkillSet = SKILLS_EN,
+  /** Bare chat providers get the empty issuance, same as the main path. */
+  bareProviders: readonly string[] = [],
 ): PluginAgentConfiguration {
+  if (bareProviders.includes(context.provider.id)) {
+    return { tools: [], skills: [] };
+  }
   const coordinator = isCoordinatorByStaticFacts(
     {
       threadId: context.thread.id,

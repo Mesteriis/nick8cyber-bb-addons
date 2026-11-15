@@ -290,6 +290,13 @@ export async function createPlugin(
         "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default EMPTY — only an explicitly saved value is kept (the author's sets `handoff, external-compact`).",
       default: "",
     },
+    bareProviders: {
+      type: "string",
+      label: "Bare chat providers",
+      description:
+        "Provider ids that are plain chat models without agent tooling — threads on them get no role and no orchestrator instructions, tools or skills (the session cannot act on them anyway). Comma/space-separated provider ids.",
+      default: "acp-argon",
+    },
     roleTexts: {
       type: "string",
       label: "Role texts",
@@ -436,6 +443,14 @@ export async function createPlugin(
     userThreadPlugins: () => userPlugins(),
   };
 
+  /** Provider ids from the `bareProviders` setting — chat models that get
+   * no role and no orchestrator issuance. */
+  const bareProviders = (): string[] =>
+    (currentSettings.bareProviders ?? "")
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
   // §13.2 п.1-2: the role decision's read side — synchronous SQLite only,
   // the `message.dispatch` hook may not call out anywhere.
   const roleProbes: RoleDecisionProbes = {
@@ -447,6 +462,8 @@ export async function createPlugin(
     policy: () => policyLoad.policy,
     // §17.1 r26 (PLUG-211 Б2): plugins continuing a human chat.
     userThreadPlugins: () => userPlugins(),
+    // Plain chat models — no role decision applies to them.
+    bareProviders: () => bareProviders(),
   };
 
   // §17.1 r26 (PLUG-211 Б1): one-time rewrite — hook-decided
@@ -777,15 +794,18 @@ export async function createPlugin(
         policyOk: policyLoad.policy !== null,
         roleInstructions: roleTextFor,
         skills: skillSet(lang),
+        bareProviders: bareProviders(),
       });
       // §13.2 п.4: reflect the decided role into display metadata. The
       // hook itself may not touch the network, so the write rides on the
       // first session build after the decision — display-only either way.
       const decided = store.threadRole(context.thread.id)?.role;
       // §17.1: the `none` verdict is not a role — nothing to display.
+      // A bare provider never displays a role either.
       if (
         decided &&
         isRoleId(decided) &&
+        !bareProviders().includes(context.provider.id) &&
         context.pluginMetadata.role !== decided
       ) {
         void bb.sdk.threads
@@ -812,6 +832,7 @@ export async function createPlugin(
         userPlugins(),
         roleTextFor("orchestrator"),
         skillSet(lang),
+        bareProviders(),
       );
     }
   });
