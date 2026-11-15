@@ -16,13 +16,14 @@ import { DEFAULT_WORDS, classify } from "./classify.js";
 import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
-import { EMPTY_CONTEXT, projectVoiceInstruction, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
+import { EMPTY_CONTEXT, messageVoiceInstruction, projectVoiceInstruction, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
 import { TOOLS, capabilityList, formatConnectorSay, getProjectTools, nativeDeclarations, runToolCall, stripConfirmKeys, toolByName, type ToolDef, type TwoStepPreviewEntry } from "./tools.js";
 import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
+import { formatMessageSubjectBlock, messageNeighbors } from "./message-call.js";
 import { BrainCenter } from "./brain-center.js";
 import { ProjectBrain, resolveProjectBrainEnv, type BrainReadResult } from "./project-brain.js";
 import { McpClient, extractConfirmToken, inspectConnectorTool, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
@@ -63,6 +64,10 @@ export interface CallSessionDeps {
   wsFactory?: (url: string) => WebSocket;
   targetThreadId?: string;
   targetProjectId?: string;
+  /** §12.13: предмет звонка по сообщению (найден в hello до startCall). Только с targetThreadId. */
+  targetMessage?: ThreadMessage;
+  /** §12.13: выделенный фрагмент предмета (только данные для блока, не в инструменты). */
+  targetSelectedText?: string;
   projectRegistry?: ProjectRegistryManager;
   projectSecrets?: Record<string, string>;
   rawProjectRegistry?: string;
@@ -86,6 +91,9 @@ export class CallSession extends EventEmitter {
   threadId: string | null = null;
   readonly targetThreadId: string | null = null;
   readonly targetProjectId: string | null = null;
+  /** §12.13: предмет звонка по сообщению и выделенный фрагмент (только с targetThreadId). */
+  targetMessage: ThreadMessage | null = null;
+  readonly targetSelectedText: string | null = null;
   private projectTitle: string | null = null;
   private repoPromptMd: string | null = null;
   private connectorClients: McpClient[] = [];
@@ -115,6 +123,8 @@ export class CallSession extends EventEmitter {
   } = { status: "свободен" };
   private nowUtc = "";
   private threadMessagesBlock = "";
+  /** §12.13: блок предмета звонка по сообщению (пустой у звонка по треду). */
+  private targetMessageBlock = "";
   private voice: LiveClient | null = null;
   private router: LiveClient | null = null;
   private pool: KeyPool;
@@ -168,6 +178,8 @@ export class CallSession extends EventEmitter {
     super();
     this.targetThreadId = deps.targetThreadId ?? null;
     this.targetProjectId = deps.targetProjectId ?? null;
+    this.targetMessage = this.targetThreadId ? (deps.targetMessage ?? null) : null;
+    this.targetSelectedText = this.targetMessage ? (deps.targetSelectedText ?? null) : null;
     if (this.targetProjectId && deps.pendingRegistryChanges) {
       const match = deps.pendingRegistryChanges.find((p) => p.projectId === this.targetProjectId);
       if (match) {
@@ -343,7 +355,17 @@ export class CallSession extends EventEmitter {
   async start() {
     if (this.targetThreadId) {
       this.deps.store.startCall(this.deps.callId);
-      this.recordEvent( "call_started", { targetThreadId: this.targetThreadId });
+      this.recordEvent( "call_started", {
+        targetThreadId: this.targetThreadId,
+        ...(this.targetMessage
+          ? {
+              targetMessageSeq: this.targetMessage.seq,
+              targetMessageNumber: this.targetMessage.number,
+              targetMessageRole: this.targetMessage.role,
+              hasSelectedText: Boolean(this.targetSelectedText),
+            }
+          : {}),
+      });
       this.nowUtc = new Date().toISOString();
       let envObj: Record<string, unknown> = {};
       let targetProjectId = "";
@@ -423,7 +445,8 @@ export class CallSession extends EventEmitter {
       }
 
       this.threadMessages = await fetchThreadMessages(this.deps.sdk, this.targetThreadId);
-      const formatted = formatThreadMessagesBlock(this.threadMessages);
+      // §12.13: у звонка по сообщению окна 10+10, у звонка по треду — 10+20 (§12.2).
+      const formatted = formatThreadMessagesBlock(this.threadMessages, this.targetMessage ? { first: 10, last: 10 } : undefined);
       this.threadMessagesBlock = formatted.block;
 
       let lastOwnerIndex: number | undefined;
@@ -445,6 +468,20 @@ export class CallSession extends EventEmitter {
         skipped: formatted.skippedCount,
         chars: formatted.chars,
       });
+
+      // §12.13: блок предмета до блока сообщений — предмет целиком, выделение и соседи.
+      if (this.targetMessage) {
+        const fresh = this.threadMessages.find((m) => m.seq === this.targetMessage!.seq) ?? this.targetMessage;
+        this.targetMessage = fresh;
+        const neighbors = messageNeighbors(this.threadMessages, fresh);
+        this.targetMessageBlock = formatMessageSubjectBlock(fresh, neighbors, this.targetSelectedText ?? undefined);
+        this.recordEvent( "message_context", {
+          number: fresh.number,
+          role: fresh.role,
+          chars: fresh.text.length,
+          ...(this.targetSelectedText ? { selectedChars: this.targetSelectedText.length } : {}),
+        });
+      }
 
       this.brainExpected = true; // и в не-git проекте — в отдельной пустой папке (03.11)
       this.brain = new BrainCenter({
@@ -915,19 +952,32 @@ export class CallSession extends EventEmitter {
           availableTools: [...this.projectConnectorTools.map((t) => t.name), "brain_ask"],
         })
       : this.targetThreadId
-        ? threadVoiceInstruction({
-            thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
-            nowUtc: this.nowUtc,
-            threadState: this.threadState,
-            messagesBlock: this.threadMessagesBlock,
-            memory: this.promptContext.memory,
-            brainSummary: this.brainSummary ?? undefined,
-            brainAvailable: this.brain !== null && this.brainExpected,
-            projectToolsLine:
-              this.projectConnectorTools.length > 0
-                ? `доступны ручки проекта «${this.threadMeta?.project ?? "проекта"}»: ${this.projectConnectorTools.map((t) => t.name).join(", ")}.`
-                : undefined,
-          })
+        ? (() => {
+            const ctx = {
+              thread: this.threadMeta ?? { id: this.targetThreadId!, title: "Тред" },
+              nowUtc: this.nowUtc,
+              threadState: this.threadState,
+              messagesBlock: this.threadMessagesBlock,
+              memory: this.promptContext.memory,
+              brainSummary: this.brainSummary ?? undefined,
+              brainAvailable: this.brain !== null && this.brainExpected,
+              projectToolsLine:
+                this.projectConnectorTools.length > 0
+                  ? `доступны ручки проекта «${this.threadMeta?.project ?? "проекта"}»: ${this.projectConnectorTools.map((t) => t.name).join(", ")}.`
+                  : undefined,
+            };
+            // §12.13: звонок по сообщению — та же инструкция с предметом и своей первой репликой.
+            return this.targetMessage
+              ? messageVoiceInstruction({
+                  ...ctx,
+                  messageCall: {
+                    number: this.targetMessage.number,
+                    role: this.targetMessage.role,
+                    subjectBlock: this.targetMessageBlock,
+                  },
+                })
+              : threadVoiceInstruction(ctx);
+          })()
         : this.mode === "normal"
           ? voiceInstructionNormal(this.promptContext)
           : voiceInstructionExtended(this.promptContext);
