@@ -46,8 +46,8 @@ describe("BrainCenter (§12.11)", () => {
       targetBranchName: "feat/my-branch",
       isGitRepo: true,
       allMessages: [
-        { number: 1, role: "owner", text: "Привет", createdAt: new Date("2026-11-03T18:00:00Z").getTime() },
-        { number: 2, role: "agent", text: "Здравствуйте", createdAt: new Date("2026-11-03T18:01:00Z").getTime() },
+        { number: 1, role: "owner", text: "Привет", createdAt: new Date("2026-11-03T18:00:00Z").getTime(), seq: 1 },
+        { number: 2, role: "agent", text: "Здравствуйте", createdAt: new Date("2026-11-03T18:01:00Z").getTime(), seq: 2 },
       ],
       storageDir: testDir,
     });
@@ -242,7 +242,7 @@ describe("BrainCenter — изоляция (§12.11 п.1, приёмка 03.11)"
       targetBranchName: "feat/x",
       isGitRepo,
       fallbackProjectId: "proj_calls_test",
-      allMessages: [{ number: 1, role: "owner", text: "Привет", createdAt: 0 }],
+      allMessages: [{ number: 1, role: "owner", text: "Привет", createdAt: 0, seq: 1 }],
       storageDir: join(tmpdir(), `test-brain-iso-${Date.now()}-${Math.random()}`),
     });
 

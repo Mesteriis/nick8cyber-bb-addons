@@ -2,7 +2,20 @@
 
 `agy` — the Antigravity CLI — as a native bb provider: a provider declaration
 plus a provider bridge, the same shape `provider-claude-code` and
-`provider-codex` use. No ACP in the path.
+`provider-codex` use.
+
+Since 2026-11-10 the default transport is **`agy acp`** through the SDK's
+`experimental_acpProviderBridge` wrapped by `src/acp-wrapper.ts` (account pool,
+quota rotation, session persistence, usage side-channel via `src/acp-shim.mjs`,
+which also drops the `session/load` history replay before the live prompt's
+user-message echo).
+ACP delivers live reasoning, tool-call args/output and per-turn usage; bb
+plugin tools reach the agent through the generic bridge's MCP proxy
+(`mcp/bb-bridge/*.json` under the account's gemini dir). Declared permission
+modes are `["full", "accept-edits"]` — `auto`/`plan`/`default` are not
+deliverable on the generic ACP dialect (thread.start is gated on adapter
+capabilities). The legacy stream-json bridge stays available behind
+`AGY_TRANSPORT=stream-json` for one release as a no-deploy rollback.
 
 Built and verified against **bb 0.40.0** (`@get-bb/plugin-sdk` 0.4.21), which
 speaks **provider bridge protocol version 2** and thread-delta grammar v3.
@@ -367,11 +380,12 @@ accounts/<label>/.gemini/antigravity-cli/antigravity-oauth-token   the credentia
 accounts/<label>/proxy                                             optional egress proxy
 ```
 
-Every parallel thread session gets pinned to its own account (least
-recently used among the healthy ones), so its requests, token refreshes and
-installation identity all live in that home — nothing shared, nothing to
-race on (agy REWRITES its token file on refresh, which is exactly why the
-pool is homes and not one swapped file). A `proxy` file next to the home
+Every parallel thread session gets pinned to its own account (the least
+recently used healthy account in the highest available priority tier —
+see "Account priority and pool tiers" below), so its requests, token
+refreshes and installation identity all live in that home — nothing
+shared, nothing to race on (agy REWRITES its token file on refresh, which
+is exactly why the pool is homes and not one swapped file). A `proxy` file next to the home
 (one URL per line worth: `socks5://user:pass@host:port`) gives that account
 its own egress IP via the standard proxy envs.
 
@@ -384,8 +398,21 @@ which also remembers which account owns which conversation) and:
   it; `session/replaced` goes out with `contextLost: true`), and the
   session stays on the new account;
 - **the whole pool is burnt** — the turn re-runs when the earliest window
-  reopens (the quota auto-retry bounds below apply); the conversation
-  resumes.
+  within the highest priority tier present reopens (or the burnt
+  account's own window, if that is sooner); `priority: 0` accounts are
+  ignored — see "Account priority and pool tiers" (the quota auto-retry
+  bounds below apply); the conversation resumes.
+
+#### Account priority and pool tiers
+
+Account selection order in the pool is governed by a numeric priority — layered on top of LRU:
+
+- **`accounts[label].priority` in `accounts-state.json`**: integer `≥ 0`. Missing, non-number, fractional, or `< 0` defaults to `10`. The field is **shared-owned**: it lives only in `accounts-state.json`, is set by operators on the owner instance (atomic write), and syncs to satellites via the keeper sync; `accounts-overlay.json` never carries it and local merges do not touch it. When `saveLedger` writes the shared file, `priority` comes from the on-disk record for labels present there — an operator edit or deletion is never clobbered by a stale in-memory ledger; for labels absent on disk the in-memory value is written.
+- **`priority: 0`**: the account is **never** picked for new sessions or rotations (excluded from candidate selection without setting cooldowns or parking). Existing pinned conversations, `thread/resume` on the owner account, and manual operator returns (editing `accounts-state.json`) keep working as before — only NEW account selection is affected.
+- **Tier selection (`pickAccount`)**: candidates (`≠ excludeLabel` and `priority > 0`) are grouped into priority tiers. The pool selects the LRU account (least recently used by `lastUsedMs`, tie-break by `label`) from the **highest available tier** (`cooldownUntilMs ≤ now`). Lower priority tiers act as reserve classes: they only take turns when all accounts in higher tiers are cooling down.
+- **Whole pool cooling fallback**: when all candidates across all tiers are cooling down, the fallback ("window opens earliest") is evaluated strictly within the **highest present tier** (not across the entire pool); `priority: 0` accounts are excluded.
+- **Pool-less fallback**: if all pool accounts have `priority: 0` (or the pool is empty), `pickAccount` returns `null` and the session is not pinned to a pool account — like an empty pool it runs through the cliproxy relay if configured, or in direct mode on the machine's default credential.
+- **Backward compatibility**: a pool with no `priority` fields defaults every account to tier 10, preserving pure LRU selection.
 
 #### Account not eligible
 
@@ -404,8 +431,70 @@ If the old account already had a conversation, the retry uses a fresh conversati
 
 Close handling uses only the current child generation's stderr. Only the eligibility diagnostic block is stored as the account's `lastError`; earlier 429 messages and later shutdown chatter are excluded. A SOCKS/network failure during the check and a tool error containing `verify your account` do not trigger eligibility parking or rotation.
 
+#### Account lost Google sign-in (auth-dead)
+
+When agy answers `auth_required` / `Authentication required` (its own log adds
+`Silent sign-in failed`, `not logged into Antigravity`, or
+`error getting token source`), the account's OAuth session is dead — not
+quota, not eligibility, not a tool error. The bridge parks it through the same
+mechanism as an eligibility refusal (long cooldown + `ineligibleAtMs`, shared
+breaker) and additionally stamps `parkedReason: "auth-dead"` in
+`accounts-state.json`. The interrupted turn is replayed on a free sibling with
+`session/replaced` (`contextLost: true`) and the reason
+`the session's account lost its Google sign-in (auth_required)`; `turn/start`
+and `thread/resume` pinned to a parked account take the same path. If no
+sibling is free the thread fails honestly — `every pool account lost its
+Google sign-in; re-authenticate one and retry` — instead of spamming
+rotations. Quota fields and `rateLimits` are untouched.
+
+> [!TIP] Restore a logged-out account
+> Re-login the account (`HOME=accounts/<label> agy` login flow). The unpark
+> edit differs by side. **On the owner instance**: in
+> `bridge-data/accounts-state.json` set the account's `cooldownUntilMs` to
+> `0` **and** `lastUsedMs` to the current time — or just run one turn, its
+> `markAccountUse` lifts every satellite's `accounts-overlay.json` shadow
+> via the next sync. **On a satellite**: remove the label's record from
+> `bridge-data/accounts-overlay.json` (or delete the file) — editing the
+> shared file there is useless, the keeper restores the owner's version
+> within ~30 s. Alternatively remove the label from `accounts-parked/`
+> bookkeeping the same way as any parked account.
+
 > [!TIP] Restore a verified account
-> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then set that account's `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json`, or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then unpark by side — **on the owner instance**: set that account's `cooldownUntilMs` to `0` **and** `lastUsedMs` to the current time in `bridge-data/accounts-state.json` (or run one turn); **on a satellite**: remove the label's record from `bridge-data/accounts-overlay.json`, since the keeper reverts shared edits within ~30 s. Or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+
+#### Native agy subagents are disabled
+
+Every subagent must be a bb thread, so agy's own invisible agents are turned
+off — by the central provider setting, same as codex/claude-code:
+`bb plugin config provider-agy set subagentsDisabled false` re-enables them
+(default **on**, i.e. native subagents are disabled; the server derives it
+into `options.providerOptions.providerSubagentsEnabled` on every
+thread/start and resume). Resolution order: `AGY_DISABLE_SUBAGENTS` env
+override (`0` allows, anything else forbids) > the derived provider option >
+default disabled. Two enforcement layers: the wrapper passes the decision to
+the shim as `AGY_DISABLE_SUBAGENTS` and the shim injects
+`disableBuiltInTools` (`invoke_subagent`, `manage_subagents`,
+`define_subagent`, `browser_subagent`, `native_swarm`, `manage_swarm`,
+`boost`) into every `session/new` and `session/load`; the wrapper also
+additively merges `antigravityConfig.subagentsConfig.enabled=<resolved>`
+(plus the snake_case twin) and `boostCommandDisabled` into the account
+home's `.gemini/settings.json` on each launch — so a re-enable actually
+takes effect.
+
+#### Native agy memory is disabled
+
+The same class of hidden state: agy's own memory tools persist notes about
+the work inside the account home, invisible to bb. The central setting
+`memoryEnabled` (default **off**;
+`bb plugin config provider-agy set memoryEnabled true` re-enables it) is
+derived as `options.providerOptions.providerMemoryEnabled` — same contract
+as codex/claude-code. Resolution order: `AGY_DISABLE_MEMORY` env override
+(`0` allows) > the derived option > default disabled. Two enforcement
+layers, same as subagents: the shim adds `memory`, `retrieve_memory`,
+`disable_memory` (plus a few speculative names — agy filters unknowns) to
+`disableBuiltInTools` on `session/new`/`session/load`, and the wrapper
+stamps `antigravityConfig.memoryConfig.enabled=<resolved>` (plus the
+snake_case twin) into the account's `.gemini/settings.json` on each launch.
 
 Accounts come in through `scripts/import-accounts.mjs` (from the opencode
 antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
@@ -510,7 +599,11 @@ Both routes are wired, because bb resolves a provider icon in this order:
 a plugin-registered `app.slots.experimental_providerIcon` component, then its
 vendored brand maps, then the server `logoUrl`. So `app.tsx` renders the mark
 inline (crisp, no fetch) and `icons/agy.svg` stays as the fallback for when the
-frontend has not booted, is disabled, or fails. The palette is explicit rather
+frontend has not booted, is disabled, or fails. The registered component must
+declare intrinsic size (`width`/`height` on the `<svg>`): the host wraps the
+icon in a `min-w/h-max` container, and a dimensionless SVG reports 300×150,
+blowing the slot out of its row. Intrinsic 14px keeps the mark compact in
+14px slots while `size-full` still stretches it wherever the slot is bigger. The palette is explicit rather
 than `currentColor`: an `<img>` SVG is a separate document where `currentColor`
 is black, and a four-colour mark has no single tint to inherit anyway.
 

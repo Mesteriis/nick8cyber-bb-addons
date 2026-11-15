@@ -35,7 +35,12 @@ test("a root app thread is a coordinator: gets tools and the rule", () => {
   const config = buildAgentConfiguration(ctx({}), deps);
   assert.deepEqual(
     config.tools,
-    ["orchestrator_delegate", "orchestrator_status", "orchestrator_cancel"],
+    [
+      "orchestrator_delegate",
+      "orchestrator_status",
+      "orchestrator_cancel",
+      "orchestrator_merge",
+    ],
   );
   // §3 rev 16: a fallback-decided coordinator gets the orchestrator
   // role's text too — instruction + rule.
@@ -49,7 +54,7 @@ test("injectInstructions=false silences texts but keeps the tools", () => {
     ...deps,
     injectInstructions: false,
   });
-  assert.equal(config.tools.length, 3);
+  assert.equal(config.tools.length, 4);
   assert.equal(config.instructions, undefined);
 });
 
@@ -158,7 +163,7 @@ test("each executor marker alone is enough — one test per marker", () => {
     [],
   );
   // none of the markers → coordinator
-  assert.equal(buildAgentConfiguration(clean, deps).tools.length, 3);
+  assert.equal(buildAgentConfiguration(clean, deps).tools.length, 4);
 });
 
 test("the fallback uses static facts only when probes throw", () => {
@@ -175,7 +180,7 @@ test("the fallback uses static facts only when probes throw", () => {
     buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
-  assert.equal(fb.tools.length, 3);
+  assert.equal(fb.tools.length, 4);
   const fbExec = fallbackAgentConfiguration(
     ctx({ thread: { parentThreadId: "thr_p" } }),
     true,
@@ -214,7 +219,7 @@ test("a broken role read falls back to the static-facts result", () => {
     buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
-  assert.equal(fb.tools.length, 3);
+  assert.equal(fb.tools.length, 4);
   assert.equal(fb.instructions, `${ORCH_TEXT}
 
 RULE`);
@@ -228,7 +233,7 @@ test("configure without a thread_roles row: fallback gives orchestrator texts", 
     ...deps,
     probes: { ...noProbes, roleByThreadId: () => undefined },
   });
-  assert.equal(config.tools.length, 3);
+  assert.equal(config.tools.length, 4);
   assert.equal(config.instructions, `${ORCH_TEXT}
 
 RULE`);
@@ -239,4 +244,192 @@ RULE`);
     probes: { ...noProbes, roleByThreadId: () => undefined },
   });
   assert.equal(silent.instructions, undefined);
+});
+
+
+test("§16.7: invalid policy → role-less root thread gets only the setup skill", () => {
+  const config = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    policyOk: false,
+  });
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(config.skills, ["orchestrator-setup"]);
+  assert.equal(config.instructions, undefined);
+  // §16.7 (PLUG-182): a recorded `orchestrator` role gets the same
+  // setup-only issuance — the window's pick is not a real choice.
+  const withRole = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    policyOk: false,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "orchestrator",
+    },
+  });
+  assert.deepEqual(withRole.tools, []);
+  assert.deepEqual(withRole.skills, ["orchestrator-setup"]);
+  assert.equal(withRole.instructions, undefined);
+  // Valid policy → full coordinator issuance as before.
+  const ok = buildAgentConfiguration(ctx({}), { ...deps, policyOk: true });
+  assert.equal(ok.tools.length, 4);
+});
+
+test("§16.7: the error fallback honors policyOk — coordinator gets setup only", () => {
+  // agent-config.ts fallback path: a root thread with an invalid policy
+  // must not get coordinator tools or instructions even from the
+  // static-facts path.
+  const fb = fallbackAgentConfiguration(ctx({}), true, "RULE", false);
+  assert.deepEqual(fb.tools, []);
+  assert.deepEqual(fb.skills, ["orchestrator-setup"]);
+  assert.equal(fb.instructions, undefined);
+  // A non-coordinator still gets nothing at all.
+  const fbExec = fallbackAgentConfiguration(
+    ctx({ thread: { parentThreadId: "thr_p" } }),
+    true,
+    "RULE",
+    false,
+  );
+  assert.deepEqual(fbExec.tools, []);
+  assert.deepEqual(fbExec.skills, []);
+});
+
+// ── §17.1 r26 (PLUG-211 Б1/Б2) ────────────────────────────────────────
+
+test("§17.1 r26 (Б1): a stale orchestrator row on a plugin thread is lazily corrected to none", () => {
+  const writes: [string, string][] = [];
+  const context = ctx({ origin: { pluginId: "advisor" } });
+  const config = buildAgentConfiguration(context, {
+    ...deps,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "orchestrator",
+      writeRole: (id, role) => writes.push([id, role]),
+    },
+  });
+  assert.deepEqual(config.tools, []);
+  assert.equal(config.instructions, undefined);
+  assert.deepEqual(writes, [[context.thread.id, "none"]]);
+});
+
+test("§17.1 r26 (Б2): a handoff plugin thread keeps its orchestrator row", () => {
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "handoff" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        roleByThreadId: () => "orchestrator",
+        writeRole: (id, role) => writes.push([id, role]),
+        // §18.6: the default list is empty now — a listed plugin is
+        // supplied explicitly.
+        userThreadPlugins: () => ["handoff", "external-compact"],
+      },
+    },
+  );
+  // a userThreadPlugins thread IS a human chat — the row is not stale
+  assert.deepEqual(config.tools, [
+    "orchestrator_delegate",
+    "orchestrator_status",
+    "orchestrator_cancel",
+    "orchestrator_merge",
+  ]);
+  assert.deepEqual(writes, []);
+});
+
+test("§17.1 r26 (Б2): an unrecorded handoff thread is a coordinator by static facts", () => {
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "handoff" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        userThreadPlugins: () => ["handoff", "external-compact"],
+      },
+    },
+  );
+  assert.equal(config.tools.length, 4);
+});
+
+test("§17.1 r26 (Б2): a configured-empty userThreadPlugins denies a handoff thread", () => {
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "handoff" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        userThreadPlugins: () => [],
+      },
+    },
+  );
+  assert.deepEqual(config.tools, []);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): the lazy fix is two-sided — a none row on a listed plugin thread is restored to orchestrator", () => {
+  const writes: [string, string][] = [];
+  const context = ctx({ origin: { pluginId: "external-compact" } });
+  const config = buildAgentConfiguration(context, {
+    ...deps,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "none",
+      writeRole: (id, role) => writes.push([id, role]),
+      userThreadPlugins: () => ["handoff", "external-compact"],
+    },
+  });
+  // the plugin continues the human chat — the row is stale, the hook
+  // would write orchestrator today
+  assert.equal(config.tools.length, 4);
+  assert.deepEqual(writes, [[context.thread.id, "orchestrator"]]);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a parented none row stays none — the parent beats the plugin list", () => {
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(
+    ctx({
+      thread: { parentThreadId: "thr_p" },
+      origin: { pluginId: "handoff" },
+    }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        roleByThreadId: () => "none",
+        writeRole: (id, role) => writes.push([id, role]),
+      },
+    },
+  );
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(writes, []);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a none row on an unlisted plugin stays none", () => {
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "advisor" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        roleByThreadId: () => "none",
+        writeRole: (id, role) => writes.push([id, role]),
+      },
+    },
+  );
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(writes, []);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a none row on a non-plugin thread stands", () => {
+  // `none` on an app/cli thread is not a plugin-list question — no fix.
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "none",
+      writeRole: (id, role) => writes.push([id, role]),
+    },
+  });
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(writes, []);
 });

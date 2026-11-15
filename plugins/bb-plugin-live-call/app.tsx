@@ -3,6 +3,7 @@
  * Входы в звонок:
  * - иконка в футере сайдбара «Позвонить координатору» и Mod+Shift+L (без изменений)
  * - кнопка в шапке треда «Звонок по треду» (иконка телефона)
+ * - действие на сообщении «Звонок по сообщению» (messageAction, §12.13)
  * - действие в панели нового треда «Позвонить по проекту» (experimental_newThreadPanelAction)
  * - команда палитры «Live Call: позвонить по проекту» с выбором проекта
  * - события window: bb-live-call:projects и bb-live-call:start-project
@@ -80,6 +81,25 @@ export default definePluginApp((app) => {
     id: "call",
     title: "Звонок по треду",
     component: ThreadCallButton,
+  });
+
+  // §12.13: действие на сообщении «Звонок по сообщению» — иконка в action-bar каждого
+  // сообщения и пункт меню выделенного текста. Идущий звонок разворачивается (как §12.1).
+  app.slots.messageAction({
+    id: "call-message",
+    title: "Звонок по сообщению",
+    icon: PHONE_ICON,
+    run: (context) => {
+      if (callEngine.isActive()) {
+        callEngine.requestExpand();
+        return;
+      }
+      callEngine.start({
+        threadId: context.threadId,
+        messageSeq: context.message.experimental_messageSeq,
+        selectedText: context.selectedText,
+      });
+    },
   });
 
   // Действие панели создания треда «Позвонить по проекту» (§15.1 п. 1)
