@@ -85,9 +85,56 @@ function quotaWindows(response: Json): UsageWindow[] {
       });
     }
   }
-  if (windows.length === 0) throw new QuotaError("Google did not report usable quota windows.");
-  return windows.sort((a, b) =>
-    Number(a.label.endsWith("Weekly")) - Number(b.label.endsWith("Weekly")));
+  return windows;
+}
+
+/** Picks a window suffix from the reset distance: matches the pool's 5h/Weekly convention. */
+function windowKind(resetsAt: string | null, now: number): string {
+  if (!resetsAt) return "Weekly";
+  const delta = Date.parse(resetsAt) - now;
+  if (delta <= 10 * 3_600_000) return "5h";
+  if (delta <= 40 * 3_600_000) return "Daily";
+  return "Weekly";
+}
+
+/**
+ * Per-model quota from fetchAvailableModels. The grouped summary can omit an
+ * entire family (Google reports only the third-party group for some tiers), so
+ * the tightest remaining share across the family's models becomes its window.
+ */
+function modelWindows(response: Json, taken: Set<string>, now: number): UsageWindow[] {
+  const models = object(response.models);
+  const families = new Map<string, { fraction: number; resetsAt: string | null }>();
+  for (const raw of Object.values(models)) {
+    const model = object(raw);
+    const provider = text(model.apiProvider) ?? "";
+    const family = provider.includes("GOOGLE_GEMINI") ? "Gemini"
+      : /Claude|GPT|OPENAI|ANTHROPIC/.test(provider) ? "Claude" : null;
+    if (family === null || taken.has(family)) continue;
+    const quota = object(model.quotaInfo);
+    const rawFraction = quota.remainingFraction;
+    const fraction = typeof rawFraction === "number" && Number.isFinite(rawFraction)
+      ? rawFraction
+      : text(quota.resetTime) !== null ? 0 : null;
+    if (fraction === null || fraction < 0 || fraction > 1) continue;
+    const reset = text(quota.resetTime);
+    const resetsAt = reset && Number.isFinite(Date.parse(reset)) ? reset : null;
+    const seen = families.get(family);
+    if (!seen || fraction < seen.fraction ||
+        (fraction === seen.fraction && (resetsAt ?? "") < (seen.resetsAt ?? ""))) {
+      families.set(family, { fraction, resetsAt });
+    }
+  }
+  const windows: UsageWindow[] = [];
+  for (const [family, quota] of families) {
+    windows.push({
+      label: `${family} ${windowKind(quota.resetsAt, now)}`,
+      usedPercent: Math.round((1 - quota.fraction) * 10_000) / 100,
+      resetsAt: quota.resetsAt,
+      cost: null,
+    });
+  }
+  return windows;
 }
 
 /** Reads the native ACP profile and Google quota APIs; never starts an agent or writes auth. */
@@ -196,14 +243,28 @@ export function createAntigravityAcpUsage(options: {
     }
     const paidTier = object(entitlement.paidTier);
     const base = paidTier.usesGcpTos === true ? PROD : DAILY;
-    const summary = await request(`${base}/v1internal:retrieveUserQuotaSummary`, {
-      method: "POST", headers, body: JSON.stringify({ project: credentials.project_id }),
-    });
+    const quotaBody = JSON.stringify({ project: credentials.project_id });
+    const [summary, models] = await Promise.all([
+      request(`${base}/v1internal:retrieveUserQuotaSummary`, {
+        method: "POST", headers, body: quotaBody,
+      }),
+      request(`${base}/v1internal:fetchAvailableModels`, {
+        method: "POST", headers, body: quotaBody,
+      }),
+    ]);
+    const windows = quotaWindows(summary);
+    const taken = new Set(windows.map(w => w.label.split(" ")[0]));
+    windows.push(...modelWindows(models, taken, options.now()));
+    if (windows.length === 0) {
+      throw new QuotaError("Google did not report usable quota windows.");
+    }
+    windows.sort((a, b) =>
+      Number(a.label.endsWith("Weekly")) - Number(b.label.endsWith("Weekly")));
     return {
       usage: {
         status: "ok", accountEmail: email,
         planLabel: text(paidTier.name) ?? text(object(entitlement.currentTier).name),
-        windows: quotaWindows(summary),
+        windows,
       },
       warning: null,
     };
