@@ -247,26 +247,22 @@ export function createAntigravityAcpUsage(options: {
     const paidTier = object(entitlement.paidTier);
     const base = paidTier.usesGcpTos === true ? PROD : DAILY;
     const quotaBody = JSON.stringify({ project: credentials.project_id });
-    // Both backends carry a different quota window (short cycle vs weekly),
-    // so per-model shares are read from prod and daily alike.
-    const [summary, prodModels, dailyModels] = await Promise.all([
+    // The per-model quota reports the currently governing window — the prod
+    // backend returns a notional full share for consumer tiers, so only the
+    // tier's own base carries real measurements.
+    const [summary, models] = await Promise.all([
       request(`${base}/v1internal:retrieveUserQuotaSummary`, {
         method: "POST", headers, body: quotaBody,
       }),
-      request(`${PROD}/v1internal:fetchAvailableModels`, {
-        method: "POST", headers, body: quotaBody,
-      }),
-      request(`${DAILY}/v1internal:fetchAvailableModels`, {
+      request(`${base}/v1internal:fetchAvailableModels`, {
         method: "POST", headers, body: quotaBody,
       }),
     ]);
     const windows = quotaWindows(summary);
     const taken = new Set(windows.map(w => w.label));
-    for (const models of [prodModels, dailyModels]) {
-      const derived = modelWindows(models, taken, options.now());
-      for (const w of derived) taken.add(w.label);
-      windows.push(...derived);
-    }
+    const derived = modelWindows(models, taken, options.now());
+    for (const w of derived) taken.add(w.label);
+    windows.push(...derived);
     if (windows.length === 0) {
       throw new QuotaError("Google did not report usable quota windows.");
     }
