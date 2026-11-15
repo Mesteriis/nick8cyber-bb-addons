@@ -6,6 +6,7 @@ import {
   actualPlanLabel,
   selectAccountResources
 } from "../usage-policy.js";
+import { createAntigravityAcpUsage } from "../antigravity-acp-usage.js";
 const require = __createRequire(import.meta.url);
 const __bbUserHome = require("node:os").homedir();
 const __bbToolPath = [`${__bbUserHome}/.local/bin`, `${__bbUserHome}/.npm-global/bin`, "/usr/local/bin", "/usr/bin", "/bin"].join(":");
@@ -15327,6 +15328,9 @@ function providerUsagePlugin(bb, options = {}) {
     }
     return globalThis.fetch(url, init);
   };
+  const nativeAntigravity = createAntigravityAcpUsage({
+    userHome: getUserHome, fetch: customFetch, now: getNow
+  });
   const runExecFileSync = (file, args, opts) => {
     if (typeof options.execFile === "function") {
       return options.execFile(file, args, opts);
@@ -15673,6 +15677,31 @@ function providerUsagePlugin(bb, options = {}) {
 
   const agyAccountsCache = new Map();
   const agyInFlight = new Map();
+  const agyAccountLabels = (baseDir) => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    if (!fs.existsSync(baseDir)) return [];
+    let state = {};
+    try {
+      state = JSON.parse(fs.readFileSync(path.join(baseDir, "..", "accounts-state.json"), "utf8"));
+    } catch {}
+    return fs.readdirSync(baseDir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .filter(label => {
+        const token = path.join(baseDir, label, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+        if (!fs.existsSync(token)) return false;
+        // A profile explicitly removed from rotation and transferred to ACP
+        // belongs to that provider's card. Leave all other pool entries alone.
+        if (state.accounts?.[label]?.priority !== 0) return true;
+        let email = null;
+        try {
+          email = JSON.parse(fs.readFileSync(token, "utf8"))?.id_token_email ?? null;
+        } catch {}
+        return email === null || email !== nativeAntigravity.accountEmail();
+      })
+      .sort();
+  };
 
   const getCachedAgyAccounts = () => {
     try {
@@ -15680,13 +15709,7 @@ function providerUsagePlugin(bb, options = {}) {
       const path = require("node:path");
       const home = getUserHome();
       const baseDir = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
-      if (!fs.existsSync(baseDir)) return [];
-      const entries = fs.readdirSync(baseDir, { withFileTypes: true });
-      const labels = entries
-        .filter(e => e.isDirectory())
-        .map(e => e.name)
-        .filter(name => fs.existsSync(path.join(baseDir, name, ".gemini", "antigravity-cli", "antigravity-oauth-token")))
-        .sort();
+      const labels = agyAccountLabels(baseDir);
       return labels.map(label => ({
         label,
         usage: agyAccountsCache.get(label)?.usage ?? null
@@ -15830,14 +15853,7 @@ function providerUsagePlugin(bb, options = {}) {
       const agyBin = getAgyPath();
       const baseDir = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
       const statePath = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts-state.json");
-      if (!fs.existsSync(baseDir)) return [];
-
-      const entries = fs.readdirSync(baseDir, { withFileTypes: true });
-      const labels = entries
-        .filter(e => e.isDirectory())
-        .map(e => e.name)
-        .filter(name => fs.existsSync(path.join(baseDir, name, ".gemini", "antigravity-cli", "antigravity-oauth-token")))
-        .sort();
+      const labels = agyAccountLabels(baseDir);
 
       const ttl = Math.max(maxAgeMs || 0, 180000);
       const staleLabels = [];
@@ -15991,7 +16007,7 @@ function providerUsagePlugin(bb, options = {}) {
       bb.sdk.hosts.list().then((hosts2) => hosts2.filter((host) => host.type !== "ephemeral")),
       bb.sdk.plugins.experimental_discoverRpc({ method: usageListMethod }),
       bb.sdk.providers.list(
-        hostId === void 0 ? { capability: "usage" } : { capability: "usage", hostId }
+        hostId === void 0 ? {} : { hostId }
       ).catch(() => []),
       bb.sdk.system.config().catch(() => null)
     ]);
@@ -16105,7 +16121,7 @@ function providerUsagePlugin(bb, options = {}) {
 
     const selected = [...inventories.values()].flatMap(
       (source) => source.resources.filter((resource) => {
-        if (resource.providerId.startsWith("acp-")) return false;
+        if (resource.providerId.startsWith("acp-") && resource.providerId !== "acp-antigravity") return false;
         const machineId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
         return (request.providerId === null || resource.providerId === request.providerId) &&
                (request.machineIds === null || request.machineIds.includes(machineId)) &&
@@ -16134,6 +16150,19 @@ function providerUsagePlugin(bb, options = {}) {
 
     const shouldFetchCodex = request.providerId === null || request.providerId === "codex";
     const shouldFetchAgy = request.providerId === null || request.providerId === "agy";
+    const nativeAcpMeta = providers.find(p => p.id === "acp-antigravity" && p.available !== false);
+    const nativeAcpSource = [...inventories.values()].some(source =>
+      source.resources.some(resource => resource.providerId === "acp-antigravity" &&
+        resource.scope.kind === "host" && resource.scope.hostId === primaryHostId));
+    const shouldFetchNativeAcp = nativeAcpMeta && !nativeAcpSource &&
+      hosts.some(host => host.id === primaryHostId && host.status === "connected") &&
+      (request.machineIds === null || request.machineIds.includes(primaryHostId)) &&
+      (request.providerId === null || request.providerId === "acp-antigravity");
+    const nativeAcpUsage = nativeAcpMeta && !nativeAcpSource
+      ? shouldFetchNativeAcp
+        ? await nativeAntigravity.get(request.force, request.maxAgeMs)
+        : nativeAntigravity.getCached()
+      : null;
 
     let piResult = null;
     if (shouldFetchCodex) {
@@ -16299,13 +16328,33 @@ function providerUsagePlugin(bb, options = {}) {
         }
       }
 
-      machine.providers = machine.providers.filter((p) => !p.providerId.startsWith("acp-"));
+      if (machine.id === primaryHostId && nativeAcpUsage !== null) {
+        machine.providers.push({
+          // providerId owns the separate provider tab. Keep id free of the
+          // "agy" prefix: this card's only quota can be third-party models,
+          // and the agy pool's optional filter must not blank it.
+          id: "acp-antigravity",
+          providerId: "acp-antigravity",
+          displayName: nativeAcpMeta?.displayName ?? "Google Antigravity",
+          accountLabel: nativeAcpUsage.usage?.accountEmail ?? null,
+          logoUrl: nativeAcpMeta?.logoUrl ?? "/api/v1/system/providers/acp-antigravity/logo",
+          icon: nativeAcpMeta?.icon ?? null,
+          strings: { iconTint: normalizedTint(nativeAcpMeta?.strings?.iconTint) },
+          signInHint: "Sign in to the Google Antigravity ACP provider.",
+          expiredHint: "The Google Antigravity sign-in expired. Reconnect that provider.",
+          usage: normalizedUsage(nativeAcpUsage.usage),
+          warning: nativeAcpUsage.warning
+        });
+      }
+      machine.providers = machine.providers.filter((p) =>
+        !p.providerId.startsWith("acp-") || p.providerId === "acp-antigravity");
     }
 
     const providerOrder = new Map([
       ["codex", 0],
       ["claude-code", 1],
-      ["agy", 2]
+      ["agy", 2],
+      ["acp-antigravity", 3]
     ]);
     for (const machine of machines) {
       machine.providers.sort(
@@ -16320,6 +16369,7 @@ function providerUsagePlugin(bb, options = {}) {
     for (const value of measurements.values()) value.loadedAt = 0;
     codexPiCache.loadedAt = 0;
     for (const v of agyAccountsCache.values()) v.loadedAt = 0;
+    nativeAntigravity.invalidate();
   };
   bb.events.on("thread.idle", markDirty);
   bb.events.on("thread.failed", markDirty);
