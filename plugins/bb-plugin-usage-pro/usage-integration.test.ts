@@ -67,6 +67,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       loadCodeAssist?: { status: number; body: any };
       quota?: { status: number; body: any };
       models?: { status: number; body: any };
+      modelsDaily?: { status: number; body: any };
     };
   };
 
@@ -145,6 +146,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       }
       if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")) {
         return googleReply(cfg.googleResponses?.quota);
+      }
+      if (urlStr.includes("daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")) {
+        return googleReply(cfg.googleResponses?.modelsDaily ?? cfg.googleResponses?.models ?? { status: 200, body: { models: {} } });
       }
       if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")) {
         return googleReply(cfg.googleResponses?.models ?? { status: 200, body: { models: {} } });
@@ -1274,8 +1278,34 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           },
         },
         // The grouped summary omits the Gemini family for this tier;
-        // fetchAvailableModels carries its shared remaining share.
+        // fetchAvailableModels carries its shares — prod holds the short
+        // 5-hour cycle, daily holds the weekly cycle.
         models: {
+          status: 200,
+          body: {
+            models: {
+              "gemini-3-flash": {
+                displayName: "Gemini 3 Flash",
+                apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+                quotaInfo: { remainingFraction: 1, resetTime: "2023-11-15T02:00:00Z" },
+              },
+              "gemini-2.5-pro": {
+                displayName: "Gemini 2.5 Pro",
+                apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+                quotaInfo: { remainingFraction: 1, resetTime: "2023-11-15T02:00:00Z" },
+              },
+              "claude-sonnet-5-5-low": {
+                apiProvider: "API_PROVIDER_ANTHROPIC_VERTEX",
+                quotaInfo: { remainingFraction: 0, resetTime: "2026-11-18T05:18:41Z" },
+              },
+              "tab_flash_lite_preview": {
+                apiProvider: "API_PROVIDER_INTERNAL",
+                quotaInfo: { remainingFraction: 1 },
+              },
+            },
+          },
+        },
+        modelsDaily: {
           status: 200,
           body: {
             models: {
@@ -1284,18 +1314,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
                 apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
                 quotaInfo: { remainingFraction: 0.04, resetTime: "2026-11-20T23:08:16Z" },
               },
-              "gemini-2.5-pro": {
-                displayName: "Gemini 2.5 Pro",
-                apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
-                quotaInfo: { remainingFraction: 0.04, resetTime: "2026-11-20T23:08:16Z" },
-              },
               "claude-sonnet-5-5-low": {
                 apiProvider: "API_PROVIDER_ANTHROPIC_VERTEX",
                 quotaInfo: { resetTime: "2026-11-18T05:18:41Z" },
-              },
-              "tab_flash_lite_preview": {
-                apiProvider: "API_PROVIDER_INTERNAL",
-                quotaInfo: { remainingFraction: 1 },
               },
             },
           },
@@ -1316,15 +1337,20 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(card.accountLabel).toBe("user-a@example.com");
     expect(card.usage.status).toBe("ok");
     expect(card.usage.planLabel).toBe("Antigravity");
-    // Disabled 5h bucket skipped; the weekly bucket plus the model-derived
-    // Gemini family window remain.
-    expect(card.usage.windows).toHaveLength(2);
-    expect(card.usage.windows[0].label).toBe("Claude Weekly");
-    expect(card.usage.windows[0].usedPercent).toBe(100);
-    expect(card.usage.windows[0].resetsAt).toBe("2026-11-18T05:18:41Z");
-    expect(card.usage.windows[1].label).toBe("Gemini Weekly");
-    expect(card.usage.windows[1].usedPercent).toBe(96);
-    expect(card.usage.windows[1].resetsAt).toBe("2026-11-20T23:08:16Z");
+    // All four pool-style windows: short cycles sort before weekly ones.
+    expect(card.usage.windows).toHaveLength(4);
+    expect(card.usage.windows[0].label).toBe("Claude 5h");
+    expect(card.usage.windows[0].usedPercent).toBe(0);
+    expect(card.usage.windows[0].resetsAt).toBe("2026-11-16T03:18:12Z");
+    expect(card.usage.windows[1].label).toBe("Gemini 5h");
+    expect(card.usage.windows[1].usedPercent).toBe(0);
+    expect(card.usage.windows[1].resetsAt).toBe("2023-11-15T02:00:00Z");
+    expect(card.usage.windows[2].label).toBe("Claude Weekly");
+    expect(card.usage.windows[2].usedPercent).toBe(100);
+    expect(card.usage.windows[2].resetsAt).toBe("2026-11-18T05:18:41Z");
+    expect(card.usage.windows[3].label).toBe("Gemini Weekly");
+    expect(card.usage.windows[3].usedPercent).toBe(96);
+    expect(card.usage.windows[3].resetsAt).toBe("2026-11-20T23:08:16Z");
 
     // The native card must not leak onto other hosts.
     const remote = snap.machines.find((m: any) => m.id === "host-remote");

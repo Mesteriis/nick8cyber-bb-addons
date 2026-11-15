@@ -63,9 +63,6 @@ function quotaWindows(response: Json): UsageWindow[] {
     if (!Array.isArray(group.buckets)) continue;
     for (const rawBucket of group.buckets) {
       const bucket = object(rawBucket);
-      // A disabled five-hour bucket does not represent usable capacity while
-      // its weekly limit is exhausted.
-      if (bucket.disabled === true) continue;
       const fraction = bucket.remainingFraction;
       if (typeof fraction !== "number" || !Number.isFinite(fraction) ||
           fraction < 0 || fraction > 1) {
@@ -110,7 +107,7 @@ function modelWindows(response: Json, taken: Set<string>, now: number): UsageWin
     const provider = text(model.apiProvider) ?? "";
     const family = provider.includes("GOOGLE_GEMINI") ? "Gemini"
       : /Claude|GPT|OPENAI|ANTHROPIC/.test(provider) ? "Claude" : null;
-    if (family === null || taken.has(family)) continue;
+    if (family === null) continue;
     const quota = object(model.quotaInfo);
     const rawFraction = quota.remainingFraction;
     const fraction = typeof rawFraction === "number" && Number.isFinite(rawFraction)
@@ -127,8 +124,10 @@ function modelWindows(response: Json, taken: Set<string>, now: number): UsageWin
   }
   const windows: UsageWindow[] = [];
   for (const [family, quota] of families) {
+    const label = `${family} ${windowKind(quota.resetsAt, now)}`;
+    if (taken.has(label)) continue;
     windows.push({
-      label: `${family} ${windowKind(quota.resetsAt, now)}`,
+      label,
       usedPercent: Math.round((1 - quota.fraction) * 10_000) / 100,
       resetsAt: quota.resetsAt,
       cost: null,
@@ -244,17 +243,26 @@ export function createAntigravityAcpUsage(options: {
     const paidTier = object(entitlement.paidTier);
     const base = paidTier.usesGcpTos === true ? PROD : DAILY;
     const quotaBody = JSON.stringify({ project: credentials.project_id });
-    const [summary, models] = await Promise.all([
+    // Both backends carry a different quota window (short cycle vs weekly),
+    // so per-model shares are read from prod and daily alike.
+    const [summary, prodModels, dailyModels] = await Promise.all([
       request(`${base}/v1internal:retrieveUserQuotaSummary`, {
         method: "POST", headers, body: quotaBody,
       }),
-      request(`${base}/v1internal:fetchAvailableModels`, {
+      request(`${PROD}/v1internal:fetchAvailableModels`, {
+        method: "POST", headers, body: quotaBody,
+      }),
+      request(`${DAILY}/v1internal:fetchAvailableModels`, {
         method: "POST", headers, body: quotaBody,
       }),
     ]);
     const windows = quotaWindows(summary);
-    const taken = new Set(windows.map(w => w.label.split(" ")[0]));
-    windows.push(...modelWindows(models, taken, options.now()));
+    const taken = new Set(windows.map(w => w.label));
+    for (const models of [prodModels, dailyModels]) {
+      const derived = modelWindows(models, taken, options.now());
+      for (const w of derived) taken.add(w.label);
+      windows.push(...derived);
+    }
     if (windows.length === 0) {
       throw new QuotaError("Google did not report usable quota windows.");
     }
