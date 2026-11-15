@@ -10,7 +10,7 @@ bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin 
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-agy
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin pi-gateways
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin speak
-bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin sidebar-collapse
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin compact-ui
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin tasks-pro
 ```
 
@@ -200,7 +200,7 @@ Highlight API, so bb's DOM is never rewritten.
 Details in
 [plugins/bb-plugin-privacy-blur/README.md](plugins/bb-plugin-privacy-blur/README.md).
 
-### `sidebar-collapse`
+### `compact-ui`
 
 The sidebar keeps the first five chats of every project and folds the rest
 behind **Ещё N**. Expanding reaches the next decade, then adds ten roots
@@ -223,11 +223,11 @@ desktop and mobile, with overflow absorbed by the editor's own scroll —
 [ADR 0019](docs/adr/0019-composer-viewport-cap.md).
 
 ```bash
-bb plugin config sidebar-collapse set visibleThreads 10
+bb plugin config compact-ui set visibleThreads 10
 ```
 
 Details in
-[plugins/bb-plugin-sidebar-collapse/README.md](plugins/bb-plugin-sidebar-collapse/README.md).
+[plugins/bb-plugin-compact-ui/README.md](plugins/bb-plugin-compact-ui/README.md).
 
 ### `thread-timestamps`
 
@@ -296,3 +296,16 @@ bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin 
 ```
 
 Details and upstream attribution: [Server Switcher](plugins/bb-plugin-server-switcher/README.md).
+
+## Development
+
+`scripts/check-changed-plugins.sh [base-ref]` — release gate: runs `npm test`
+and `tsc --noEmit` only in the `plugins/` directories changed vs the base ref
+(default `origin/main`); exits non-zero on any failure, exits 0 when no plugin
+is affected. Requires a clean working tree (untracked files are ignored) — only
+committed changes are checked. A plugin's `node_modules` must be a real
+directory carrying every `devDependencies` binary under `.bin`: a symlink
+(shared store) is unlinked with `rm -f` first, and a missing binary (e.g.
+`tsc`) also makes `npm ci` run again. On failure the tail of the output lists
+the failed test names per plugin — TAP `not ok` and vitest `FAIL`/`×` lines —
+because the release journal keeps only the tail.

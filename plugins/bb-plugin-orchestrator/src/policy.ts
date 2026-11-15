@@ -8,6 +8,8 @@
  * level whose whole chain is unavailable refuses delegation at call time.
  */
 import { OrchestratorError } from "./errors.js";
+import { RU } from "./i18n/ru.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export interface PolicyRoute {
   preset: string;
@@ -15,10 +17,22 @@ export interface PolicyRoute {
   quotaGroup?: string;
   quotaPatterns?: string[];
   unavailablePatterns?: string[];
+  /** §2 rule 4: per-route first-response window, overrides the global one. */
+  firstResponseSeconds?: number;
+  /** §16.5: no turn for this long → one coordinator message (default 600). */
+  startSeconds?: number;
+  /** §16.5: response silence this long → one coordinator message (default 1800). */
+  idleSeconds?: number;
 }
+
+/** §2.3: what a level's delegation does — executes or only checks. */
+export type LevelRole = "auditor" | "executor";
 
 export interface PolicyLevel {
   description?: string;
+  /** §2.3: `auditor` marks a review level; default `executor`, except a
+   * level named `review` which stays `auditor` as before. */
+  role?: LevelRole;
   chain: string[];
   autoFallback?: boolean;
 }
@@ -32,9 +46,29 @@ export interface Policy {
   version: 1;
   limits?: PolicyLimits;
   firstResponseSeconds?: number;
+  /** §17.2 (e2e 8): first-response window for `--preset` one-off routes
+   * when no policy route on the same provider carries its own
+   * `firstResponseSeconds`, e.g. `{"codex": 300}`. */
+  firstResponseSecondsByProvider?: Record<string, number>;
   maxRunSeconds?: number;
+  /** §18.5 (PLUG-245): таймауты сторожа/плагина — по ключам. */
+  timing?: PolicyTiming;
+  /** §2.3: executor level → the auditor level that reviews its work. */
+  reviewByLevel?: Record<string, string>;
   levels: Record<string, PolicyLevel>;
   routes: Record<string, PolicyRoute>;
+}
+
+/** §18.5: настраиваемые таймауты сторожа (policy.timing). */
+export interface PolicyTiming {
+  /** Холд квоты/маршрута после quota/unavailable (default 15). */
+  quotaHoldMinutes?: number;
+  /** Повторная строка «ждёт решения» не чаще (default 10). */
+  approvalRepeatMinutes?: number;
+  /** Окно неизвестного результата раздачи (default 5). */
+  postDispatchGraceMinutes?: number;
+  /** Окно ожидания BB-нотифика о результате (default 120 с). */
+  bbNotifyWaitSeconds?: number;
 }
 
 export interface PolicyIssue {
@@ -52,8 +86,9 @@ export interface PolicyLoad {
   unavailableRoutes: string[];
 }
 
-export const EMPTY_POLICY_MESSAGE =
-  "политика не задана — настройте через навык `orchestrator-setup`";
+/** Compat export — the `ru` catalog value; language-aware callers use
+ * `t("pol.empty")`. */
+export const EMPTY_POLICY_MESSAGE = RU["pol.empty"]!;
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
   typeof x === "object" && x !== null && !Array.isArray(x);
@@ -72,6 +107,10 @@ const isPositiveInt = (x: unknown): x is number =>
 export function parsePolicy(
   text: string | undefined,
   knownPresets?: ReadonlySet<string>,
+  /** §16.8: preset name/id → facts; used for the executor-worktree warning. */
+  presetDetails?: ReadonlyMap<string, { environmentKind?: string | null }>,
+  /** §18.1 (PLUG-247a): parse messages come from the language catalog. */
+  t: T = T_RU,
 ): PolicyLoad {
   const errors: PolicyIssue[] = [];
   const warnings: PolicyIssue[] = [];
@@ -87,7 +126,7 @@ export function parsePolicy(
   });
 
   if (!text || text.trim() === "") {
-    err("policy", EMPTY_POLICY_MESSAGE);
+    err("policy", t("pol.empty"));
     return done();
   }
 
@@ -95,19 +134,19 @@ export function parsePolicy(
   try {
     raw = JSON.parse(text);
   } catch (e) {
-    err("$", `невалидный JSON: ${(e as Error).message}`);
+    err("$", t("pol.badJson", { error: (e as Error).message }));
     return done();
   }
   if (!isRecord(raw)) {
-    err("$", "политика должна быть JSON-объектом");
+    err("$", t("pol.notObject"));
     return done();
   }
 
   // Rule 1.
-  if (raw.version !== 1) err("version", "version must be 1");
+  if (raw.version !== 1) err("version", t("pol.version"));
 
   const routesRaw = isRecord(raw.routes) ? raw.routes : undefined;
-  if (!routesRaw) err("routes", "required object of route definitions");
+  if (!routesRaw) err("routes", t("pol.routesReq"));
 
   // Routes.
   const routes: Record<string, PolicyRoute> = {};
@@ -115,17 +154,17 @@ export function parsePolicy(
     for (const [name, value] of Object.entries(routesRaw)) {
       const path = `routes.${name}`;
       if (!isRecord(value)) {
-        err(path, "route must be an object");
+        err(path, t("pol.routeObject"));
         continue;
       }
       if (!isNonEmptyString(value.preset)) {
-        err(`${path}.preset`, "required non-empty preset name");
+        err(`${path}.preset`, t("pol.presetReq"));
       }
       if (!isNonEmptyString(value.provider)) {
-        err(`${path}.provider`, "required non-empty provider id");
+        err(`${path}.provider`, t("pol.providerReq"));
       }
       if (value.quotaGroup !== undefined && !isNonEmptyString(value.quotaGroup)) {
-        err(`${path}.quotaGroup`, "must be a non-empty string");
+        err(`${path}.quotaGroup`, t("pol.nonEmptyString"));
       }
       // Rules 5 + 6: quota and removed-model pattern lists share the shape.
       const patternsOf = (
@@ -134,19 +173,49 @@ export function parsePolicy(
         const raw = value[key];
         if (raw === undefined) return undefined;
         if (!Array.isArray(raw)) {
-          err(`${path}.${key}`, "must be an array of non-empty strings");
+          err(`${path}.${key}`, t("pol.stringArray"));
           return undefined;
         }
-        if (raw.length > 20) err(`${path}.${key}`, "at most 20 patterns");
+        if (raw.length > 20) err(`${path}.${key}`, t("pol.maxPatterns"));
         const bad = raw.findIndex((p) => !isNonEmptyString(p));
         if (bad >= 0) {
-          err(`${path}.${key}[${bad}]`, "must be a non-empty string");
+          err(`${path}.${key}[${bad}]`, t("pol.nonEmptyString"));
           return undefined;
         }
         return raw.map((p) => (p as string).trim());
       };
       const quotaPatterns = patternsOf("quotaPatterns");
       const unavailablePatterns = patternsOf("unavailablePatterns");
+      // Rule 4, per route: a cold-start-heavy provider gets its own window.
+      let routeFirst: number | undefined;
+      if (value.firstResponseSeconds !== undefined) {
+        const v = value.firstResponseSeconds;
+        if (typeof v !== "number" || v < 30 || v > 600) {
+          err(`${path}.firstResponseSeconds`, t("pol.seconds30600"));
+        } else {
+          routeFirst = v;
+        }
+      }
+      // §16.5, per route: the stall notices — `startSeconds` (no turn
+      // began) and `idleSeconds` (response silence) — one message each.
+      let routeStart: number | undefined;
+      if (value.startSeconds !== undefined) {
+        const v = value.startSeconds;
+        if (typeof v !== "number" || v < 30) {
+          err(`${path}.startSeconds`, t("pol.numGe30"));
+        } else {
+          routeStart = v;
+        }
+      }
+      let routeIdle: number | undefined;
+      if (value.idleSeconds !== undefined) {
+        const v = value.idleSeconds;
+        if (typeof v !== "number" || v < 60) {
+          err(`${path}.idleSeconds`, t("pol.numGe60"));
+        } else {
+          routeIdle = v;
+        }
+      }
       if (isNonEmptyString(value.preset) && isNonEmptyString(value.provider)) {
         routes[name] = {
           preset: value.preset,
@@ -156,6 +225,11 @@ export function parsePolicy(
             : {}),
           ...(quotaPatterns ? { quotaPatterns } : {}),
           ...(unavailablePatterns ? { unavailablePatterns } : {}),
+          ...(routeFirst !== undefined
+            ? { firstResponseSeconds: routeFirst }
+            : {}),
+          ...(routeStart !== undefined ? { startSeconds: routeStart } : {}),
+          ...(routeIdle !== undefined ? { idleSeconds: routeIdle } : {}),
         };
       }
     }
@@ -164,35 +238,41 @@ export function parsePolicy(
   // Levels + rule 2 (chain references).
   const levels: Record<string, PolicyLevel> = {};
   if (!isRecord(raw.levels)) {
-    err("levels", "required object of level definitions");
+    err("levels", t("pol.levelsReq"));
   } else {
     for (const [name, value] of Object.entries(raw.levels)) {
       const path = `levels.${name}`;
       if (!isRecord(value)) {
-        err(path, "level must be an object");
+        err(path, t("pol.levelObject"));
         continue;
       }
       if (value.description !== undefined && typeof value.description !== "string") {
-        err(`${path}.description`, "must be a string");
+        err(`${path}.description`, t("pol.isString"));
       }
       if (value.autoFallback !== undefined && typeof value.autoFallback !== "boolean") {
-        err(`${path}.autoFallback`, "must be a boolean");
+        err(`${path}.autoFallback`, t("pol.isBool"));
+      }
+      // §2.3: the level's role — `auditor` (review) or `executor`.
+      if (
+        value.role !== undefined &&
+        value.role !== "auditor" &&
+        value.role !== "executor"
+      ) {
+        err(`${path}.role`, t("pol.roleEnum"));
       }
       let chain: string[] = [];
       if (!Array.isArray(value.chain) || value.chain.length === 0) {
-        err(`${path}.chain`, "required non-empty array of route names");
+        err(`${path}.chain`, t("pol.chainReq"));
       } else {
         const bad = value.chain.findIndex((r) => !isNonEmptyString(r));
         if (bad >= 0) {
-          err(`${path}.chain[${bad}]`, "route name must be a non-empty string");
+          err(`${path}.chain[${bad}]`, t("pol.routeNameStr"));
         } else {
           chain = value.chain.map((r) => (r as string).trim());
           chain.forEach((routeName, i) => {
             if (!routesRaw || !(routeName in routesRaw)) {
               err(
-                `${path}.chain[${i}]`,
-                `route "${routeName}" is not declared in routes`,
-              );
+                `${path}.chain[${i}]`, t("pol.routeUndeclared", { route: routeName }));
             }
           });
         }
@@ -200,6 +280,9 @@ export function parsePolicy(
       levels[name] = {
         ...(typeof value.description === "string"
           ? { description: value.description }
+          : {}),
+        ...(value.role === "auditor" || value.role === "executor"
+          ? { role: value.role }
           : {}),
         chain,
         ...(typeof value.autoFallback === "boolean"
@@ -209,17 +292,66 @@ export function parsePolicy(
     }
   }
 
+  // §2.3: reviewByLevel — executor level → auditor level that reviews it.
+  // Every map value must name a declared level with the auditor role.
+  let reviewByLevel: Record<string, string> | undefined;
+  if (raw.reviewByLevel !== undefined) {
+    if (!isRecord(raw.reviewByLevel)) {
+      err("reviewByLevel", t("pol.reviewByLevelObject"));
+    } else {
+      reviewByLevel = {};
+      for (const [execLevel, reviewLevel] of Object.entries(
+        raw.reviewByLevel,
+      )) {
+        // §2.3: the map key is the EXECUTED level — it must name a
+        // declared level with the executor role.
+        const source = levels[execLevel];
+        const sourceRole = source
+          ? (source.role ?? (execLevel === "review" ? "auditor" : "executor"))
+          : undefined;
+        if (!source) {
+          err(
+            `reviewByLevel.${execLevel}`, t("pol.levelUndeclared", { level: execLevel }));
+          continue;
+        }
+        if (sourceRole !== "executor") {
+          err(
+            `reviewByLevel.${execLevel}`, t("pol.levelNotExecutor", { level: execLevel }));
+          continue;
+        }
+        if (!isNonEmptyString(reviewLevel)) {
+          err(`reviewByLevel.${execLevel}`, t("pol.levelName"));
+          continue;
+        }
+        const target = levels[reviewLevel];
+        if (!target) {
+          err(
+            `reviewByLevel.${execLevel}`, t("pol.levelUndeclared", { level: reviewLevel }));
+          continue;
+        }
+        const targetRole =
+          target.role ?? (reviewLevel === "review" ? "auditor" : "executor");
+        if (targetRole !== "auditor") {
+          err(
+            `reviewByLevel.${execLevel}`, t("pol.levelNotAuditor", { level: reviewLevel }));
+          continue;
+        }
+        reviewByLevel[execLevel] = reviewLevel;
+      }
+    }
+  }
+
   // Rule 3.
   let limits: PolicyLimits | undefined;
   if (raw.limits !== undefined) {
     if (!isRecord(raw.limits)) {
-      err("limits", "must be an object");
+      err("limits", t("pol.isObject"));
     } else {
       const l = raw.limits;
       let maxActive: number | undefined;
       if (l.maxActive !== undefined) {
         if (!isPositiveInt(l.maxActive)) {
-          err("limits.maxActive", "must be an integer ≥ 1");
+          err("limits.maxActive", t("pol.intGe1"));
         } else {
           maxActive = l.maxActive;
         }
@@ -227,19 +359,17 @@ export function parsePolicy(
       let perLevel: Record<string, number> | undefined;
       if (l.perLevel !== undefined) {
         if (!isRecord(l.perLevel)) {
-          err("limits.perLevel", "must be an object of level → cap");
+          err("limits.perLevel", t("pol.perLevelObject"));
         } else {
           perLevel = {};
           for (const [levelName, cap] of Object.entries(l.perLevel)) {
             if (!isPositiveInt(cap)) {
-              err(`limits.perLevel.${levelName}`, "must be an integer ≥ 1");
+              err(`limits.perLevel.${levelName}`, t("pol.intGe1"));
               continue;
             }
             if (maxActive !== undefined && cap > maxActive) {
               err(
-                `limits.perLevel.${levelName}`,
-                `must be ≤ limits.maxActive (${maxActive})`,
-              );
+                `limits.perLevel.${levelName}`, t("pol.capOverMax", { max: maxActive }));
               continue;
             }
             perLevel[levelName] = cap;
@@ -255,16 +385,64 @@ export function parsePolicy(
   if (raw.firstResponseSeconds !== undefined) {
     const v = raw.firstResponseSeconds;
     if (typeof v !== "number" || v < 30 || v > 600) {
-      err("firstResponseSeconds", "must be a number in 30–600");
+      err("firstResponseSeconds", t("pol.seconds30600"));
     } else {
       firstResponseSeconds = v;
     }
   }
+  // §17.2 (e2e 8): per-provider first-response windows for one-off
+  // preset dispatches — same 30–600 bounds as the route/global fields.
+  let firstResponseSecondsByProvider: Record<string, number> | undefined;
+  if (raw.firstResponseSecondsByProvider !== undefined) {
+    if (!isRecord(raw.firstResponseSecondsByProvider)) {
+      err(
+        "firstResponseSecondsByProvider", t("pol.byProviderObject"));
+    } else {
+      firstResponseSecondsByProvider = {};
+      for (const [providerId, v] of Object.entries(
+        raw.firstResponseSecondsByProvider,
+      )) {
+        if (typeof v !== "number" || v < 30 || v > 600) {
+          err(
+            `firstResponseSecondsByProvider.${providerId}`, t("pol.seconds30600"));
+          continue;
+        }
+        firstResponseSecondsByProvider[providerId] = v;
+      }
+    }
+  }
+  /* §18.5: policy.timing — вне пределов предупреждение и дефолт. */
+  const timing: PolicyTiming = {};
+  if (raw.timing !== undefined) {
+    if (!isRecord(raw.timing)) {
+      warn("timing", t("pol.timingObjectIgnored"));
+    } else {
+      const bounds: Record<keyof PolicyTiming, [number, number]> = {
+        quotaHoldMinutes: [1, 1440],
+        approvalRepeatMinutes: [1, 1440],
+        postDispatchGraceMinutes: [1, 1440],
+        bbNotifyWaitSeconds: [5, 3600],
+      };
+      for (const [key, [min, max]] of Object.entries(bounds) as [
+        keyof PolicyTiming,
+        [number, number],
+      ][]) {
+        const v = raw.timing[key];
+        if (v === undefined) continue;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
+          warn(`timing.${key}`, t("pol.outOfBoundsDefault", { min: min, max: max }));
+        } else {
+          timing[key] = v;
+        }
+      }
+    }
+  }
+
   let maxRunSeconds: number | undefined;
   if (raw.maxRunSeconds !== undefined) {
     const v = raw.maxRunSeconds;
     if (typeof v !== "number" || v < 300) {
-      err("maxRunSeconds", "must be a number ≥ 300");
+      err("maxRunSeconds", t("pol.numGe300"));
     } else {
       maxRunSeconds = v;
     }
@@ -274,8 +452,26 @@ export function parsePolicy(
   if (routesRaw && knownPresets) {
     for (const [name, route] of Object.entries(routes)) {
       if (!knownPresets.has(route.preset)) {
-        warn(`routes.${name}.preset`, `preset "${route.preset}" not found in bb tasks preset list`);
+        warn(`routes.${name}.preset`, t("pol.presetNotFound", { preset: route.preset }));
         unavailableRoutes.push(name);
+      }
+    }
+  }
+
+  // §16.8: an executor-level preset must give the executor its own
+  // worktree — a preset that does not create one is a warning.
+  if (presetDetails) {
+    for (const [levelName, level] of Object.entries(levels)) {
+      const role = level.role ?? (levelName === "review" ? "auditor" : "executor");
+      if (role !== "executor") continue;
+      for (const routeName of level.chain) {
+        const route = routes[routeName];
+        if (!route) continue;
+        const detail = presetDetails.get(route.preset);
+        if (detail && detail.environmentKind !== "new-worktree") {
+          warn(
+            `routes.${routeName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
+        }
       }
     }
   }
@@ -285,8 +481,13 @@ export function parsePolicy(
     policy: {
       version: 1,
       ...(limits ? { limits } : {}),
+      ...(reviewByLevel ? { reviewByLevel } : {}),
       ...(firstResponseSeconds !== undefined ? { firstResponseSeconds } : {}),
+      ...(firstResponseSecondsByProvider !== undefined
+        ? { firstResponseSecondsByProvider }
+        : {}),
       ...(maxRunSeconds !== undefined ? { maxRunSeconds } : {}),
+      ...(Object.keys(timing).length > 0 ? { timing } : {}),
       levels,
       routes,
     },
@@ -299,6 +500,53 @@ export function parsePolicy(
 /** Quota group a route belongs to: its `quotaGroup`, or itself. */
 export function quotaGroupOf(route: PolicyRoute, name: string): string {
   return route.quotaGroup ?? name;
+}
+
+/**
+ * §2.3: the effective role of a level — its `role` field, or the default:
+ * a level named `review` audits (as before r24), every other executes.
+ * `release-audit` keeps its own role (§13.1) — callers needing the thread
+ * role use `roleForLevel` in roles.ts.
+ */
+export function levelRole(
+  policy: Policy | null | undefined,
+  levelName: string,
+): LevelRole {
+  const role = policy?.levels[levelName]?.role;
+  if (role) return role;
+  return levelName === "review" ? "auditor" : "executor";
+}
+
+/**
+ * §2.3 (уточнение PLUG-182): the hold names a burned `preset:<name>`
+ * one-off shares — the quota group of every policy route on the same
+ * provider AND the same model (preset `modelId` from `bb tasks preset
+ * show`/`list`), plus the one-off route's own name so the preset itself
+ * is paused for re-dispatch. A route whose preset model is unknown does
+ * not join — a one-off never pauses same-provider routes on other models.
+ */
+export function quotaGroupsForOneOff(
+  policy: Policy | null | undefined,
+  oneOff: { route: string; provider: string; modelId?: string | null },
+  presetModels: ReadonlyMap<string, string | null | undefined>,
+): string[] {
+  const groups = new Set<string>([oneOff.route]);
+  const want = baseModelId(oneOff.modelId);
+  if (!policy || !want) return [...groups];
+  for (const [name, route] of Object.entries(policy.routes)) {
+    if (route.provider !== oneOff.provider) continue;
+    if (baseModelId(presetModels.get(route.preset)) !== want) continue;
+    groups.add(quotaGroupOf(route, name));
+  }
+  return [...groups];
+}
+
+/** §2.3: model ids compare without the bracketed variant suffix —
+ * `claude-opus-5-5[1m]` and `claude-opus-5-5` share one quota. */
+function baseModelId(
+  modelId: string | null | undefined,
+): string | null | undefined {
+  return modelId?.replace(/\[[^\]]*\]\s*$/, "");
 }
 
 /** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */
@@ -345,11 +593,13 @@ export function pickRoute(
   };
   if (opts.requested !== undefined) {
     const name = opts.requested;
-    if (!level.chain.includes(name)) {
+    // §2.3: `--route` names any route of the policy, not only the level's
+    // chain — the chain is only the fallback order.
+    if (!policy.routes[name]) {
       throw new OrchestratorError(
         "unknown-route",
-        `route "${name}" is not in the chain of level "${levelName}"`,
-        `chain: ${level.chain.join(" → ")}`,
+        `route "${name}" is not declared in routes`,
+        `routes: ${Object.keys(policy.routes).join(", ")}`,
       );
     }
     if (!usable(name)) {

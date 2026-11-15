@@ -4,6 +4,9 @@
  * `thread_roles` are added by the roles task (PLUG-141), after these.
  */
 import type { Database } from "better-sqlite3";
+import { OrchestratorError } from "./errors.js";
+import type { EventHookSetting } from "./events.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export const MIGRATIONS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS delegations (
@@ -62,7 +65,276 @@ export const MIGRATIONS: readonly string[] = [
     decided_at INTEGER NOT NULL,
     source TEXT NOT NULL CHECK (source IN ('hook','delegate'))
   )`,
+  // orchestrator-release §2: one release pipeline run per task at a time;
+  // published rows double as the step-7 «выложено в обход» reference.
+  `CREATE TABLE IF NOT EXISTS releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    coordinator_thread_id TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    target_action TEXT NOT NULL CHECK (target_action IN ('push','pr')),
+    target_branch TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+      'auditing','rejected','publishing','published','failed'
+    )),
+    head_sha TEXT,
+    published_sha TEXT,
+    remote_base_sha TEXT,
+    audit_delegation_id INTEGER,
+    no_docs_reason TEXT,
+    kb_note TEXT,
+    no_kb_reason TEXT,
+    pr_url TEXT,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS releases_active_task_idx
+    ON releases(task_key) WHERE status IN ('auditing','publishing')`,
+  `CREATE INDEX IF NOT EXISTS releases_task_idx ON releases(task_key)`,
+  // §7 rev 23 (ADR-0024): rounds — every dispatch gets `round` and an
+  // optional `continue_from`; `result_*` — the round's outcome read from
+  // the executor's worktree at `done` (§4.1); `merge_*` — the §14 merge
+  // step's record, filled by the merge task. One migration statement per
+  // column (SQLite has no multi-column ALTER); exec'd as one migration.
+  `ALTER TABLE delegations ADD COLUMN round INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE delegations ADD COLUMN continue_from TEXT;
+   ALTER TABLE delegations ADD COLUMN result_branch TEXT;
+   ALTER TABLE delegations ADD COLUMN result_sha TEXT;
+   ALTER TABLE delegations ADD COLUMN result_commits INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_dirty INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_env_id TEXT;
+   ALTER TABLE delegations ADD COLUMN merge_status TEXT;
+   ALTER TABLE delegations ADD COLUMN merged_into TEXT;
+   ALTER TABLE delegations ADD COLUMN merged_sha TEXT;
+   ALTER TABLE delegations ADD COLUMN merged_at INTEGER`,
+  // §2.3 r24 (PLUG-182): the dispatch used an explicit `--route`/`--preset`
+  // — its §5.4 reissue restarts the level chain from the beginning.
+  `ALTER TABLE delegations ADD COLUMN explicit_route INTEGER NOT NULL DEFAULT 0`,
+  // §16.6 (PLUG-191): with `threadIds` off the remote branch is a neutral
+  // `release/<sha7>` recorded at the first release and reused by repeats
+  // — one branch and one PR per task.
+  `ALTER TABLE releases ADD COLUMN publish_branch TEXT`,
+  // §7 rev 24/25: `result_notified_at`/`result_notice` — the §16.5 result
+  // delivery's record (`plugin` when the plugin message went out, NULL
+  // notice when the coordinator was already gone); `revived_count` —
+  // §16.2, how often a finished delegation came back to `running`;
+  // `last_response_at` — §16.5 `idleSeconds`, the newest response-event
+  // time of the current turn. `plugin_meta` — key/value service state
+  // (the post-compaction reminder's per-coordinator cursor).
+  `ALTER TABLE delegations ADD COLUMN result_notified_at INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_notice TEXT;
+   ALTER TABLE delegations ADD COLUMN revived_count INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE delegations ADD COLUMN last_response_at INTEGER;
+   CREATE TABLE IF NOT EXISTS plugin_meta (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL
+   )`,
+  // §7 rev 25 rollout: delegations finished BEFORE the §16.5 delivery
+  // columns existed already reached the coordinator through BB's own
+  // parent notifications — they are marked `legacy` so the first
+  // reconcile does not re-send every stale result (PLUG-184 B1). The
+  // marker covers EVERY terminal status: it doubles as the rollout
+  // last_seq-sync scope — only rows already terminal at the migration
+  // may be force-advanced (PLUG-193 #4; a row closed after the rollout
+  // keeps its live cursor for the §16.2 wake rule).
+  `UPDATE delegations SET result_notified_at = CAST(strftime('%s','now') AS INTEGER) * 1000,
+     result_notice = 'legacy'
+   WHERE status IN ('done','cancelled','failed','stalled','quota','reissued')
+     AND result_notified_at IS NULL`,
+  // §15 janitor, one migration: the per-env ledger (`first_seen_at` is the
+  // first run the copy was seen merged — «влита» state), the run log, and
+  // a small key-value table (daily coordinator-notify watermark).
+  `CREATE TABLE IF NOT EXISTS janitor_items (
+    env_id TEXT PRIMARY KEY,
+    project_id TEXT,
+    thread_id TEXT,
+    path TEXT,
+    branch TEXT,
+    state TEXT NOT NULL CHECK (state IN ('removed','kept','reported')),
+    reason TEXT,
+    size_kb INTEGER,
+    first_seen_at INTEGER,
+    last_checked_at INTEGER,
+    removed_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS janitor_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    removed INTEGER NOT NULL DEFAULT 0,
+    kept INTEGER NOT NULL DEFAULT 0,
+    freed_kb INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+  );
+  CREATE TABLE IF NOT EXISTS janitor_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )`,
+  // §17.3 (ревью PLUG-210): `pipeline_shas` — JSON-массив SHA коммитов,
+  // которые создал сам конвейер выкладки на публикуемой ветке (синк-
+  // слияние, трейлер --no-docs). Гейт ревью не считает их чужими, в том
+  // числе на повторном запуске после отказа.
+  `ALTER TABLE releases ADD COLUMN pipeline_shas TEXT`,
+  // §17.4 (ревью PLUG-218): `tip_sha` — вершина удаляемого (ветка —
+  // её tip, копия — tip её ветки; HEAD копии уходит в журнал и
+  // `run --json`). Восстановление ветки: `git branch <ветка> <sha>`,
+  // пока gc не убрал объекты (ADR-0024 «Восстановимость»).
+  `ALTER TABLE janitor_items ADD COLUMN tip_sha TEXT`,
+  // orchestrator-release §6 (r8, PLUG-231): проект настройки выкладки,
+  // определённый один раз на шаге 1 — шаги 6–7 и повторные заходы той же
+  // выкладки берут его из записи и заново не ищут.
+  `ALTER TABLE releases ADD COLUMN settings_project_id TEXT`,
+  // §4.1 r28 (PLUG-237): «задача без кода» — делегирование, не требующее
+  // коммитов. Наследуется перевыпуском (§5.4); новый delegate без флага
+  // — снова обычная раздача.
+  `ALTER TABLE delegations ADD COLUMN no_code INTEGER NOT NULL DEFAULT 0`,
+  // §16.4 r29 (PLUG-240): журнал спасений — каждая попытка снимка
+  // грязной копии (и сбой) строкой: тред, ref, корень репозитория,
+  // причина, время и дошла ли строка координатору. `janitor report`
+  // читает её, не обходя репозитории, — спасённое без адресата не
+  // теряется.
+  `CREATE TABLE IF NOT EXISTS janitor_rescues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    ref TEXT,
+    repo_root TEXT,
+    reason TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at INTEGER NOT NULL
+  )`,
+  // orchestrator-release §7 (r10): `notified_at` — итоговая строка п.1
+  // отправлена (захват -1 до отправки, stale 2 мин); `repo_root` —
+  // realpath основного каталога репозитория, идентичность цели п.0;
+  // `pr_*` — слежение за PR п.3 (одна запись на pr_url, 72 ч,
+  // счётчик сбоев gh). В delegations `verdict_*` — напоминание
+  // ревьюеру/аудитору без вердикта (§17 r31).
+  `ALTER TABLE releases ADD COLUMN notified_at INTEGER`,
+  `ALTER TABLE releases ADD COLUMN repo_root TEXT`,
+  `ALTER TABLE releases ADD COLUMN pr_state TEXT`,
+  `ALTER TABLE releases ADD COLUMN pr_checked_at INTEGER`,
+  `ALTER TABLE releases ADD COLUMN pr_closed_at INTEGER`,
+  `ALTER TABLE releases ADD COLUMN pr_stale_notified INTEGER`,
+  `ALTER TABLE releases ADD COLUMN pr_error_count INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE delegations ADD COLUMN verdict_nudged_at INTEGER`,
+  `ALTER TABLE delegations ADD COLUMN verdict_nudge_seq INTEGER`,
+  `UPDATE releases SET notified_at = CAST(strftime('%s','now') AS INTEGER)*1000
+   WHERE status IN ('published','rejected','failed') AND notified_at IS NULL`,
+  `UPDATE releases SET pr_state = 'legacy'
+   WHERE pr_url IS NOT NULL AND pr_state IS NULL`,
+  // orchestrator-release §2 п.5 (r10): итоговая строка собирается один
+  // раз и хранится до доставки (`notice_text`, `notice_kind`) — повтор
+  // такта только переотправляет сохранённый текст, работу п.2 и
+  // пост-проверку заново не выполняет.
+  `ALTER TABLE releases ADD COLUMN notice_text TEXT`,
+  `ALTER TABLE releases ADD COLUMN notice_kind TEXT`,
+  // orchestrator §18.2 (r32, PLUG-245): журнал запускаемых команд —
+  // queued переживает рестарт, running сверяется по pid + proc_start,
+  // живая группа убивается до пометки interrupted. argv/cwd/env/stdin
+  // хранятся в строке, чтобы запись queued запускалась после рестарта
+  // без перечитывания конфига.
+  `CREATE TABLE command_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    run_key TEXT NOT NULL UNIQUE,
+    group_key TEXT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    argv TEXT,
+    cwd TEXT,
+    env TEXT,
+    stdin TEXT,
+    timeout_sec INTEGER,
+    pid INTEGER,
+    pgid INTEGER,
+    proc_start TEXT,
+    exit_code INTEGER,
+    output_tail TEXT,
+    queued_at INTEGER,
+    started_at INTEGER,
+    finished_at INTEGER
+  )`,
+  `CREATE INDEX command_runs_status ON command_runs(status)`,
+  `CREATE INDEX command_runs_group ON command_runs(group_key)`,
+  // orchestrator-release §2 п.6 (r11): merge-коммит PR для строки «влит → sha7».
+  `ALTER TABLE releases ADD COLUMN pr_merge_sha TEXT`,
+  // orchestrator §18.5 (r32, PLUG-246): таблица событий — запись идёт в
+  // той же транзакции, что и переход, и там же сопоставляется с хуками
+  // (queued в command_runs); позже событие хукам не сопоставляется.
+  // verdict_event_at — отметка «review.verdict уже порождён» (один раз
+  // на делегирование). notify_on_fail — флаг хука на момент постановки.
+  `CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `ALTER TABLE delegations ADD COLUMN verdict_event_at INTEGER`,
+  `ALTER TABLE command_runs ADD COLUMN notify_on_fail INTEGER NOT NULL DEFAULT 0`,
 ];
+
+export type CommandRunStatus =
+  | "queued"
+  | "running"
+  | "ok"
+  | "failed"
+  | "timeout"
+  | "interrupted"
+  | "skipped";
+
+/** §18.2 (r32): запись журнала одного запуска команды. */
+export interface CommandRunRow {
+  id: number;
+  /** postPublish | eventHook | prProvider — источник команды. */
+  source: string;
+  run_key: string;
+  /** Одна running на group_key — команды одной выкладки последовательны. */
+  group_key: string | null;
+  name: string;
+  status: CommandRunStatus;
+  argv: string | null;
+  cwd: string | null;
+  env: string | null;
+  stdin: string | null;
+  timeout_sec: number | null;
+  pid: number | null;
+  pgid: number | null;
+  /** /proc/<pid>/stat starttime — отличие «наш лидер» от чужого pid. */
+  proc_start: string | null;
+  exit_code: number | null;
+  output_tail: string | null;
+  /** §18.5: флаг notifyOnFail хука на момент постановки (0/1). */
+  notify_on_fail: number;
+  queued_at: number | null;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export interface CommandRunSpec {
+  source: string;
+  runKey: string;
+  groupKey?: string;
+  name: string;
+  argv: string[];
+  cwd: string;
+  env?: Record<string, string>;
+  stdin?: string;
+  timeoutSec?: number;
+  /** §18.5: у хуков — флаг notifyOnFail на момент постановки. */
+  notifyOnFail?: boolean;
+}
+
+/** §18.5: запись таблицы событий — payload это JSON события v1
+ * (тот же документ, что уходит хуку в stdin). */
+export interface EventRow {
+  id: number;
+  kind: string;
+  payload: string;
+  created_at: number;
+}
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
 
@@ -97,6 +369,34 @@ export interface DelegationRow {
   timeout_notified_at: number | null;
   resume_count: number;
   retry_count: number;
+  round: number;
+  continue_from: string | null;
+  result_branch: string | null;
+  result_sha: string | null;
+  result_commits: number | null;
+  result_dirty: number | null;
+  result_env_id: string | null;
+  merge_status: string | null;
+  merged_into: string | null;
+  merged_sha: string | null;
+  merged_at: number | null;
+  /** §2.3: the dispatch named an explicit `--route`/`--preset` (reissue
+   * restarts the chain from its beginning). */
+  explicit_route: number;
+  result_notified_at: number | null;
+  result_notice: string | null;
+  revived_count: number;
+  last_response_at: number | null;
+  /** §4.1 r28: «задача без кода» — коммитов не ждём, коммиты — находка. */
+  no_code: number;
+  /** §17 r31: ревьюер/аудитор завершил ход без вердикта — напоминание
+   * отправлено (время и seq журнала на момент отправки). */
+  verdict_nudged_at: number | null;
+  verdict_nudge_seq: number | null;
+  /** §18.5: событие review.verdict уже порождено (один раз на
+   * делегирование — оживший тред повторяет delegation.done, но не
+   * review.verdict). */
+  verdict_event_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -110,6 +410,61 @@ export interface RouteHoldRow {
 export interface PendingRoleRow {
   project_id: string;
   role: string;
+  updated_at: number;
+}
+
+export type ReleaseStatus =
+  | "auditing"
+  | "rejected"
+  | "publishing"
+  | "published"
+  | "failed";
+
+export interface ReleaseRow {
+  id: number;
+  task_key: string;
+  project_id: string;
+  coordinator_thread_id: string;
+  repo_path: string;
+  branch: string;
+  target_action: "push" | "pr";
+  target_branch: string;
+  status: ReleaseStatus;
+  head_sha: string | null;
+  published_sha: string | null;
+  remote_base_sha: string | null;
+  audit_delegation_id: number | null;
+  no_docs_reason: string | null;
+  kb_note: string | null;
+  no_kb_reason: string | null;
+  pr_url: string | null;
+  publish_branch: string | null;
+  /** §17.3: JSON-массив SHA, созданных конвейером на этой выкладке. */
+  pipeline_shas: string | null;
+  /** §6 (r8): проект настройки, записанный на шаге 1. */
+  settings_project_id: string | null;
+  /** §2 r10 п.5: итоговая строка п.1 отправлена; отрицательное —
+   * захват до отправки (минус время захвата, stale 2 мин). */
+  notified_at: number | null;
+  /** §2 r10 п.5: итоговая строка, собранная до отправки — повтор такта
+   * переотправляет её, не повторяя работу. */
+  notice_text: string | null;
+  notice_kind: string | null;
+  /** §2 r10 п.0: realpath основного каталога репозитория — идентичность
+   * цели вместе с target_branch. */
+  repo_root: string | null;
+  /** §2 r10 п.3: open | closed | merged | error | legacy |
+   * superseded | closed_final — «72 ч» это флаг pr_stale_notified,
+   * не состояние (опрос до MERGED/CLOSED продолжается молча). */
+  pr_state: string | null;
+  pr_checked_at: number | null;
+  pr_closed_at: number | null;
+  pr_stale_notified: number | null;
+  pr_error_count: number;
+  /** §2 п.6 (r11): merge-коммит влитого PR — строка «влит → sha7». */
+  pr_merge_sha: string | null;
+  error: string | null;
+  created_at: number;
   updated_at: number;
 }
 
@@ -134,6 +489,14 @@ export const normalizeTaskKey = (key: string) => key.trim().toUpperCase();
 export class DelegationStore {
   private readonly db: Database;
 
+  /** §18.5: действующие хуки событий и каталог их запуска — назначает
+   * сервер после разбора настройки `eventHooks`; провайдер синхронный
+   * (сопоставление — внутри транзакции перехода). null — хуков нет,
+   * события в таблицу пишутся всё равно. */
+  eventHooksProvider:
+    | (() => { hooks: EventHookSetting[]; cwd: string } | null)
+    | null = null;
+
   constructor(db: Database) {
     this.db = db;
   }
@@ -147,14 +510,21 @@ export class DelegationStore {
     route: string;
     preset: string;
     provider: string;
+    round?: number;
+    continueFrom?: string | null;
+    /** §2.3: set when the dispatch named an explicit `--route`/`--preset`. */
+    explicitRoute?: boolean;
+    /** §4.1 r28: «задача без кода» (`delegate --no-code`). */
+    noCode?: boolean;
   }): DelegationRow {
     const now = Date.now();
     const info = this.db
       .prepare(
         `INSERT INTO delegations (
           task_key, task_id, project_id, coordinator_thread_id, level, route,
-          preset, provider, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
+          preset, provider, status, round, continue_from, explicit_route,
+          no_code, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         normalizeTaskKey(input.taskKey),
@@ -165,6 +535,10 @@ export class DelegationStore {
         input.route,
         input.preset,
         input.provider,
+        input.round ?? 1,
+        input.continueFrom ?? null,
+        input.explicitRoute ? 1 : 0,
+        input.noCode ? 1 : 0,
         now,
         now,
       );
@@ -271,9 +645,16 @@ export class DelegationStore {
   }
 
   setStatus(id: number, status: DelegationStatus): void {
-    this.db
-      .prepare(`UPDATE delegations SET status = ?, updated_at = ? WHERE id = ?`)
-      .run(status, Date.now(), id);
+    this.db.transaction(() => {
+      const at = Date.now();
+      this.db
+        .prepare(
+          `UPDATE delegations SET status = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(status, at, id);
+      const row = this.get(id);
+      if (row) this.emitDelegationTransition(row, status, at);
+    })();
   }
 
   /**
@@ -285,14 +666,23 @@ export class DelegationStore {
     id: number,
     from: DelegationStatus,
     to: DelegationStatus,
+    /** §18.5: у делегирования ревью — прочитанный вердикт (r31) для
+     * события review.verdict в той же транзакции. */
+    opts?: { reviewVerdict?: { verdict: string; blockers: number | null } },
   ): boolean {
-    const info = this.db
-      .prepare(
-        `UPDATE delegations SET status = ?, updated_at = ?
-         WHERE id = ? AND status = ?`,
-      )
-      .run(to, Date.now(), id, from);
-    return info.changes > 0;
+    return this.db.transaction(() => {
+      const at = Date.now();
+      const info = this.db
+        .prepare(
+          `UPDATE delegations SET status = ?, updated_at = ?
+           WHERE id = ? AND status = ?`,
+        )
+        .run(to, at, id, from);
+      if (info.changes === 0) return false;
+      const row = this.get(id);
+      if (row) this.emitDelegationTransition(row, to, at, opts);
+      return true;
+    })();
   }
 
   addSetupError(id: number, step: string, message: string): void {
@@ -403,6 +793,229 @@ export class DelegationStore {
       .run(Date.now(), id);
   }
 
+  /** §16.5: latest response-event time of the current turn (idleSeconds). */
+  setLastResponse(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations
+         SET last_response_at = MAX(COALESCE(last_response_at, -1), ?),
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /**
+   * §16.5: the coordinator was told (or could not be told — a gone
+   * coordinator records `result_notified_at` with a NULL `result_notice`
+   * so the delivery does not rescan forever).
+   */
+  setResultNotified(id: number, notice: "bb" | "plugin" | "legacy" | null): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = ?, result_notice = ?,
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), notice, Date.now(), id);
+  }
+
+  /**
+   * §16.2: a `turn/started` on a finished delegation revives it — back to
+   * `running`, `revived_count += 1`, and the delivery record cleared so
+   * the next `done`/`cancelled` notifies again. The check for another
+   * ACTIVE delegation of the same task runs inside the transaction —
+   * otherwise the partial unique index throws mid-handler (PLUG-184).
+   * Returns false when a sibling already owns the task.
+   */
+  revive(id: number): boolean {
+    return this.db.transaction(() => {
+      const row = this.get(id);
+      if (!row) return false;
+      const other = this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE task_key = ? AND id <> ?
+             AND status IN ('dispatching','running') LIMIT 1`,
+        )
+        .get(row.task_key, id) as { x: number } | undefined;
+      if (other) return false;
+      this.db
+        .prepare(
+          `UPDATE delegations SET status = 'running',
+           revived_count = revived_count + 1,
+           result_notified_at = NULL, result_notice = NULL,
+           first_response_at = NULL, last_response_at = NULL, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(Date.now(), id);
+      // §16.5: the next `done` re-opens BB's grace window — a stale
+      // `result-window` marker would skip it and send over BB's notice.
+      // A stale `coordinator-cancel` (PLUG-224) would keep «без отчёта»
+      // wrongly suppressed on the new round.
+      try {
+        const errors = (
+          JSON.parse(row.setup_errors) as { step?: string }[]
+        ).filter(
+          (e) =>
+            e?.step !== "result-window" && e?.step !== "coordinator-cancel",
+        );
+        this.db
+          .prepare(
+            `UPDATE delegations SET setup_errors = ? WHERE id = ?`,
+          )
+          .run(JSON.stringify(errors), id);
+      } catch {
+        // A corrupt setup_errors stays as is — the window gate tolerates
+        // a stale marker (its timestamp is old, i.e. already elapsed).
+      }
+      return true;
+    })();
+  }
+
+  /**
+   * §16.2: only the task's NEWEST delegation may revive — a row with a
+   * bigger id is a past round that must never work again.
+   */
+  hasNewerForTask(taskKey: string, id: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE task_key = ? AND id > ? LIMIT 1`,
+        )
+        .get(taskKey, id) !== undefined
+    );
+  }
+
+  /**
+   * §16.5 exactly-once (PLUG-184): the in-flight delivery marker —
+   * `UPDATE … WHERE` is atomic, so a second caller (event vs reconcile
+   * pass, or a second plugin process) sees the claim and leaves.
+   * `updated_at` doubles as the claim's time: a crash mid-delivery
+   * leaves the `-1` until it goes stale — the same predicate that
+   * `listPendingResult` rescans lets the claim be TAKEN again after
+   * two minutes, so a killed send cannot lose the result (PLUG-190).
+   */
+  claimResultDelivery(id: number): boolean {
+    const staleBefore = Date.now() - 120_000;
+    const info = this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = -1, updated_at = ?
+         WHERE id = ? AND (
+           result_notified_at IS NULL
+           OR (result_notified_at = -1 AND updated_at < ?)
+         )`,
+      )
+      .run(Date.now(), id, staleBefore);
+    return info.changes > 0;
+  }
+
+  /** A claimed delivery failed before the send — release it for a retry. */
+  releaseResultClaim(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = NULL
+         WHERE id = ? AND result_notified_at = -1`,
+      )
+      .run(id);
+  }
+
+  /** §16.5: `done`/`cancelled` rows whose result was not delivered yet —
+   * plus claims that went stale (a crash mid-delivery). */
+  listPendingResult(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status IN ('done','cancelled') AND (
+           result_notified_at IS NULL
+           OR (result_notified_at = -1 AND updated_at < ?)
+         )
+         ORDER BY id`,
+      )
+      .all(Date.now() - 120_000) as DelegationRow[];
+  }
+
+  /** §16.5 rollout (PLUG-193 #4): rows already terminal when the
+   * delivery migration ran — the last_seq sync scope. A row closed
+   * after the rollout (`result_notice` unset/'plugin'/'bb') is never
+   * force-advanced: its post-cursor turns are real and go through the
+   * §16.2 wake rule. */
+  listLegacyTerminal(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE result_notice = 'legacy' AND thread_id IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /** Terminal rows that still name a thread — the §16.2 wake scan
+   * scope (PLUG-193 #3; a stale cursor would let a HISTORICAL turn
+   * revive or suppress them, PLUG-190). */
+  listTerminalWithThread(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status NOT IN ('dispatching','running')
+           AND thread_id IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /** Distinct coordinator threads the store knows — the §16.5 reminder's scope. */
+  coordinatorThreadIds(): string[] {
+    const rows = this.db
+      .prepare(`SELECT DISTINCT coordinator_thread_id AS t FROM delegations`)
+      .all() as { t: string }[];
+    return rows.map((r) => r.t);
+  }
+
+  /** §17.2 (мелко 6): coordinator threads that still own an ACTIVE
+   * delegation — the post-compaction reminder polls only these, not the
+   * whole history of coordinators every minute. */
+  activeCoordinatorThreadIds(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT coordinator_thread_id AS t FROM delegations
+         WHERE status IN ('dispatching','running')`,
+      )
+      .all() as { t: string }[];
+    return rows.map((r) => r.t);
+  }
+
+  /** §17.2 (мелко 6): status counts of ONE coordinator's delegations —
+   * the reminder names only its own rows, not global totals. */
+  countsByStatusForCoordinator(
+    coordinatorThreadId: string,
+  ): Record<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) AS n FROM delegations
+         WHERE coordinator_thread_id = ? GROUP BY status`,
+      )
+      .all(coordinatorThreadId) as { status: string; n: number }[];
+    return Object.fromEntries(rows.map((r) => [r.status, r.n]));
+  }
+
+  /** `plugin_meta` — durable service cursors (post-compaction reminder). */
+  metaGet(key: string): string | undefined {
+    return (
+      this.db.prepare(`SELECT value FROM plugin_meta WHERE key = ?`).get(key) as
+        | { value: string }
+        | undefined
+    )?.value;
+  }
+
+  metaSet(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO plugin_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
+  }
+
   /** §7 retry limit: another failed retry of the same action. */
   bumpRetry(id: number): void {
     this.db
@@ -460,23 +1073,85 @@ export class DelegationStore {
   /**
    * Routes an automatic reissue already sent this task to (§5.4): a route
    * may be picked at most once per task — but only auto-reissues count,
-   * routes of manual delegations stay eligible.
+   * routes of manual delegations stay eligible. §17.2 (мелко 4): the
+   * budget is per ROUND — a later round's chain may re-walk routes an
+   * earlier round already burned, so callers pass the current `round`.
    */
-  routesUsedByTask(taskKey: string): Set<string> {
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT route FROM delegations
-         WHERE task_key = ? AND reissue_of IS NOT NULL`,
-      )
-      .all(normalizeTaskKey(taskKey)) as { route: string }[];
+  routesUsedByTask(taskKey: string, round?: number): Set<string> {
+    const key = normalizeTaskKey(taskKey);
+    const rows = (
+      round === undefined
+        ? this.db
+            .prepare(
+              `SELECT DISTINCT route FROM delegations
+               WHERE task_key = ? AND reissue_of IS NOT NULL`,
+            )
+            .all(key)
+        : this.db
+            .prepare(
+              `SELECT DISTINCT route FROM delegations
+               WHERE task_key = ? AND reissue_of IS NOT NULL AND round = ?`,
+            )
+            .all(key, round)
+    ) as { route: string }[];
     return new Set(rows.map((r) => r.route));
+  }
+
+  /**
+   * §17.2 r26 (PLUG-211 С2/мелко 2): the auto-reissue budget's «заход» is
+   * one reissue CHAIN — the root dispatch (`reissue_of` NULL) plus every
+   * row reissued from it. Round numbers are no longer one-per-chain:
+   * review and release-audit dispatches share the executor's round space
+   * but form their own chains, so their route reserve counts separately
+   * and never eats the executor round's budget (or vice versa).
+   * `reissuesOnly` mirrors `routesUsedByTask` — only routes an
+   * auto-reissue already burned; without it every route of the chain
+   * counts (the explicit --route/--preset restart rule).
+   */
+  chainUsedRoutes(
+    row: DelegationRow,
+    opts: { reissuesOnly?: boolean } = {},
+  ): Set<string> {
+    const rows = this.delegationsByTask(row.task_key);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const rootOf = (r: DelegationRow): number => {
+      let cur = r;
+      const seen = new Set<number>();
+      while (cur.reissue_of != null && !seen.has(cur.reissue_of)) {
+        seen.add(cur.reissue_of);
+        const prev = byId.get(cur.reissue_of);
+        if (!prev) break;
+        cur = prev;
+      }
+      return cur.id;
+    };
+    const root = rootOf(row);
+    return new Set(
+      rows
+        .filter((r) => !opts.reissuesOnly || r.reissue_of != null)
+        .filter((r) => rootOf(r) === root)
+        .map((r) => r.route),
+    );
+  }
+
+  /** Rows whose `setup_errors` carry an entry for `step` — the §7 scans
+   * (e.g. `notify-muted` marks needing the `auto` restore, §17.2 r26). */
+  listBySetupError(step: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE setup_errors LIKE ? ORDER BY id`,
+      )
+      .all(`%"step":"${step}"%`) as DelegationRow[];
   }
 
   /**
    * §5.4 reissue in one transaction: the old row moves to `reissued` and a
    * new `dispatching` row with `reissue_of` is inserted atomically, so a
    * service restart mid-reissue cannot leave a duplicate. Returns the new
-   * row, or undefined when the old row already left `stalled`/`quota`.
+   * row, or undefined when the old row already left `stalled`/`quota`/
+   * `failed`. The reissue retries the SAME round (§4.1 r23): it inherits
+   * `round` and `continue_from`, so a later manual delegate is the next
+   * round, not the reissue.
    */
   reissue(
     id: number,
@@ -484,7 +1159,12 @@ export class DelegationStore {
   ): DelegationRow | undefined {
     return this.db.transaction(() => {
       const row = this.get(id);
-      if (!row || (row.status !== "stalled" && row.status !== "quota")) {
+      if (
+        !row ||
+        (row.status !== "stalled" &&
+          row.status !== "quota" &&
+          row.status !== "failed")
+      ) {
         return undefined;
       }
       const now = Date.now();
@@ -497,8 +1177,9 @@ export class DelegationStore {
         .prepare(
           `INSERT INTO delegations (
             task_key, task_id, project_id, coordinator_thread_id, level,
-            route, preset, provider, status, reissue_of, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?)`,
+            route, preset, provider, status, reissue_of, round, continue_from,
+            explicit_route, no_code, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.task_key,
@@ -510,12 +1191,151 @@ export class DelegationStore {
           next.preset,
           next.provider,
           id,
+          row.round,
+          row.continue_from,
+          // §5.4 (PLUG-186): an explicit --route/--preset lineage keeps
+          // restarting the chain and skipping every used route — the
+          // flag must reach each reissue, not just the first one.
+          row.explicit_route,
+          // §4.1 r28: a reissue is the same dispatch — the «без кода»
+          // mark inherits with the round fields.
+          row.no_code,
           now,
           now,
         );
       return this.get(Number(info.lastInsertRowid));
     })();
   }
+
+  /**
+   * §4.1: the next round number for a task — one above the highest round
+   * the task already has.
+   */
+  nextRound(taskKey: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(round), 0) + 1 AS n FROM delegations
+         WHERE task_key = ?`,
+      )
+      .get(normalizeTaskKey(taskKey)) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * §4.1: the newest delegation of the task with a recorded round result —
+   * the SHA the next round continues from.
+   */
+  latestResultByTask(taskKey: string): DelegationRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE task_key = ? AND result_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as DelegationRow | undefined;
+  }
+
+  /**
+   * §4.1: the recorded result a `continue_from` sha points at — its branch
+   * and the round that produced it — for the «Заход N» / «Проверяемый
+   * итог» instruction texts. Null when the ref names no recorded result
+   * (e.g. an arbitrary `--from` commit).
+   */
+  resultRefForSha(
+    taskKey: string,
+    sha: string,
+  ): { branch: string | null; round: number } | null {
+    const row = this.db
+      .prepare(
+        `SELECT result_branch, round FROM delegations
+         WHERE task_key = ? AND result_sha = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), sha) as
+      | { result_branch: string | null; round: number }
+      | undefined;
+    return row ? { branch: row.result_branch, round: row.round } : null;
+  }
+
+  /** §4.1: record the executor worktree's state at `done`. §17.2 (С3):
+   * a CHANGED `result_sha` — a revived thread that committed more —
+   * voids the recorded merge: the new commits were never merged, so
+   * `merge` must no longer answer `already-merged` and `release` must
+   * not publish the stale `merged_into` range. */
+  setRoundResult(
+    id: number,
+    result: {
+      envId?: string | null;
+      branch: string | null;
+      sha: string;
+      commits: number | null;
+      dirty: boolean;
+    },
+  ): void {
+    const prev = this.get(id);
+    const shaChanged = prev != null && prev.result_sha !== result.sha;
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_env_id = ?, result_branch = ?,
+         result_sha = ?, result_commits = ?, result_dirty = ?,
+         merge_status = CASE WHEN ? THEN NULL ELSE merge_status END,
+         merged_into = CASE WHEN ? THEN NULL ELSE merged_into END,
+         merged_sha = CASE WHEN ? THEN NULL ELSE merged_sha END,
+         merged_at = CASE WHEN ? THEN NULL ELSE merged_at END,
+         updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        result.envId ?? null,
+        result.branch,
+        result.sha,
+        result.commits,
+        result.dirty ? 1 : 0,
+        shaChanged ? 1 : 0,
+        shaChanged ? 1 : 0,
+        shaChanged ? 1 : 0,
+        shaChanged ? 1 : 0,
+        Date.now(),
+        id,
+      );
+  }
+
+  /**
+   * §14: the newest `done` delegation of the task with a recorded round
+   * result — the row `merge <KEY>` targets.
+   */
+  latestDoneResultByTask(taskKey: string): DelegationRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE task_key = ? AND status = 'done' AND result_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as DelegationRow | undefined;
+  }
+
+  /** §14: the merge landed — record target branch, merge commit, time. */
+  setMerged(id: number, merged: { into: string; sha: string }): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET merge_status = 'merged', merged_into = ?,
+         merged_sha = ?, merged_at = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(merged.into, merged.sha, Date.now(), Date.now(), id);
+  }
+
+  /** §14: a merge outcome that produced no merge commit. */
+  setMergeStatus(
+    id: number,
+    status: "conflict" | "fix-delegated" | "failed",
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET merge_status = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(status, Date.now(), id);
+  }
+
 
   /** Drop every `setup_errors` entry of one step — after a successful retry. */
   clearSetupError(id: number, step: string): void {
@@ -581,6 +1401,30 @@ export class DelegationStore {
       .run(projectId, role, Date.now());
   }
 
+  /** All recorded thread roles, optionally filtered — the §17.1 r26
+   * migration's scope (hook-written `orchestrator` rows). */
+  listThreadRoles(
+    filter: { role?: string; source?: ThreadRoleSource } = {},
+  ): ThreadRoleRow[] {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (filter.role) {
+      where.push("role = ?");
+      args.push(filter.role);
+    }
+    if (filter.source) {
+      where.push("source = ?");
+      args.push(filter.source);
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM thread_roles` +
+          (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
+          ` ORDER BY thread_id`,
+      )
+      .all(...args) as ThreadRoleRow[];
+  }
+
   /** The decided role of a thread, when the hook or delegate recorded it. */
   threadRole(threadId: string): ThreadRoleRow | undefined {
     return this.db
@@ -609,4 +1453,1307 @@ export class DelegationStore {
       )
       .run(threadId, role, Date.now(), source);
   }
+
+  // ── Releases (orchestrator-release §2/§7) ─────────────────────────
+
+  insertRelease(input: {
+    taskKey: string;
+    projectId: string;
+    coordinatorThreadId: string;
+    repoPath: string;
+    branch: string;
+    targetAction: "push" | "pr";
+    targetBranch: string;
+    noDocsReason?: string | null;
+    kbNote?: string | null;
+    noKbReason?: string | null;
+    /** §6 (r8): resolved on step 1; absent only on pre-r8 rows. */
+    settingsProjectId?: string | null;
+    /** §2 r10 п.0: realpath основного каталога репозитория. С ним
+     * вставка атомарно отказывает, когда в ту же цель (repo_root +
+     * target_branch) уже идёт auditing/publishing выкладка. */
+    repoRoot?: string | null;
+  }, t: T = T_RU): ReleaseRow {
+    const now = Date.now();
+    const insert = this.db.transaction((): ReleaseRow => {
+      if (input.repoRoot) {
+        const busy = this.db
+          .prepare(
+            `SELECT id, task_key FROM releases
+             WHERE status IN ('auditing','publishing')
+               AND target_branch = ? AND repo_root = ? LIMIT 1`,
+          )
+          .get(input.targetBranch, input.repoRoot) as
+          | { id: number; task_key: string }
+          | undefined;
+        if (busy) {
+          throw new OrchestratorError(
+            "release-target-busy",
+            t("store.busyTarget", {
+              target: input.targetBranch,
+              busyKey: busy.task_key,
+            }),
+          );
+        }
+      }
+      const info = this.db
+        .prepare(
+          `INSERT INTO releases (
+            task_key, project_id, coordinator_thread_id, repo_path, branch,
+            target_action, target_branch, status, no_docs_reason, kb_note,
+            no_kb_reason, settings_project_id, repo_root, created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'auditing', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          normalizeTaskKey(input.taskKey),
+          input.projectId,
+          input.coordinatorThreadId,
+          input.repoPath,
+          input.branch,
+          input.targetAction,
+          input.targetBranch,
+          input.noDocsReason ?? null,
+          input.kbNote ?? null,
+          input.noKbReason ?? null,
+          input.settingsProjectId ?? null,
+          input.repoRoot ?? null,
+          now,
+          now,
+        );
+      return this.getRelease(Number(info.lastInsertRowid))!;
+    });
+    return insert();
+  }
+
+  /** §2 r10 п.0: активные выкладки без записанного repo_root — строки
+   * до r10; вызывающий вычисляет корень и дозаписывает, чтобы гейт одной
+   * выкладки в цель их тоже видел. */
+  releasesMissingRepoRoot(): ReleaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases
+         WHERE status IN ('auditing','publishing') AND repo_root IS NULL
+         ORDER BY id`,
+      )
+      .all() as ReleaseRow[];
+  }
+
+  setReleaseRepoRoot(id: number, repoRoot: string): void {
+    this.db
+      .prepare(`UPDATE releases SET repo_root = ? WHERE id = ?`)
+      .run(repoRoot, id);
+  }
+
+  /** §2 r10 п.5: итоговая строка собрана — сохранить ДО отправки;
+   * повтор такта только переотправляет этот текст. notified_at
+   * сбрасывается: новая строка считается недоставленной. updated_at
+   * НЕ двигаем — у отслеживаемых PR он остаётся моментом публикации
+   * (база «72 ч» п.3). */
+  setReleaseNotice(id: number, kind: string, text: string): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET notice_text = ?, notice_kind = ?,
+           notified_at = NULL
+         WHERE id = ?`,
+      )
+      .run(text, kind, id);
+  }
+
+  /** Итоговая строка + метка postPublish `finish` — одной транзакцией:
+   * крах между записью строки и меткой оставил бы merging-запись без
+   * признака «итог собран», и такт пересобрал бы дубль (PLUG-245 Б6). */
+  setReleaseNoticeWithMeta(
+    id: number,
+    kind: string,
+    text: string,
+    metaKey: string,
+    metaValue: string,
+  ): void {
+    this.db.transaction(() => {
+      this.setReleaseNotice(id, kind, text);
+      this.metaSet(metaKey, metaValue);
+    })();
+  }
+
+  /** §2 r10 п.5: захват отправки — минус время захвата, протокол
+   * claimResultDelivery (PLUG-190): захват старше 2 мин перехватывается
+   * следующим тактом, лучше редкий дубль, чем потеря. Значение -1 от
+   * кода до этой ревизии читается как давно устаревший захват.
+   * updated_at не двигаем — он база «72 ч» п.3. */
+  claimReleaseNotify(id: number): boolean {
+    const now = Date.now();
+    const staleAfter = -(now - 120_000);
+    const info = this.db
+      .prepare(
+        `UPDATE releases SET notified_at = ?
+         WHERE id = ? AND (
+           notified_at IS NULL
+           OR (notified_at < 0 AND notified_at >= ?)
+         )`,
+      )
+      .run(-now, id, staleAfter);
+    return info.changes > 0;
+  }
+
+  /** Доставка подтверждена — отметка и снятие сохранённой строки.
+   * Условие на текст: если за время отправки записана СЛЕДУЮЩАЯ строка,
+   * она не подтверждается и не стирается — её доставит досмотр. */
+  confirmReleaseNotify(id: number, text: string): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET notified_at = ?,
+           notice_text = NULL, notice_kind = NULL
+         WHERE id = ? AND notice_text = ?`,
+      )
+      .run(Date.now(), id, text);
+  }
+
+  releaseReleaseNotify(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET notified_at = NULL
+         WHERE id = ? AND notified_at < 0`,
+      )
+      .run(id);
+  }
+
+  /** §2 r10 п.5: записи с недоставленной итоговой строкой — досмотр
+   * конвейера (включая устаревшие захваты). Сохранённая строка —
+   * переотправка; published-запись БЕЗ строки — крах до её сохранения,
+   * работа и текст собираются заново. */
+  pendingReleaseNotices(): ReleaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases
+         WHERE (
+             notice_text IS NOT NULL OR status = 'published'
+           ) AND (
+             notified_at IS NULL
+             OR (notified_at < 0 AND notified_at >= ?)
+           )
+         ORDER BY id`,
+      )
+      .all(-(Date.now() - 120_000)) as ReleaseRow[];
+  }
+
+  /** §2 r10 п.3: запись только что получила pr_url — начинаем следить.
+   * Повторная инициализация (retry после сбоя) состояние не трогает. */
+  initPrTracking(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET pr_state = 'open'
+         WHERE id = ? AND pr_url IS NOT NULL AND pr_state IS NULL`,
+      )
+      .run(id);
+  }
+
+  /** §2 r10 п.3: записи выкладок, по которым идёт слежение за PR. */
+  trackedPrReleases(): ReleaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases
+         WHERE status = 'published' AND pr_url IS NOT NULL
+           AND pr_state IN ('open','closed')
+         ORDER BY id`,
+      )
+      .all() as ReleaseRow[];
+  }
+
+  /** §2 r10 п.3: одна запись на pr_url — трекинг ведёт новейшая. */
+  latestReleaseByPrUrl(prUrl: string): ReleaseRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE pr_url = ? ORDER BY id DESC LIMIT 1`,
+      )
+      .get(prUrl) as ReleaseRow | undefined;
+  }
+
+  /** Условный переход pr_state — охрана строк п.3: UPDATE не сработал,
+   * значит строку уже отправил другой такт. updated_at НЕ двигаем —
+   * он остаётся моментом публикации PR (база для 72-часового stale). */
+  transitionPrState(
+    id: number,
+    from: readonly string[],
+    to: string,
+    fields?: {
+      prCheckedAt?: number | null;
+      prClosedAt?: number | null;
+      prStaleNotified?: number | null;
+      prErrorCount?: number;
+    },
+  ): boolean {
+    return this.db.transaction(() => {
+      const sets = ["pr_state = ?"];
+      const args: unknown[] = [to];
+      const map: Record<string, string> = {
+        prCheckedAt: "pr_checked_at",
+        prClosedAt: "pr_closed_at",
+        prStaleNotified: "pr_stale_notified",
+        prErrorCount: "pr_error_count",
+      };
+      for (const [key, col] of Object.entries(map)) {
+        if (fields && key in fields) {
+          sets.push(`${col} = ?`);
+          args.push((fields as Record<string, unknown>)[key]);
+        }
+      }
+      const marks = from.map(() => "?").join(",");
+      const info = this.db
+        .prepare(
+          `UPDATE releases SET ${sets.join(", ")}
+           WHERE id = ? AND pr_state IN (${marks})`,
+        )
+        .run(...args, id, ...from);
+      if (info.changes === 0) return false;
+      // §18.5: событие PR — в той же транзакции, что и переход.
+      const row = this.getRelease(id);
+      if (row) this.emitPrTransition(row, to, Date.now());
+      return true;
+    })();
+  }
+
+  /** §2 r10 п.3: «PR висит 72 ч» — флаг, не состояние: после строки
+   * опрос продолжается молча до MERGED/CLOSED («дальше молча»).
+   * Условный UPDATE — одна строка на все такты. */
+  markPrStaleNotified(id: number): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE releases SET pr_stale_notified = 1
+         WHERE id = ? AND pr_state = 'open' AND pr_stale_notified IS NULL`,
+      )
+      .run(id);
+    return info.changes > 0;
+  }
+
+  /** Такт gh прошёл без смены состояния — отметка проверки и счётчик
+   * ошибок (updated_at не двигаем: база 72 ч для п.3). */
+  recordPrCheck(id: number, error: boolean, at = Date.now()): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET pr_checked_at = ?,
+           pr_error_count = CASE WHEN ? THEN pr_error_count + 1 ELSE 0 END
+         WHERE id = ?`,
+      )
+      .run(at, error ? 1 : 0, id);
+  }
+
+  /** §2 r10 п.3: старые записи с тем же pr_url слежение не ведут —
+   * треком является новейшая. */
+  supersedePrRows(prUrl: string, keepId: number): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET pr_state = 'superseded'
+         WHERE pr_url = ? AND id != ?
+           AND pr_state IN ('open','closed','stale','error')`,
+      )
+      .run(prUrl, keepId);
+  }
+
+  /** «PR обновлён» при досмотре: выложенная запись с тем же pr_url
+   * была и раньше. */
+  otherReleaseByPrUrl(prUrl: string, excludeId: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 FROM releases
+           WHERE pr_url = ? AND id != ? AND status = 'published' LIMIT 1`,
+        )
+        .get(prUrl, excludeId) !== undefined
+    );
+  }
+
+  metaDelete(key: string): void {
+    this.db.prepare(`DELETE FROM plugin_meta WHERE key = ?`).run(key);
+  }
+
+  /** §17 r31: напоминание ревьюеру без вердикта — время и seq журнала
+   * на момент отправки (второй промах считается только по ходу,
+   * начавшемуся позже). */
+  setVerdictNudge(id: number, nudgeSeq: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET verdict_nudged_at = ?,
+           verdict_nudge_seq = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), nudgeSeq, Date.now(), id);
+  }
+
+  getRelease(id: number): ReleaseRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM releases WHERE id = ?`)
+      .get(id) as ReleaseRow | undefined;
+  }
+
+  latestReleaseByTask(taskKey: string): ReleaseRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE task_key = ? ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as ReleaseRow | undefined;
+  }
+
+  activeReleaseByTask(taskKey: string): ReleaseRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE task_key = ?
+         AND status IN ('auditing','publishing')`,
+      )
+      .get(normalizeTaskKey(taskKey)) as ReleaseRow | undefined;
+  }
+
+  releasesByStatuses(statuses: readonly string[]): ReleaseRow[] {
+    if (!statuses.length) return [];
+    const marks = statuses.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE status IN (${marks}) ORDER BY id`,
+      )
+      .all(...statuses) as ReleaseRow[];
+  }
+
+  updateRelease(
+    id: number,
+    fields: {
+      status?: ReleaseStatus;
+      headSha?: string | null;
+      publishedSha?: string | null;
+      remoteBaseSha?: string | null;
+      auditDelegationId?: number | null;
+      prUrl?: string | null;
+      publishBranch?: string | null;
+      error?: string | null;
+    },
+  ): void {
+    const sets: string[] = [];
+    const args: unknown[] = [];
+    const map: Record<string, string> = {
+      status: "status",
+      headSha: "head_sha",
+      publishedSha: "published_sha",
+      remoteBaseSha: "remote_base_sha",
+      auditDelegationId: "audit_delegation_id",
+      prUrl: "pr_url",
+      publishBranch: "publish_branch",
+      error: "error",
+    };
+    for (const [key, col] of Object.entries(map)) {
+      if (key in fields) {
+        sets.push(`${col} = ?`);
+        args.push((fields as Record<string, unknown>)[key]);
+      }
+    }
+    if (!sets.length) return;
+    sets.push("updated_at = ?");
+    args.push(Date.now(), id);
+    this.db.transaction(() => {
+      // §18.5: терминальный статус через updateRelease (публикация в
+      // release.ts идёт этим методом) — событие в той же транзакции,
+      // но только при реальном переходе, не при повторной записи.
+      const prev = this.getRelease(id);
+      this.db
+        .prepare(`UPDATE releases SET ${sets.join(", ")} WHERE id = ?`)
+        .run(...args);
+      if (fields.status && prev && prev.status !== fields.status) {
+        const row = this.getRelease(id);
+        if (row) this.emitReleaseTransition(row, fields.status, Date.now());
+      }
+    })();
+  }
+
+  /** Условный перевод статуса выкладки — тот же приём, что setStatusIf:
+   * кто первый перевёл, тот и владеет строкой об исходе (r31: сторож
+   * отклоняет «аудит без вердикта» до done делегирования, чтобы насос
+   * не успел отклонить своей строкой). `notice` — итоговая строка п.5:
+   * пишется в той же записи, что и переход, — между «статус конечный» и
+   * «строка сохранена» окна нет. */
+  transitionReleaseStatus(
+    id: number,
+    from: readonly ReleaseStatus[],
+    to: ReleaseStatus,
+    error?: string,
+    notice?: { kind: string; text: string },
+  ): boolean {
+    return this.db.transaction(() => {
+      const at = Date.now();
+      const marks = from.map(() => "?").join(",");
+      const sets = "status = ?, error = ?, updated_at = ?";
+      const args: unknown[] = [to, error ?? null, at];
+      const noticeSet = notice
+        ? ", notice_text = ?, notice_kind = ?, notified_at = NULL"
+        : "";
+      if (notice) args.push(notice.text, notice.kind);
+      const info = this.db
+        .prepare(
+          `UPDATE releases SET ${sets}${noticeSet}
+           WHERE id = ? AND status IN (${marks})`,
+        )
+        .run(...args, id, ...from);
+      if (info.changes === 0) return false;
+      // §18.5: событие выкладки — в той же транзакции, что и переход.
+      const row = this.getRelease(id);
+      if (row) this.emitReleaseTransition(row, to, at);
+      return true;
+    })();
+  }
+
+  /**
+   * §2.3 r24: all delegations of the task, newest first — the caller
+   * filters by level role (the policy decides which levels audit) or
+   * status. Used by reviewByLevel mapping and release acceptance.
+   */
+  delegationsByTask(taskKey: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE task_key = ? ORDER BY id DESC`,
+      )
+      .all(normalizeTaskKey(taskKey)) as DelegationRow[];
+  }
+
+  /** Latest release-audit delegation of a task (§3): the chain reissue
+   * inserts newer rows, so "the audit's delegation" is always the newest
+   * `release-audit` row for the task key. */
+  latestDelegationByTaskAndLevel(
+    taskKey: string,
+    level: string,
+  ): DelegationRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE task_key = ? AND level = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), level) as
+      | DelegationRow
+      | undefined;
+  }
+
+  /** §16.6 + §18.3: is this PR URL one the release pipeline itself
+   * created FOR THIS TASK by THIS COORDINATOR? With `threadIds` off —
+   * or a template/provider without a thread marker — our PRs carry no
+   * «Источник»/`BB-Thread:` marker, so a repeat release may write only
+   * into a PR this coordinator's release of this task recorded here —
+   * a PR another coordinator's release created is still foreign
+   * (PLUG-189). */
+  prWasReleased(
+    url: string,
+    coordinatorThreadId: string,
+    taskKey: string,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM releases
+           WHERE pr_url = ? AND coordinator_thread_id = ?
+             AND task_key = ? LIMIT 1`,
+        )
+        .get(url, coordinatorThreadId, normalizeTaskKey(taskKey)) !==
+        undefined
+    );
+  }
+
+  /** §18.3 (command без `find`): pr_url прошлой выкладки этой задачи
+   * на ту же ветку публикации — кандидат на переиспользование, если
+   * `view` отвечает OPEN. */
+  lastPrUrl(taskKey: string, publishBranch: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT pr_url FROM releases
+         WHERE task_key = ? AND pr_url IS NOT NULL
+           AND COALESCE(publish_branch, branch) = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), publishBranch) as
+      | { pr_url: string }
+      | undefined;
+    return row?.pr_url ?? null;
+  }
+
+  /** §2 step 7 «выложено в обход»: is this sha a commit release pushed? */
+  shaWasReleased(sha: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM releases
+           WHERE status = 'published'
+             AND (head_sha = ? OR published_sha = ?) LIMIT 1`,
+        )
+        .get(sha, sha) !== undefined
+    );
+  }
+
+  /** §17.3 (С4): the newest publish branch name recorded for the task —
+   * any form (`release/<sha7>` or the executor's own while `threadIds`
+   * was on); the caller decides which forms are reusable. */
+  lastPublishBranch(taskKey: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT publish_branch FROM releases
+         WHERE task_key = ? AND publish_branch IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as
+      | { publish_branch: string }
+      | undefined;
+    return row?.publish_branch ?? null;
+  }
+
+  /** §17.3 (Б4): all delegations the §14 merge recorded into this branch
+   * — every task's of THIS project, not only the released one (ревью
+   * PLUG-214: a row from another project with the same `merged_into`,
+   * or a stale row whose merge commit is gone, must not block the
+   * gate with «отсутствует в копии»). */
+  mergedDelegationsInto(
+    branch: string,
+    projectId: string | null,
+  ): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE merge_status = 'merged' AND merged_into = ?
+           AND project_id IS ?`,
+      )
+      .all(branch, projectId) as DelegationRow[];
+  }
+
+  /**
+   * §17.3 (С4): the commit the task's next round continues from — the
+   * newest `published_sha` when it CONTAINS the latest round result
+   * (the published tip carries the sync merge and the docs trailer, so
+   * a repeat release fast-forwards the same remote branch), else the
+   * latest recorded `result_sha`. Ancestry, not timestamps, decides —
+   * `updated_at` moves on late writes (ревью PLUG-210 мелко).
+   * `isAncestor(repoPath, a, b)` reports `git merge-base
+   * --is-ancestor a b`; without it the old timestamp heuristic is the
+   * degraded fallback.
+   */
+  async continuePoint(
+    taskKey: string,
+    isAncestor?: (
+      repoPath: string,
+      ancestor: string,
+      descendant: string,
+    ) => Promise<boolean>,
+  ): Promise<string | null> {
+    const key = normalizeTaskKey(taskKey);
+    const result = this.latestResultByTask(key);
+    const release = this.db
+      .prepare(
+        `SELECT published_sha, repo_path, updated_at FROM releases
+         WHERE task_key = ? AND status = 'published'
+           AND published_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(key) as
+      | { published_sha: string; repo_path: string; updated_at: number }
+      | undefined;
+    if (release && result?.result_sha && isAncestor) {
+      const publishedCovers = await isAncestor(
+        release.repo_path,
+        result.result_sha,
+        release.published_sha,
+      ).catch(() => false);
+      return publishedCovers ? release.published_sha : result.result_sha;
+    }
+    if (release && (!result?.result_sha || !isAncestor)) {
+      if (!result?.result_sha) return release.published_sha;
+      if (release.updated_at >= result.updated_at) {
+        return release.published_sha;
+      }
+    }
+    return result?.result_sha ?? null;
+  }
+
+  /** §17.3: SHAs the pipeline itself created on this run's branch —
+   * unioned into the row so a retry's review gate ignores them. */
+  addReleasePipelineShas(id: number, shas: readonly string[]): void {
+    if (!shas.length) return;
+    const row = this.getRelease(id);
+    if (!row) return;
+    let cur: string[] = [];
+    try {
+      const parsed = JSON.parse(row.pipeline_shas ?? "[]") as unknown;
+      if (Array.isArray(parsed)) {
+        cur = parsed.filter((x): x is string => typeof x === "string");
+      }
+    } catch { /* corrupt value — replaced below */ }
+    this.db
+      .prepare(
+        `UPDATE releases SET pipeline_shas = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(JSON.stringify([...new Set([...cur, ...shas])]), Date.now(), id);
+  }
+
+  /** §17.3: every sha the pipeline ever created in this repo — the
+   * review gate's exclusion set (any run, any status). */
+  pipelineShasForRepo(repoPath: string): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT pipeline_shas FROM releases
+         WHERE repo_path = ? AND pipeline_shas IS NOT NULL`,
+      )
+      .all(repoPath) as { pipeline_shas: string }[];
+    const out = new Set<string>();
+    for (const r of rows) {
+      try {
+        const parsed = JSON.parse(r.pipeline_shas) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const x of parsed) {
+            if (typeof x === "string") out.add(x);
+          }
+        }
+      } catch { /* ignore corrupt row */ }
+    }
+    return out;
+  }
+
+  /** §17.3: tips this repo's releases already pushed — «опубликовано»
+   * for the gate's range regardless of the remote branch they hit. */
+  publishedShasForRepo(repoPath: string): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT published_sha FROM releases
+           WHERE repo_path = ? AND status = 'published'
+             AND published_sha IS NOT NULL`,
+        )
+        .all(repoPath) as { published_sha: string }[]
+    ).map((r) => r.published_sha);
+  }
+
+  /** §17.3 (С4): the task's newest pushed tip — the fast-forward
+   * baseline a repeat release continues from (the CURRENT row's
+   * published_sha is still empty at publish time). */
+  lastPublishedSha(taskKey: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT published_sha FROM releases
+         WHERE task_key = ? AND status = 'published'
+           AND published_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as
+      | { published_sha: string }
+      | undefined;
+    return row?.published_sha ?? null;
+  }
+
+  /** §17.3: delegations of ANY task bound to a sha via `continue_from`
+   * — the tip-review lookup (a review covering a merged branch tip may
+   * live under a different task). Newest first. */
+  delegationsByContinueFrom(sha: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE continue_from = ?
+         ORDER BY id DESC`,
+      )
+      .all(sha) as DelegationRow[];
+  }
+  /* §18.5 (r32, PLUG-246): события. Запись в `events` и сопоставление
+   * с действующими хуками идут в ТОЙ ЖЕ транзакции, что породивший
+   * переход: для подходящего хука — запись command_runs `queued`
+   * (run_key — `event:<id>:<имя>`). Позже событие хукам не
+   * сопоставляется: добавленный/переименованный после события хук по
+   * нему не запускается. */
+
+  private emitEvent(
+    kind: string,
+    fields: Record<string, unknown>,
+    at: number,
+  ): number {
+    const doc: Record<string, unknown> = {
+      version: 1,
+      event: kind,
+      at,
+      ...fields,
+    };
+    const info = this.db
+      .prepare(
+        `INSERT INTO events (kind, payload, created_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(kind, JSON.stringify(doc), at);
+    const eventId = Number(info.lastInsertRowid);
+    const ctx = this.eventHooksProvider?.();
+    if (!ctx?.hooks.length) return eventId;
+    for (const h of ctx.hooks) {
+      if (!h.on.includes(kind)) continue;
+      if (
+        h.projects !== undefined &&
+        (typeof doc.project !== "string" ||
+          !h.projects.includes(doc.project))
+      ) {
+        continue;
+      }
+      this.enqueueCommandRun(
+        {
+          source: "hook",
+          runKey: `event:${eventId}:${h.name}`,
+          name: h.name,
+          argv: h.run,
+          cwd: ctx.cwd,
+          env: {
+            ORCH_EVENT: kind,
+            ORCH_TASK: String(doc.task ?? ""),
+            ORCH_PROJECT:
+              typeof doc.project === "string" ? doc.project : "",
+          },
+          stdin: JSON.stringify(doc),
+          timeoutSec: h.timeoutSec ?? 120,
+          notifyOnFail: h.notifyOnFail ?? false,
+        },
+        at,
+      );
+    }
+    return eventId;
+  }
+
+  /** §18.5 таблица переходов: делегирование → событие. `cancelled`,
+   * `reissued` и промежуточные статусы — внутренние, событий нет;
+   * `release-audit` не порождает delegation.done — его исход это
+   * события выкладки. */
+  private emitDelegationTransition(
+    row: DelegationRow,
+    to: DelegationStatus,
+    at: number,
+    opts?: { reviewVerdict?: { verdict: string; blockers: number | null } },
+  ): void {
+    const base = {
+      task: row.task_key,
+      project: row.project_id,
+      coordinatorThreadId: row.coordinator_thread_id,
+      delegationId: row.id,
+      level: row.level,
+      route: row.route,
+      threadId: row.thread_id,
+    };
+    if (to === "done") {
+      if (row.level !== "release-audit") {
+        this.emitEvent("delegation.done", base, at);
+      }
+      // review.verdict — делегирование ревью, ушедшее в done с
+      // прочитанным вердиктом (r31); один раз на делегирование —
+      // отметка verdict_event_at в той же транзакции (оживлённый тред
+      // повторяет delegation.done, но не review.verdict).
+      if (opts?.reviewVerdict) {
+        const claimed =
+          this.db
+            .prepare(
+              `UPDATE delegations SET verdict_event_at = ?
+               WHERE id = ? AND verdict_event_at IS NULL`,
+            )
+            .run(at, row.id).changes > 0;
+        if (claimed) {
+          this.emitEvent(
+            "review.verdict",
+            {
+              ...base,
+              verdict: opts.reviewVerdict.verdict,
+              blockers: opts.reviewVerdict.blockers,
+            },
+            at,
+          );
+        }
+      }
+      return;
+    }
+    if (to === "failed") {
+      this.emitEvent("delegation.failed", base, at);
+      return;
+    }
+    if (to === "stalled" || to === "quota") {
+      this.emitEvent("delegation.stalled", { ...base, reason: to }, at);
+    }
+  }
+
+  private emitReleaseEvent(
+    kind: string,
+    row: ReleaseRow,
+    at: number,
+  ): void {
+    this.emitEvent(
+      kind,
+      {
+        task: row.task_key,
+        // §18.5: у событий выкладки и PR — проект настройки выкладки.
+        project: row.settings_project_id ?? row.project_id,
+        coordinatorThreadId: row.coordinator_thread_id,
+        releaseId: row.id,
+        sha: row.pr_merge_sha ?? row.published_sha ?? row.head_sha,
+        branch: row.publish_branch ?? row.branch,
+        target: row.target_branch,
+        prUrl: row.pr_url,
+      },
+      at,
+    );
+  }
+
+  /** Статус выкладки → событие (§18.5). auditing/publishing —
+   * промежуточные, событий нет. */
+  private emitReleaseTransition(
+    row: ReleaseRow,
+    to: ReleaseStatus,
+    at: number,
+  ): void {
+    const kind =
+      to === "published"
+        ? "release.published"
+        : to === "rejected"
+          ? "release.rejected"
+          : to === "failed"
+            ? "release.failed"
+            : null;
+    if (kind) this.emitReleaseEvent(kind, row, at);
+  }
+
+  /** pr_state → событие (§18.5): только merged/closed — open, merging,
+   * superseded, error, closed_final — внутренние. */
+  private emitPrTransition(row: ReleaseRow, to: string, at: number): void {
+    const kind =
+      to === "merged" ? "pr.merged" : to === "closed" ? "pr.closed" : null;
+    if (kind) this.emitReleaseEvent(kind, row, at);
+  }
+
+  /** §18.5: событие по id — для строк notifyOnFail и тестов. */
+  eventById(id: number): EventRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM events WHERE id = ?`)
+      .get(id) as EventRow | undefined;
+  }
+
+  /** События по порядку записи (опционально — одного вида). */
+  listEvents(kind?: string): EventRow[] {
+    return (kind
+      ? this.db
+          .prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`)
+          .all(kind)
+      : this.db.prepare(`SELECT * FROM events ORDER BY id`).all()) as
+      EventRow[];
+  }
+
+  /** §18.5: срок хранения events тот же, что у command_runs
+   * (retentionDays). */
+  pruneEvents(cutoff: number): number {
+    return this.db
+      .prepare(`DELETE FROM events WHERE created_at < ?`)
+      .run(cutoff).changes;
+  }
+
+  /* §18.2 (r32, PLUG-245): журнал команд. run_key уникален — повторная
+   * постановка той же команды выкладки после рестарта не дублирует её
+   * (INSERT ON CONFLICT DO NOTHING + чтение существующей). */
+
+  enqueueCommandRun(spec: CommandRunSpec, at: number): CommandRunRow {
+    this.db
+      .prepare(
+        `INSERT INTO command_runs (
+          source, run_key, group_key, name, status, argv, cwd, env,
+          stdin, timeout_sec, notify_on_fail, queued_at
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_key) DO NOTHING`,
+      )
+      .run(
+        spec.source,
+        spec.runKey,
+        spec.groupKey ?? null,
+        spec.name,
+        JSON.stringify(spec.argv),
+        spec.cwd,
+        spec.env ? JSON.stringify(spec.env) : null,
+        spec.stdin ?? null,
+        spec.timeoutSec ?? null,
+        spec.notifyOnFail ? 1 : 0,
+        at,
+      );
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE run_key = ?`)
+      .get(spec.runKey) as CommandRunRow;
+  }
+
+  /** Терминальный skipped: создаёт запись, если её не было; ждущую
+   * очередь переводит в skipped; running и терминальные не трогает. */
+  markCommandRunSkipped(
+    spec: CommandRunSpec,
+    reason: string,
+    at: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO command_runs (
+          source, run_key, group_key, name, status, argv, cwd, env,
+          stdin, timeout_sec, notify_on_fail, queued_at, finished_at,
+          output_tail
+        ) VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_key) DO UPDATE SET
+          status = 'skipped',
+          finished_at = excluded.finished_at,
+          output_tail = excluded.output_tail
+        WHERE command_runs.status = 'queued'`,
+      )
+      .run(
+        spec.source,
+        spec.runKey,
+        spec.groupKey ?? null,
+        spec.name,
+        JSON.stringify(spec.argv),
+        spec.cwd,
+        spec.env ? JSON.stringify(spec.env) : null,
+        spec.stdin ?? null,
+        spec.timeoutSec ?? null,
+        spec.notifyOnFail ? 1 : 0,
+        at,
+        at,
+        reason,
+      );
+  }
+
+  /** §18.5 (заход 5): queued → skipped по существующей записи журнала —
+   * ранний выход postPublish не собирает спеку (команды может уже не
+   * быть в настройке). */
+  skipQueuedCommandRun(id: number, reason: string, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE command_runs
+         SET status = 'skipped', finished_at = ?, output_tail = ?
+         WHERE id = ? AND status = 'queued'`,
+      )
+      .run(at, reason, id);
+  }
+
+  commandRunByKey(runKey: string): CommandRunRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE run_key = ?`)
+      .get(runKey) as CommandRunRow | undefined;
+  }
+
+  commandRunsByGroup(groupKey: string): CommandRunRow[] {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE group_key = ? ORDER BY id`)
+      .all(groupKey) as CommandRunRow[];
+  }
+
+  queuedCommandRuns(): CommandRunRow[] {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE status = 'queued' ORDER BY id`)
+      .all() as CommandRunRow[];
+  }
+
+  runningCommandRuns(): CommandRunRow[] {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE status = 'running' ORDER BY id`)
+      .all() as CommandRunRow[];
+  }
+
+  /** Охрана «запущена один раз» (§18.2): queued → running один раз. */
+  claimCommandRun(id: number, at: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE command_runs SET status = 'running', started_at = ?
+           WHERE id = ? AND status = 'queued'`,
+        )
+        .run(at, id).changes > 0
+    );
+  }
+
+  attachCommandProcess(
+    id: number,
+    pid: number | null,
+    pgid: number | null,
+    procStart: string | null,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE command_runs SET pid = ?, pgid = ?, proc_start = ?
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(pid, pgid, procStart, id);
+  }
+
+  finishCommandRun(
+    id: number,
+    status: CommandRunStatus,
+    exitCode: number | null,
+    outputTail: string | null,
+    at: number,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE command_runs
+           SET status = ?, exit_code = ?, output_tail = ?, finished_at = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(status, exitCode, outputTail, at, id).changes > 0
+    );
+  }
+
+  interruptCommandRun(id: number, at: number): boolean {
+    return this.finishCommandRun(id, "interrupted", null, null, at);
+  }
+
+  /** §18.2: чистка журнала старше retentionDays. */
+  pruneCommandRuns(cutoff: number): number {
+    return this.db
+      .prepare(
+        `DELETE FROM command_runs
+         WHERE finished_at IS NOT NULL AND finished_at < ?`,
+      )
+      .run(cutoff).changes;
+  }
+
+  /** §2 п.6 (r11): merge-коммит влитого PR. */
+  setPrMergeSha(id: number, sha: string | null): void {
+    this.db
+      .prepare(`UPDATE releases SET pr_merge_sha = ? WHERE id = ?`)
+      .run(sha, id);
+  }
+
+  releasesByPrState(state: string): ReleaseRow[] {
+    return this.db
+      .prepare(`SELECT * FROM releases WHERE pr_state = ? ORDER BY id`)
+      .all(state) as ReleaseRow[];
+  }
+
+}
+
+
+// ── Janitor (§15) ────────────────────────────────────────────────────
+
+export type JanitorItemState = "removed" | "kept" | "reported";
+
+export interface JanitorItemRow {
+  env_id: string;
+  project_id: string | null;
+  thread_id: string | null;
+  path: string | null;
+  branch: string | null;
+  state: JanitorItemState;
+  reason: string | null;
+  size_kb: number | null;
+  /** First run the copy was seen merged (resets when the sighting breaks). */
+  first_seen_at: number | null;
+  last_checked_at: number | null;
+  removed_at: number | null;
+  /** §17.4 (PLUG-218): tip of the removed branch (copies: own-branch
+   * tip, else HEAD) — restore with `git branch <name> <sha>`. */
+  tip_sha: string | null;
+}
+
+export interface JanitorRunRow {
+  id: number;
+  started_at: number;
+  finished_at: number | null;
+  removed: number;
+  kept: number;
+  freed_kb: number;
+  error: string | null;
+}
+
+/** §16.4 r29 (PLUG-240): one rescue snapshot attempt — success rows
+ * carry the ref, failures carry `error` and no ref. */
+export interface JanitorRescueRow {
+  id: number;
+  thread_id: string;
+  ref: string | null;
+  repo_root: string | null;
+  reason: string;
+  notified: number;
+  error: string | null;
+  created_at: number;
+}
+
+export class JanitorStore {
+  private readonly db: Database;
+
+  constructor(db: Database) {
+    this.db = db;
+  }
+
+  item(envId: string): JanitorItemRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM janitor_items WHERE env_id = ?`)
+      .get(envId) as JanitorItemRow | undefined;
+  }
+
+  items(): JanitorItemRow[] {
+    return this.db
+      .prepare(`SELECT * FROM janitor_items ORDER BY last_checked_at DESC`)
+      .all() as JanitorItemRow[];
+  }
+
+  /**
+   * Upsert the per-env ledger row. `first_seen_at` is managed by the
+   * caller (merged-sighting clock, §15); every write stamps
+   * `last_checked_at`.
+   */
+  upsertItem(
+    envId: string,
+    fields: {
+      projectId?: string | null;
+      threadId?: string | null;
+      path?: string | null;
+      branch?: string | null;
+      state: JanitorItemState;
+      reason?: string | null;
+      sizeKb?: number | null;
+      firstSeenAt?: number | null;
+      removedAt?: number | null;
+      /** §17.4 (PLUG-218/220): stamped by the pre-delete «removing»
+       * write and confirmed by «removed»; a later
+       * «ветки больше нет» write never erases it (`fields ?? prev`). */
+      tipSha?: string | null;
+    },
+    at: number,
+  ): void {
+    const prev = this.item(envId);
+    const next = {
+      project_id: fields.projectId ?? prev?.project_id ?? null,
+      thread_id: fields.threadId ?? prev?.thread_id ?? null,
+      path: fields.path ?? prev?.path ?? null,
+      branch: fields.branch ?? prev?.branch ?? null,
+      state: fields.state,
+      reason:
+        fields.reason !== undefined ? fields.reason : (prev?.reason ?? null),
+      size_kb:
+        fields.sizeKb !== undefined ? fields.sizeKb : (prev?.size_kb ?? null),
+      first_seen_at:
+        fields.firstSeenAt !== undefined
+          ? fields.firstSeenAt
+          : (prev?.first_seen_at ?? null),
+      removed_at:
+        fields.removedAt !== undefined
+          ? fields.removedAt
+          : (prev?.removed_at ?? null),
+      tip_sha: fields.tipSha ?? prev?.tip_sha ?? null,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO janitor_items (
+          env_id, project_id, thread_id, path, branch, state, reason,
+          size_kb, first_seen_at, last_checked_at, removed_at, tip_sha
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(env_id) DO UPDATE SET
+          project_id = excluded.project_id,
+          thread_id = excluded.thread_id,
+          path = excluded.path,
+          branch = excluded.branch,
+          state = excluded.state,
+          reason = excluded.reason,
+          size_kb = excluded.size_kb,
+          first_seen_at = excluded.first_seen_at,
+          last_checked_at = excluded.last_checked_at,
+          removed_at = excluded.removed_at,
+          tip_sha = excluded.tip_sha`,
+      )
+      .run(
+        envId,
+        next.project_id,
+        next.thread_id,
+        next.path,
+        next.branch,
+        next.state,
+        next.reason,
+        next.size_kb,
+        next.first_seen_at,
+        at,
+        next.removed_at,
+        next.tip_sha,
+      );
+  }
+
+  /** Forget an env row entirely (env disappeared and nothing to report). */
+  removeItem(envId: string): void {
+    this.db.prepare(`DELETE FROM janitor_items WHERE env_id = ?`).run(envId);
+  }
+
+  startRun(at: number): number {
+    const info = this.db
+      .prepare(`INSERT INTO janitor_runs (started_at) VALUES (?)`)
+      .run(at);
+    return Number(info.lastInsertRowid);
+  }
+
+  finishRun(
+    id: number,
+    result: {
+      removed: number;
+      kept: number;
+      freedKb: number;
+      error?: string | null;
+    },
+    at: number,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE janitor_runs SET finished_at = ?, removed = ?, kept = ?,
+         freed_kb = ?, error = ? WHERE id = ?`,
+      )
+      .run(
+        at,
+        result.removed,
+        result.kept,
+        result.freedKb,
+        result.error ?? null,
+        id,
+      );
+  }
+
+  latestRun(): JanitorRunRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM janitor_runs ORDER BY id DESC LIMIT 1`)
+      .get() as JanitorRunRow | undefined;
+  }
+
+  /** §16.4 r29: append one rescue attempt to the ledger. */
+  addRescue(
+    r: {
+      threadId: string;
+      ref: string | null;
+      repoRoot: string | null;
+      reason: string;
+      notified: boolean;
+      error?: string | null;
+    },
+    at: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO janitor_rescues (
+          thread_id, ref, repo_root, reason, notified, error, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        r.threadId,
+        r.ref,
+        r.repoRoot,
+        r.reason,
+        r.notified ? 1 : 0,
+        r.error ?? null,
+        at,
+      );
+  }
+
+  rescues(): JanitorRescueRow[] {
+    return this.db
+      .prepare(`SELECT * FROM janitor_rescues ORDER BY id`)
+      .all() as JanitorRescueRow[];
+  }
+
+  meta(key: string): string | undefined {
+    return (
+      this.db.prepare(`SELECT value FROM janitor_meta WHERE key = ?`).get(key) as
+        | { value: string }
+        | undefined
+    )?.value;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO janitor_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
+  }
+
 }

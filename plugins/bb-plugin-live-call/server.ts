@@ -29,6 +29,8 @@ import { EventBridge } from "./src/event-bridge.js";
 import { LiveClient } from "./src/live-client.js";
 import { argsHash } from "./src/confirmation-gate.js";
 import { decideHello } from "./src/reattach.js";
+import { messageHelloError, resolveTargetMessage } from "./src/message-call.js";
+import type { ThreadMessage } from "./src/thread-messages.js";
 import { toolByName } from "./src/tools.js";
 import { createCallThreadManager, closeStaleCallThreads } from "./src/thread-lifecycle.js";
 import { ProjectRegistryManager, readProjectRepoConfig, type ProjectConfig } from "./src/project-registry.js";
@@ -316,6 +318,8 @@ export default async function plugin(bb: BbPluginApi) {
     targetThreadId?: string,
     targetProjectId?: string,
     onSession?: (s: CallSession) => void,
+    /** §12.13: предмет звонка по сообщению (проверен в hello до старта). */
+    messageTarget?: { message: ThreadMessage; selectedText?: string },
   ): Promise<CallSession> => {
     const keys = await keysList();
     if (keys.length === 0) {
@@ -362,6 +366,8 @@ export default async function plugin(bb: BbPluginApi) {
       sdk: bb.sdk,
       targetThreadId,
       targetProjectId,
+      targetMessage: messageTarget?.message,
+      targetSelectedText: messageTarget?.selectedText,
       projectRegistry,
       projectSecrets,
       rawProjectRegistry: rawRegistry,
@@ -519,11 +525,13 @@ export default async function plugin(bb: BbPluginApi) {
                 sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
               }
-              if (frame.threadId && frame.projectId) {
+              // §12.13: threadId+projectId; messageSeq/selectedText без threadId; selectedText без messageSeq.
+              const helloError = messageHelloError(frame);
+              if (helloError) {
                 sock.send(JSON.stringify({
                   type: "error",
                   code: "bad_hello",
-                  message: "в одном hello не бывает и threadId, и projectId",
+                  message: helloError,
                   retryable: false,
                 } satisfies ServerFrame));
                 sock.close(4000, "bad hello");
@@ -574,6 +582,22 @@ export default async function plugin(bb: BbPluginApi) {
                   return;
                 }
               }
+              // §12.13: предмет звонка по сообщению ищется до startCall (как проверка треда):
+              // нет сообщения с таким seq — явная ошибка, звонок не начинается.
+              let targetMessage: ThreadMessage | undefined;
+              if (frame.threadId && frame.messageSeq !== undefined) {
+                targetMessage = await resolveTargetMessage(bb.sdk, frame.threadId, frame.messageSeq);
+                if (!targetMessage) {
+                  sock.send(JSON.stringify({
+                    type: "error",
+                    code: "message_not_found",
+                    message: "сообщение не найдено в треде",
+                    retryable: false,
+                  } satisfies ServerFrame));
+                  sock.close(4000, "message not found");
+                  return;
+                }
+              }
               // Звонок по треду (§12.10) — строго normal (одна сессия gemini-3.8-live с инструментами).
               // Для общего звонка: Extended по умолчанию; «Быстрый» (normal) — если выбран явно.
               // Extended отключён (владелец 03.11, ADR-0006 пересмотр 2): модель Google ломается
@@ -586,10 +610,17 @@ export default async function plugin(bb: BbPluginApi) {
               }
               starting = true;
               try {
-                state.session = await startCall(sock, callMode, frame.threadId, frame.projectId, (s) => {
-                  state.session = s;
-                  starting = false;
-                });
+                state.session = await startCall(
+                  sock,
+                  callMode,
+                  frame.threadId,
+                  frame.projectId,
+                  (s) => {
+                    state.session = s;
+                    starting = false;
+                  },
+                  targetMessage ? { message: targetMessage, selectedText: frame.selectedText } : undefined,
+                );
               } catch {
                 // Ошибка уже ушла фреймом и соединение закрыто.
               } finally {
