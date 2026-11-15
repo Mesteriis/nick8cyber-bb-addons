@@ -483,13 +483,10 @@ export class CallEngine {
         this.patch({ orb: "reconnecting", stateDetail: "связь прервалась" });
         const callId = this.view.callId;
         setTimeout(() => {
-          // §12.13: поля предмета — в каждом hello, включая возврат по обрыву сокета.
+          // §12.13: поля предмета — только в стартовых hello (с threadId). В hello возврата
+          // ({resume}) их нет: предмет уже в сессии, а messageSeq без threadId — bad_hello.
           if (this.view.phase === "live" && !this.sock)
-            this.openSocket({
-              resume: callId,
-              ...(this.view.targetMessageSeq !== null ? { messageSeq: this.view.targetMessageSeq } : {}),
-              ...(this.view.targetSelectedText ? { selectedText: this.view.targetSelectedText } : {}),
-            });
+            this.openSocket({ resume: callId });
         }, Math.min(500 * 2 ** (this.reconnectTries - 1), 4000));
         return;
       }

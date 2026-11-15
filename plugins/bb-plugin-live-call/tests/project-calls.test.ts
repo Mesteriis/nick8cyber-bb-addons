@@ -6,6 +6,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import plugin from "../server.js";
 import { CallSession } from "../src/call-session.js";
 import { CallStore } from "../src/call-store.js";
 import { clientFrame, type ServerFrame } from "../src/contract.js";
@@ -290,6 +291,100 @@ describe("4. Кадр hello и валидация входа (§15.1, §15.8)", 
       expect(parsed.data.projectId).toBe("proj_crm");
       expect(parsed.data.threadId).toBeUndefined();
     }
+  });
+});
+
+// ─── Сервер: обработка hello звонка по сообщению (§12.13, ревью PLUG-256) ───
+
+function createServerMock(threadEvents: Array<Record<string, unknown>>) {
+  const db = new Database(":memory:");
+  let rpcHandlers: Record<string, (...args: never[]) => Promise<unknown>> = {};
+  const wsHandlers = new Map<string, () => { onMessage(s: unknown, d: unknown): Promise<void> }>();
+  const api = {
+    settings: {
+      define: vi.fn(() => ({ get: vi.fn(async () => ({})), experimental_set: vi.fn(async () => {}) })),
+    },
+    storage: { database: vi.fn(() => db) },
+    server: { experimental_dataDir: tmpdir(), loopbackBaseUrl: "http://localhost:3000" },
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    sdk: {
+      threads: {
+        get: vi.fn(async ({ threadId }: { threadId: string }) => ({ id: threadId, title: "Тред" })),
+        spawn: vi.fn(async () => ({ id: "thr_new" })),
+        list: vi.fn(async () => []),
+        listRunning: vi.fn(async () => []),
+        markRead: vi.fn(async () => {}),
+        events: { list: vi.fn(async () => threadEvents) },
+      },
+      projects: { get: vi.fn(async () => ({})), list: vi.fn(async () => []) },
+      system: { config: vi.fn(async () => ({ primaryHostId: "host_local" })) },
+    },
+    onDispose: vi.fn(),
+    http: {
+      experimental_websocket: vi.fn((path: string, factory: () => unknown) => {
+        wsHandlers.set(path, factory as never);
+      }),
+    },
+    providers: { register: vi.fn() },
+    events: { on: vi.fn() },
+    rpc: {
+      register: vi.fn((_contract: unknown, handlers: typeof rpcHandlers) => {
+        rpcHandlers = handlers;
+      }),
+    },
+    cli: { register: vi.fn() },
+  };
+  return { api, db, wsHandlers, getRpc: () => rpcHandlers };
+}
+
+describe("4.1. Сервер: hello звонка по сообщению (§12.13, ревью PLUG-256)", () => {
+  const threadEvents = [
+    { id: "e1", seq: 11, type: "client/turn/requested", createdAt: 1000, data: { input: [{ text: "Запрос" }] } },
+    { id: "e2", seq: 12, type: "item/completed", createdAt: 2000, data: { item: { type: "agentMessage", text: "Ответ" } } },
+  ];
+
+  const sentFrames = (sock: { send: ReturnType<typeof vi.fn> }) =>
+    sock.send.mock.calls.map(([d]) => JSON.parse(d as string) as { type?: string; code?: string });
+
+  it("hello с несуществующим messageSeq → message_not_found, записей calls/call_started нет", async () => {
+    const mock = createServerMock(threadEvents);
+    await plugin(mock.api as never);
+    const { token } = (await mock.getRpc().callToken()) as { token: string };
+    const sock = { send: vi.fn(), close: vi.fn() };
+    await mock
+      .wsHandlers.get("/call")!()
+      .onMessage(sock, JSON.stringify({ type: "hello", protocol: 1, token, threadId: "thr_srvmsg01", messageSeq: 99 }));
+    expect(sentFrames(sock)).toContainEqual({
+      type: "error",
+      code: "message_not_found",
+      message: "сообщение не найдено в треде",
+      retryable: false,
+    });
+    const calls = (mock.db.prepare("SELECT COUNT(*) AS n FROM calls").get() as { n: number }).n;
+    const started = (mock.db.prepare("SELECT COUNT(*) AS n FROM call_events WHERE kind = 'call_started'").get() as { n: number }).n;
+    expect(calls).toBe(0);
+    expect(started).toBe(0);
+  });
+
+  it("messageSeq без threadId и selectedText без messageSeq → bad_hello", async () => {
+    const mock = createServerMock(threadEvents);
+    await plugin(mock.api as never);
+    const { token } = (await mock.getRpc().callToken()) as { token: string };
+
+    const sockNoThread = { send: vi.fn(), close: vi.fn() };
+    await mock
+      .wsHandlers.get("/call")!()
+      .onMessage(sockNoThread, JSON.stringify({ type: "hello", protocol: 1, token, messageSeq: 5 }));
+    expect(sentFrames(sockNoThread)[0]).toMatchObject({ type: "error", code: "bad_hello" });
+
+    const sockNoSeq = { send: vi.fn(), close: vi.fn() };
+    await mock
+      .wsHandlers.get("/call")!()
+      .onMessage(
+        sockNoSeq,
+        JSON.stringify({ type: "hello", protocol: 1, token, threadId: "thr_srvmsg01", selectedText: "фрагмент" }),
+      );
+    expect(sentFrames(sockNoSeq)[0]).toMatchObject({ type: "error", code: "bad_hello" });
   });
 });
 

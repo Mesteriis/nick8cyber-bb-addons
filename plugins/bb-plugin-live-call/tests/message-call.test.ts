@@ -399,6 +399,41 @@ describe("звонок по сообщению в сессии (§12.13)", () =>
     await s.end("owner");
   });
 
+  it("стартовый кадр модели — «звонок по сообщению №n», а не пересказ последнего ответа (§12.13, ревью PLUG-256)", async () => {
+    const target = msg(12, "agent", "Ответ 12", 12);
+    const { s } = makeMessageCall(target);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    ws.fire("message", { data: JSON.stringify({ setupComplete: {} }) });
+    await vi.advanceTimersByTimeAsync(10);
+    const greet = ws.sent.filter((x) => x.includes('"clientContent"')).join("\n");
+    expect(greet).toContain("звонок по сообщению №12 начат");
+    expect(greet).toContain("подробно объясни сообщение №12, по которому звонят");
+    expect(greet).not.toContain("перескажи ответ агента");
+    await s.end("owner");
+  });
+
+  it("стартовый кадр с ожидающим реестром — фраза про настройки в конце (§12.13)", async () => {
+    const target = msg(12, "agent", "Ответ 12", 12);
+    const { s } = makeMessageCall(target);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    (s as unknown as { pendingRegistry: unknown }).pendingRegistry = {
+      projectId: "proj_test",
+      title: "Тестовый проект",
+      hash: "h1",
+      diff: [],
+    };
+    const ws = FakeWs.all[0];
+    ws.fire("message", { data: JSON.stringify({ setupComplete: {} }) });
+    await vi.advanceTimersByTimeAsync(10);
+    const greet = ws.sent.filter((x) => x.includes('"clientContent"')).join("\n");
+    expect(greet).toContain("звонок по сообщению №12 начат");
+    expect(greet).toContain("реестр проекта изменился, подтверди изменения в настройках плагина");
+    await s.end("owner");
+  });
+
   it("звонок по треду без предмета: окна 10+20 и call_started без полей сообщения", async () => {
     const { s, store } = makeMessageCall(undefined);
     await s.start();
@@ -561,7 +596,7 @@ describe("UI: действие на сообщении и поля hello (§12.1
     expect(callEngine.getSnapshot().expandSignal).toBe(before + 1);
   });
 
-  it("возврат по обрыву сокета: resume-hello досылает messageSeq и selectedText", async () => {
+  it("возврат по обрыву сокета: resume-hello без полей сообщения (предмет уже в сессии)", async () => {
     callEngine.start({ threadId: "thr_testmsg01", messageSeq: 6, selectedText: "фрагмент" });
     await new Promise((r) => setTimeout(r, 10));
     const sock = MockWebSocket.instances[0];
@@ -569,8 +604,13 @@ describe("UI: действие на сообщении и поля hello (§12.1
     sock.close(1006, "abnormal");
     await new Promise((r) => setTimeout(r, 600));
     expect(MockWebSocket.instances.length).toBeGreaterThanOrEqual(2);
+    // Стартовое hello несло поля; в resume-hello их нет — messageSeq без threadId был бы bad_hello.
+    expect(helloOf(0)).toMatchObject({ threadId: "thr_testmsg01", messageSeq: 6, selectedText: "фрагмент" });
     const h = helloOf(1);
-    expect(h).toMatchObject({ type: "hello", protocol: 1, resume: "call_mc1", messageSeq: 6, selectedText: "фрагмент" });
+    expect(h).toMatchObject({ type: "hello", protocol: 1, resume: "call_mc1" });
+    expect(h.messageSeq).toBeUndefined();
+    expect(h.selectedText).toBeUndefined();
+    expect(h.threadId).toBeUndefined();
   });
 
   it("перезапуск после обрыва сервера: новое hello с threadId, messageSeq и selectedText", async () => {

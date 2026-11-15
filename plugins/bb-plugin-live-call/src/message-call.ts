@@ -45,8 +45,7 @@ export async function resolveTargetMessage(
  * - соседей нет — пустой массив (пометку не писать).
  */
 export function messageNeighbors(messages: ThreadMessage[], target: ThreadMessage): ThreadMessage[] {
-  const idx = messages.findIndex((m) => m.seq === target.seq && m.seq !== 0);
-  const at = idx >= 0 ? idx : messages.findIndex((m) => m.number === target.number);
+  const at = messages.findIndex((m) => m.seq === target.seq);
   if (at < 0) return [];
   if (messages[at].role === "agent") {
     for (let i = at - 1; i >= 0; i--) {
