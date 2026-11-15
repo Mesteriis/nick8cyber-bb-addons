@@ -1343,20 +1343,18 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(card.accountLabel).toBe("karina@example.com");
     expect(card.usage.status).toBe("ok");
     expect(card.usage.planLabel).toBe("Antigravity");
-    // All four pool-style windows: short cycles sort before weekly ones.
-    expect(card.usage.windows).toHaveLength(4);
-    expect(card.usage.windows[0].label).toBe("Claude 5h");
+    // The disabled 5h bucket is a frozen counter (weekly governs) and is
+    // hidden; the live short window comes from the prod model share.
+    expect(card.usage.windows).toHaveLength(3);
+    expect(card.usage.windows[0].label).toBe("Gemini 5h");
     expect(card.usage.windows[0].usedPercent).toBe(0);
-    expect(card.usage.windows[0].resetsAt).toBe("2026-11-16T03:18:12Z");
-    expect(card.usage.windows[1].label).toBe("Gemini 5h");
-    expect(card.usage.windows[1].usedPercent).toBe(0);
-    expect(card.usage.windows[1].resetsAt).toBe("2023-11-15T02:00:00Z");
-    expect(card.usage.windows[2].label).toBe("Claude Weekly");
-    expect(card.usage.windows[2].usedPercent).toBe(100);
-    expect(card.usage.windows[2].resetsAt).toBe("2026-11-18T05:18:41Z");
-    expect(card.usage.windows[3].label).toBe("Gemini Weekly");
-    expect(card.usage.windows[3].usedPercent).toBe(96);
-    expect(card.usage.windows[3].resetsAt).toBe("2026-11-20T23:08:16Z");
+    expect(card.usage.windows[0].resetsAt).toBe("2023-11-15T02:00:00Z");
+    expect(card.usage.windows[1].label).toBe("Claude Weekly");
+    expect(card.usage.windows[1].usedPercent).toBe(100);
+    expect(card.usage.windows[1].resetsAt).toBe("2026-11-18T05:18:41Z");
+    expect(card.usage.windows[2].label).toBe("Gemini Weekly");
+    expect(card.usage.windows[2].usedPercent).toBe(96);
+    expect(card.usage.windows[2].resetsAt).toBe("2026-11-20T23:08:16Z");
 
     // The native card must not leak onto other hosts.
     const remote = snap.machines.find((m: any) => m.id === "host-remote");
