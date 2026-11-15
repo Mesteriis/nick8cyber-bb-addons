@@ -12,19 +12,8 @@
  *
  * Поля повторяют acpProviderDeclaration() встроенного provider-acp (bb 0.48.1).
  */
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-
-/**
- * Devin CLI: ~/.local/bin (официальный установщик, самообновление) или
- * /usr/local/bin (общая копия для второго инстанса без своего установщика).
- * Иначе — "devin" из PATH.
- */
-const DEVIN_BIN =
-  [join(homedir(), ".local", "bin", "devin"), "/usr/local/bin/devin"].find((p) => existsSync(p)) ?? "devin";
+import { resolveDevinBin } from "./src/resolve-devin-bin.mjs";
 
 export default function plugin(bb: BbPluginApi) {
   bb.settings.define({
@@ -65,7 +54,7 @@ export default function plugin(bb: BbPluginApi) {
       acpDialect: "devin",
       acpLaunchSpec: {
         displayName: "Devin",
-        command: DEVIN_BIN,
+        command: resolveDevinBin(),
         args: ["acp", "--model", "swe-2"],
         env: {},
         permissionCli: {

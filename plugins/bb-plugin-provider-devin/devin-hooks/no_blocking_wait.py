@@ -12,7 +12,7 @@ import json
 import os
 import sys
 
-SRC = os.path.expanduser("~/.claude/hooks/no-blocking-wait.py")
+SRC = os.environ.get("CLAUDE_NO_BLOCKING_WAIT_PATH") or os.path.expanduser("~/.claude/hooks/no-blocking-wait.py")
 
 
 def load_rules():
@@ -25,12 +25,18 @@ def load_rules():
 def main():
     try:
         payload = json.load(sys.stdin)
-    except ValueError:
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
         return 0
     if payload.get("tool_name") != "exec":
         return 0
-    tool_input = payload.get("tool_input") or {}
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
     if tool_input.get("timeout") == 0:
+        return 0
+    if not os.path.exists(SRC):
         return 0
     rules = load_rules()
     command = rules.strip_heredocs(tool_input.get("command") or "")

@@ -9,22 +9,46 @@
                                        additionalContext и снять отметку
 Ошибки -> exit 0 (хук не мешает работе).
 """
+import datetime
 import json
 import os
 import re
 import sys
 
-STATE = os.path.expanduser("~/.local/state/bb-devin")
+STATE = os.environ.get("BB_DEVIN_STATE_DIR") or os.path.expanduser("~/.local/state/bb-devin")
 MARKS = os.path.join(STATE, "compacted")
-LOG = os.path.expanduser("~/.local/state/devin-bb-hooks.log")
+DEFAULT_LOG = os.path.join(STATE, "hooks.log")
+LOG = os.environ.get("DEVIN_BB_LOG") or DEFAULT_LOG
+IS_DEFAULT_LOG = not bool(os.environ.get("DEVIN_BB_LOG"))
+
+THREAD_RE = re.compile(r"^thr_[a-z0-9]+$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 def log(msg):
     try:
-        import datetime
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} "
-                    f"[{os.environ.get('BB_THREAD_ID', '-')}] {msg}\n")
+        log_dir = os.path.dirname(LOG)
+        if IS_DEFAULT_LOG:
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(log_dir, 0o700)
+            except OSError:
+                pass
+        else:
+            os.makedirs(log_dir, exist_ok=True)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(LOG, flags, 0o600)
+        try:
+            with open(fd, "a", encoding="utf-8", closefd=True) as f:
+                ts = datetime.datetime.now().isoformat(timespec="seconds")
+                thread = os.environ.get("BB_THREAD_ID", "-")
+                f.write(f"{ts} [{thread}] {msg}\n")
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -70,23 +94,28 @@ def instructions_from_devin_db(session_id):
 
 
 def mark_path(session_id):
-    return os.path.join(MARKS, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120])
+    return os.path.join(MARKS, session_id)
 
 
 def main():
     try:
         data = json.load(sys.stdin)
-    except ValueError:
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
         return 0
     event = data.get("hook_event_name")
-    session_id = str(data.get("session_id") or "")
+    if not isinstance(event, str):
+        return 0
+    raw_session_id = data.get("session_id")
+    if not isinstance(raw_session_id, str):
+        return 0
+    session_id = raw_session_id.strip()
     thread = os.environ.get("BB_THREAD_ID", "")
-    if not session_id or not re.fullmatch(r"thr_[a-z0-9]+", thread):
+    if not SESSION_RE.match(session_id) or not THREAD_RE.match(thread):
         return 0
 
     if event == "SessionStart" and data.get("source") == "resume":
-        # Восстановленная сессия держит правила, снятые при её создании; новые
-        # читают ~/.config/devin/AGENTS.md (= ~/.claude/CLAUDE.md) сами.
         try:
             text = open(os.path.expanduser("~/.claude/CLAUDE.md"), encoding="utf-8").read()
         except OSError:
@@ -102,7 +131,24 @@ def main():
 
     if event == "PostCompaction":
         os.makedirs(MARKS, mode=0o700, exist_ok=True)
-        open(mark_path(session_id), "w").close()
+        try:
+            os.chmod(STATE, 0o700)
+        except OSError:
+            pass
+        try:
+            os.chmod(MARKS, 0o700)
+        except OSError:
+            pass
+        mpath = mark_path(session_id)
+        try:
+            fd = os.open(mpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd)
+            try:
+                os.chmod(mpath, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
         log("compaction: bb instructions will be re-injected")
         return 0
 
@@ -111,14 +157,18 @@ def main():
         try:
             text = open(src, encoding="utf-8").read()
         except OSError:
-            # Процесс моста старше provider-devin eda2dce: файла нет. Правила bb
-            # всё равно лежат в базе Devin — мост отправил их первым сообщением сессии.
             text = instructions_from_devin_db(session_id)
             if not text:
-                os.remove(mark_path(session_id))
+                try:
+                    os.remove(mark_path(session_id))
+                except OSError:
+                    pass
                 log(f"no bb instructions for session {session_id} (file and Devin DB)")
                 return 0
-        os.remove(mark_path(session_id))
+        try:
+            os.remove(mark_path(session_id))
+        except OSError:
+            pass
         log(f"re-injected bb instructions ({len(text)} chars) on {event}")
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": event,

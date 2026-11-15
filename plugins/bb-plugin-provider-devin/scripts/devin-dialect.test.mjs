@@ -1,14 +1,20 @@
 // node --test scripts/devin-dialect.test.mjs
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { z } from "zod";
-import { promises as fsPromises, mkdtempSync, readFileSync as readSync, statSync } from "node:fs";
+import * as fsSync from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 
-const fakeHome = mkdtempSync(path.join(tmpdir(), "devin-dialect-"));
+const fakeHome = fsSync.mkdtempSync(path.join(tmpdir(), "devin-dialect-"));
 const fakeOs = { homedir: () => fakeHome };
+
+after(() => {
+  try {
+    fsSync.rmSync(fakeHome, { recursive: true, force: true });
+  } catch {}
+});
 
 const code = readFileSync(new URL("../src/devin-dialect.js", import.meta.url), "utf8");
 const delegationPresentation = (args) => ({
@@ -16,14 +22,22 @@ const delegationPresentation = (args) => ({
   title: args.label,
   ...(args.detail === undefined ? {} : { detail: args.detail }),
 });
-const { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode } = new Function(
-  "z",
+const {
+  devinClassifyToolCall,
+  DEVIN_ACP_DIALECT,
+  persistDevinBbInstructions,
+  isBbSystemNotice,
+  applyDevinAcpSessionMode,
+  DEVIN_ACP_MODE_BY_PERMISSION_MODE,
+} = new Function(
+  "devinFsSync",
+  "devinFsPromises",
+  "devinOs",
+  "devinPath",
+  "resolveDevinBin",
   "delegationPresentation",
-  "fs",
-  "os",
-  "path2",
-  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode };`,
-)(z, delegationPresentation, fsPromises, fakeOs, path);
+  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode, DEVIN_ACP_MODE_BY_PERMISSION_MODE };`,
+)(fsSync, fsPromises, fakeOs, path, () => "devin", delegationPresentation);
 
 // Реальное событие из bb (<thread> seq 2346), до выключения субагентов.
 const backgroundSubagent = {
@@ -75,17 +89,33 @@ test("dialect id", () => {
   assert.equal(typeof DEVIN_ACP_DIALECT.classifyToolCall, "function");
 });
 
-test("bb instructions persisted per thread, 0600, junk ids ignored", async () => {
+test("bb instructions persisted per thread, 0600, dir 0700, junk ids ignored", () => {
   persistDevinBbInstructions("thr_abc123", "RULES-TEXT");
   persistDevinBbInstructions("../evil", "X");
   persistDevinBbInstructions("thr_def456", undefined);
-  await new Promise((r) => setTimeout(r, 100));
+
   const dir = path.join(fakeHome, ".local", "state", "bb-devin", "instructions");
   const file = path.join(dir, "thr_abc123.md");
-  assert.equal(readSync(file, "utf8"), "RULES-TEXT");
-  assert.equal(statSync(file).mode & 0o777, 0o600);
-  const { readdirSync } = await import("node:fs");
-  assert.deepEqual(readdirSync(dir), ["thr_abc123.md"]);
+  assert.equal(fsSync.readFileSync(file, "utf8"), "RULES-TEXT");
+  assert.equal(fsSync.statSync(file).mode & 0o777, 0o600);
+  assert.equal(fsSync.statSync(dir).mode & 0o777, 0o700);
+  assert.deepEqual(fsSync.readdirSync(dir), ["thr_abc123.md"]);
+});
+
+test("persistDevinBbInstructions: nested non-existent BB_DEVIN_STATE_DIR gets 0700 under umask", () => {
+  const customStateDir = path.join(fakeHome, "nested-base", "custom-state-dir");
+  process.env.BB_DEVIN_STATE_DIR = customStateDir;
+  try {
+    persistDevinBbInstructions("thr_nested123", "NESTED-INSTRUCTIONS");
+    assert.equal(fsSync.statSync(customStateDir).mode & 0o777, 0o700);
+    const instructionsDir = path.join(customStateDir, "instructions");
+    assert.equal(fsSync.statSync(instructionsDir).mode & 0o777, 0o700);
+    const file = path.join(instructionsDir, "thr_nested123.md");
+    assert.equal(fsSync.readFileSync(file, "utf8"), "NESTED-INSTRUCTIONS");
+    assert.equal(fsSync.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    delete process.env.BB_DEVIN_STATE_DIR;
+  }
 });
 
 test("bb system and orchestrator notices are soft, owner and agent messages are not", () => {
@@ -105,14 +135,24 @@ const acpModeOption = {
   type: "select",
   options: ["accept-edits", "smart", "ask", "plan", "bypass"].map((value) => ({ value })),
 };
-function fakeAcpConnection(requests, fail) {
+
+function fakeAcpConnection(requests, fail, returnUpdatedConfig = false) {
   return {
     request({ method, params }) {
       requests.push({ method, params });
-      return fail ? Promise.reject(new Error("set_config_option rejected")) : Promise.resolve(null);
+      if (fail) {
+        return Promise.reject(new Error("set_config_option rejected"));
+      }
+      if (returnUpdatedConfig) {
+        return Promise.resolve({
+          configOptions: [{ id: "mode", type: "select", options: acpModeOption.options, currentValue: params.value }],
+        });
+      }
+      return Promise.resolve(null);
     },
   };
 }
+
 function captureStderr(fn) {
   const warnings = [];
   const original = process.stderr.write;
@@ -125,8 +165,13 @@ function captureStderr(fn) {
   }).then((result) => ({ result, warnings }));
 }
 
-test("permissionMode maps to ACP session mode", async () => {
-  for (const [permissionMode, mode] of [["full", "bypass"], ["accept-edits", "accept-edits"], ["auto", "smart"]]) {
+test("permissionMode maps to ACP session mode (including workspace-write and auto)", async () => {
+  for (const [permissionMode, mode] of [
+    ["full", "bypass"],
+    ["accept-edits", "accept-edits"],
+    ["workspace-write", "accept-edits"],
+    ["auto", "smart"],
+  ]) {
     const requests = [];
     const { warnings } = await captureStderr(() => applyDevinAcpSessionMode({
       connection: fakeAcpConnection(requests, false),
@@ -141,6 +186,20 @@ test("permissionMode maps to ACP session mode", async () => {
     }]);
     assert.deepEqual(warnings, []);
   }
+});
+
+test("applyDevinAcpSessionMode updates session.nativeConfig.configOptions if returned", async () => {
+  const requests = [];
+  const session = { nativeConfig: { configOptions: [acpModeOption] } };
+  await applyDevinAcpSessionMode({
+    session,
+    connection: fakeAcpConnection(requests, false, true),
+    sessionId: "s1",
+    permissionMode: "full",
+    configOptions: [acpModeOption],
+    agentLabel: "devin",
+  });
+  assert.equal(session.nativeConfig.configOptions[0].currentValue, "bypass");
 });
 
 test("mode option found by category too", async () => {

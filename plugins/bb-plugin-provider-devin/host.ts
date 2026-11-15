@@ -1,21 +1,18 @@
 /**
  * bb.host артефакт: ACP-мост bb с диалектом Devin. Копия моста собирается
  * скриптом scripts/vendor-acp-bridge.mjs из @get-bb/plugin-sdk (npm run vendor).
- *
- * Обёртка вокруг вендорного моста добавляет один перехват: центральная
- * настройка bb `subagentsDisabled` (та же, что у codex/claude-code/agy)
- * доезжает сюда как options.providerOptions.providerSubagentsEnabled на
- * thread/start|resume|fork — и применяется к `subagents_enabled` в юзерском
- * конфиге Devin (единственный рычаг: `devin acp` читает только его). Запрет —
- * стемп `false` с запоминанием прошлого значения в dataDir; включение —
- * восстановление. Конфиг пользователя с его `subagents_enabled:false`
- * (devin-hooks/install.py) не трогаем: стемпить нечего, откатывать нечего.
  */
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { experimental_acpProviderBridge as inner } from "./src/vendor/acp-bridge.js";
-import { applyDisabled, applyRestore, parseSubagentsEnabled } from "./src/subagent-gate.mjs";
+import {
+  applyDisabled,
+  applyRestore,
+  parseSubagentsEnabled,
+  writeConfigFileSafely,
+} from "./src/subagent-gate.mjs";
+import { resolveDevinBin } from "./src/resolve-devin-bin.mjs";
 
 let dataDir = "";
 const DEVIN_CONFIG = join(homedir(), ".config", "devin", "config.json");
@@ -51,12 +48,12 @@ function applySubagentGate(enabled: boolean) {
     if (parseSubagentsEnabled(text) === false) return; // уже выключено — не наш стемп
     if (state === null) {
       try {
-        writeFileSync(gateStatePath(), JSON.stringify({ prior: parseSubagentsEnabled(text) }));
+        writeConfigFileSafely(gateStatePath(), JSON.stringify({ prior: parseSubagentsEnabled(text) }));
       } catch {}
     }
     const next = applyDisabled(text);
     if (next !== text) {
-      writeFileSync(DEVIN_CONFIG, next);
+      writeConfigFileSafely(DEVIN_CONFIG, next);
       log("subagents_enabled=false applied (bb central setting)");
     }
     return;
@@ -64,7 +61,7 @@ function applySubagentGate(enabled: boolean) {
   if (state === null) return; // мы не стемпили — чужой выбор уважаем
   const next = applyRestore(text, state.prior ?? null);
   if (next !== text) {
-    writeFileSync(DEVIN_CONFIG, next);
+    writeConfigFileSafely(DEVIN_CONFIG, next);
     log(`subagents_enabled restored (prior=${JSON.stringify(state.prior ?? null)})`);
   }
   try {
@@ -86,6 +83,20 @@ function applyMemoryGate(enabled: boolean) {
 }
 
 const GATE_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
+const LAUNCH_SPEC_OPTIONS_METHODS = new Set([
+  "thread/start",
+  "thread/resume",
+  "thread/fork",
+  "turn/start",
+  "turn/steer",
+]);
+const LAUNCH_SPEC_PROVIDER_METHODS = new Set([
+  "model/list",
+  "provider/health",
+  "provider/usage",
+  "provider/installation/status",
+  "provider/installation/run",
+]);
 
 export const experimental_providerBridge = {
   ...inner,
@@ -96,11 +107,31 @@ export const experimental_providerBridge = {
   handleLine(line: string) {
     try {
       const msg = JSON.parse(line);
-      if (msg !== null && typeof msg === "object" && GATE_METHODS.has(msg.method)) {
-        const enabled = msg.params?.options?.providerOptions?.providerSubagentsEnabled;
-        if (typeof enabled === "boolean") applySubagentGate(enabled);
-        const memoryEnabled = msg.params?.options?.providerOptions?.providerMemoryEnabled;
-        if (typeof memoryEnabled === "boolean") applyMemoryGate(memoryEnabled);
+      if (msg !== null && typeof msg === "object") {
+        if (GATE_METHODS.has(msg.method)) {
+          const enabled = msg.params?.options?.providerOptions?.providerSubagentsEnabled;
+          if (typeof enabled === "boolean") applySubagentGate(enabled);
+          const memoryEnabled = msg.params?.options?.providerOptions?.providerMemoryEnabled;
+          if (typeof memoryEnabled === "boolean") applyMemoryGate(memoryEnabled);
+        }
+        let updated = false;
+        if (LAUNCH_SPEC_OPTIONS_METHODS.has(msg.method)) {
+          const spec = msg.params?.options?.providerOptions?.acpLaunchSpec;
+          if (spec && typeof spec === "object") {
+            spec.command = resolveDevinBin();
+            updated = true;
+          }
+        } else if (LAUNCH_SPEC_PROVIDER_METHODS.has(msg.method)) {
+          const spec = msg.params?.providerOptions?.acpLaunchSpec;
+          if (spec && typeof spec === "object") {
+            spec.command = resolveDevinBin();
+            updated = true;
+          }
+        }
+        if (updated) {
+          inner.handleLine(JSON.stringify(msg));
+          return;
+        }
       }
     } catch {}
     inner.handleLine(line);

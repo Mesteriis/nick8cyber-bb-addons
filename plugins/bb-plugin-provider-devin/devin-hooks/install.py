@@ -9,7 +9,7 @@
     python3 -I devin-hooks/install.py          # установить / обновить
     python3 -I devin-hooks/install.py --check  # показать, что будет, не писать
 
-В ~/.config/devin/config.json (с резервной копией config.json.bak-hooks-<время>):
+В ~/.config/devin/config.json (с резервной копией config.json.bak):
   - hooks: наши записи заменяются, ЧУЖИЕ хуки пользователя сохраняются
       bb_subagents.py   PreToolUse(exec/write/edit/...) — защита конфигов и правил
       bb_instructions.py SessionStart/PostCompaction/PostToolUse/UserPromptSubmit
@@ -24,15 +24,16 @@
 import datetime
 import json
 import os
+import random
 import shutil
+import stat
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEST = os.path.expanduser("~/.local/share/bb-devin/hooks")
-CONFIG = os.path.expanduser("~/.config/devin/config.json")
-LEGACY = os.path.expanduser("~/.config/devin/hooks")
+DEST = os.environ.get("DEVIN_HOOKS_DEST") or os.path.expanduser("~/.local/share/bb-devin/hooks")
+CONFIG = os.environ.get("DEVIN_CONFIG_PATH") or os.path.expanduser("~/.config/devin/config.json")
+LEGACY = os.environ.get("DEVIN_LEGACY_HOOKS") or os.path.expanduser("~/.config/devin/hooks")
 SCRIPTS = ("bb_subagents.py", "bb_instructions.py", "no_blocking_wait.py")
-# Признаки наших записей в hooks — по ним старые версии заменяются, чужое не трогается.
 OURS = tuple(f"/{name}" for name in SCRIPTS)
 
 
@@ -41,8 +42,9 @@ def cmd(script, timeout):
 
 
 def our_hooks():
-    pre = [{"matcher": "^(exec|write|edit|apply_patch|notebook_edit)$", "hooks": [cmd("bb_subagents.py", 10)]}]
-    if os.path.exists(os.path.expanduser("~/.claude/hooks/no-blocking-wait.py")):
+    pre = [{"matcher": "^(exec|write|edit|MultiEdit|apply_patch|notebook_edit|NotebookEdit|write_file|edit_file)$", "hooks": [cmd("bb_subagents.py", 10)]}]
+    claude_nbw = os.environ.get("CLAUDE_NO_BLOCKING_WAIT_PATH") or os.path.expanduser("~/.claude/hooks/no-blocking-wait.py")
+    if os.path.exists(claude_nbw):
         pre.append({"matcher": "^exec$", "hooks": [cmd("no_blocking_wait.py", 10)]})
     ins = [cmd("bb_instructions.py", 10)]
     return {
@@ -71,6 +73,86 @@ def merged_hooks(existing):
     return result
 
 
+def strip_jsonc_comments(text):
+    out = []
+    has_comments = False
+    i = 0
+    n = len(text)
+    in_string = False
+    escape = False
+
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+        else:
+            if c == '"':
+                in_string = True
+                out.append(c)
+                i += 1
+            elif c == '/' and i + 1 < n and text[i + 1] == '/':
+                has_comments = True
+                i += 2
+                while i < n and text[i] != '\n':
+                    i += 1
+            elif c == '/' and i + 1 < n and text[i + 1] == '*':
+                has_comments = True
+                i += 2
+                while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                    i += 1
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+
+    return "".join(out), has_comments
+
+
+def remove_trailing_commas(text):
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    escape = False
+
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+        else:
+            if c == '"':
+                in_string = True
+                out.append(c)
+                i += 1
+            elif c == ',':
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                if j < n and text[j] in "}]":
+                    i += 1
+                else:
+                    out.append(c)
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+    return "".join(out)
+
+
 def copy_scripts(check):
     changed = []
     for name in SCRIPTS:
@@ -82,11 +164,22 @@ def copy_scripts(check):
         changed.append(name)
         if not check:
             os.makedirs(DEST, mode=0o755, exist_ok=True)
-            tmp = dst + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.chmod(tmp, 0o644)
-            os.replace(tmp, dst)
+            tmp = f"{dst}.{os.getpid()}.{random.randint(100000, 999999)}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                with open(fd, "wb", closefd=True) as f:
+                    f.write(data)
+                try:
+                    os.chmod(tmp, 0o644)
+                except OSError:
+                    pass
+                os.replace(tmp, dst)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
     return changed
 
 
@@ -96,11 +189,26 @@ def fix_legacy_link(check):
     if check:
         return True
     if os.path.islink(LEGACY):
-        os.remove(LEGACY)
+        try:
+            os.remove(LEGACY)
+        except OSError:
+            pass
     elif os.path.isdir(LEGACY):
         shutil.move(LEGACY, LEGACY + ".bak-" + datetime.datetime.now().strftime("%Y%m%dT%H%M%S"))
-    os.symlink(DEST, LEGACY)
-    return True
+    try:
+        parent_dir = os.path.dirname(LEGACY)
+        dir_existed = os.path.exists(parent_dir)
+        os.makedirs(parent_dir, mode=0o700, exist_ok=True)
+        if not dir_existed:
+            try:
+                os.chmod(parent_dir, 0o700)
+            except OSError:
+                pass
+        os.symlink(DEST, LEGACY)
+        return True
+    except OSError as exc:
+        sys.stderr.write(f"warning: failed to create legacy symlink {LEGACY} -> {DEST}: {exc}\n")
+        return False
 
 
 def main():
@@ -110,29 +218,82 @@ def main():
     if fix_legacy_link(check):
         print(f"{LEGACY} -> {DEST}")
 
-    with open(CONFIG, encoding="utf-8") as f:
-        config = json.load(f)
+    exists = os.path.exists(CONFIG)
+    has_comments = False
+    if exists:
+        with open(CONFIG, "r", encoding="utf-8-sig") as f:
+            raw_text = f.read()
+        cleaned, has_comments = strip_jsonc_comments(raw_text)
+        cleaned_no_commas = remove_trailing_commas(cleaned)
+        if cleaned_no_commas.strip():
+            config = json.loads(cleaned_no_commas)
+        else:
+            config = {}
+    else:
+        config = {}
+
     new = dict(config)
     new["hooks"] = merged_hooks(config.get("hooks"))
     rcf = dict(new.get("read_config_from") or {})
     rcf["claude"] = True
     rcf.setdefault("agents_standard", True)
     new["read_config_from"] = rcf
-    if new == config:
-        print("config.json уже настроен")
-        return 0
+
     if check:
-        print(json.dumps({k: new[k] for k in ("hooks", "subagents_enabled", "read_config_from")}, ensure_ascii=False, indent=1))
+        would_write = {k: new[k] for k in ("hooks", "subagents_enabled", "read_config_from") if k in new}
+        print(json.dumps({"would_write_keys": would_write}, ensure_ascii=False, indent=2))
         print("--check: не записано")
         return 0
-    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    shutil.copy2(CONFIG, f"{CONFIG}.bak-hooks-{stamp}")
-    tmp = CONFIG + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(new, f, indent=2, ensure_ascii=False)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG)
-    print(f"записано: {CONFIG} (копия {CONFIG}.bak-hooks-{stamp})")
+
+    if exists and new == config:
+        print("config.json уже настроен")
+        return 0
+
+    target = os.path.realpath(CONFIG)
+    target_dir = os.path.dirname(target)
+    dir_existed = os.path.exists(target_dir)
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    if not dir_existed:
+        try:
+            os.chmod(target_dir, 0o700)
+        except OSError:
+            pass
+
+    if exists and has_comments:
+        bak_path = target + ".bak"
+        if not os.path.exists(bak_path):
+            shutil.copy2(target, bak_path)
+            try:
+                os.chmod(bak_path, 0o600)
+            except OSError:
+                pass
+            print(f"сохранена копия с комментариями: {bak_path}")
+
+    if os.path.exists(target):
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    else:
+        mode = 0o600
+
+    pid = os.getpid()
+    rand = random.randint(100000, 999999)
+    tmp = f"{target}.{pid}.{rand}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with open(fd, "w", encoding="utf-8", closefd=True) as f:
+            json.dump(new, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    print(f"записано: {CONFIG}")
     return 0
 
 

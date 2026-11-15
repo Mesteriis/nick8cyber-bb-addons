@@ -4,8 +4,9 @@
   "type": "module",
   "description": "Devin (SWE-2) for bb over ACP, with Devin subagents shown as bb subagents.",
   "engines": {
-    "bb": ">=0.48",
-    "bbPluginSdk": ">=0.4.87"
+    "bb": ">=0.49.0",
+    "bbPluginSdk": ">=0.6.132",
+    "node": ">=22.5.0"
   },
   "bb": {
     "name": "Devin provider",
@@ -21,11 +22,12 @@
   ],
   "scripts": {
     "vendor": "node scripts/vendor-acp-bridge.mjs",
-    "test": "node --test scripts/devin-dialect.test.mjs scripts/subagent-gate.test.mjs",
+    "test": "node --test scripts/subagent-gate.test.mjs scripts/resolve-devin-bin.test.mjs scripts/devin-dialect.test.mjs scripts/acp-bridge-e2e.test.mjs && python3 -I devin-hooks/bb_subagents.test.py && python3 -I devin-hooks/bb_instructions.test.py && python3 -I devin-hooks/no_blocking_wait.test.py && python3 -I devin-hooks/install.test.py",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.4.87",
+    "@get-bb/plugin-sdk": "0.6.132",
+    "cross-spawn": "^7.0.6",
     "zod": "^4.3.6"
   },
   "devDependencies": {
