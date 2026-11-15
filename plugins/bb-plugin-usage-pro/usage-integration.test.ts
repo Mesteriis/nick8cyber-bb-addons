@@ -60,6 +60,13 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     piRunner?: (cmd: string, args: string[]) => string;
     spawnRunner?: (bin: string, args: string[]) => any;
     now?: () => number;
+    antigravityProfile?: any;
+    googleResponses?: {
+      token?: { status: number; body: any };
+      userinfo?: { status: number; body: any };
+      loadCodeAssist?: { status: number; body: any };
+      quota?: { status: number; body: any };
+    };
   };
 
   function setupHarness(cfg: TestRigConfig) {
@@ -106,9 +113,38 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       fs.writeFileSync(path.join(piDir, "auth.json"), JSON.stringify(cfg.piAuth, null, 2));
     }
 
+    // Setup native Antigravity ACP profile if provided
+    if (cfg.antigravityProfile !== undefined) {
+      const agDir = path.join(tmpUserHome, ".gemini", "antigravity-acp");
+      fs.mkdirSync(agDir, { recursive: true });
+      fs.writeFileSync(path.join(agDir, "acp_token.json"), JSON.stringify(cfg.antigravityProfile));
+    }
+
+    const googleReply = (resp?: { status: number; body: any }) => {
+      const r = resp ?? { status: 500, body: { error: "unconfigured google endpoint" } };
+      return {
+        ok: r.status >= 200 && r.status < 300,
+        status: r.status,
+        json: async () => r.body,
+        text: async () => JSON.stringify(r.body),
+      } as Response;
+    };
+
     // Mock fetch for Pi
     const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const urlStr = url.toString();
+      if (urlStr === "https://oauth2.googleapis.com/token") {
+        return googleReply(cfg.googleResponses?.token);
+      }
+      if (urlStr.includes("googleapis.com/oauth2/v2/userinfo")) {
+        return googleReply(cfg.googleResponses?.userinfo);
+      }
+      if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")) {
+        return googleReply(cfg.googleResponses?.loadCodeAssist);
+      }
+      if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")) {
+        return googleReply(cfg.googleResponses?.quota);
+      }
       if (urlStr.includes("chatgpt.com/backend-api/wham/usage")) {
         if (!cfg.piUsageResponse) {
           throw new Error("No Pi usage response configured in test");
@@ -1197,6 +1233,130 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     });
     expect(snap.machines).toBeDefined();
     expect(snap.machines).toHaveLength(1);
+  });
+
+  // Native Antigravity ACP: dedicated provider card fed by Google quota APIs
+  it("Native ACP: acp-antigravity card collects real Google quota on the primary host", async () => {
+    const h = setupHarness({
+      hosts: [
+        { id: "host-primary", name: "Primary", status: "connected" },
+        { id: "host-remote", name: "Remote", status: "connected" },
+      ],
+      primaryHostId: "host-primary",
+      sources: [],
+      inventories: {},
+      providers: [
+        { id: "agy", displayName: "Antigravity", logoUrl: null },
+        { id: "acp-antigravity", displayName: "Google Antigravity", logoUrl: null },
+      ],
+      antigravityProfile: {
+        client_id: "cid", client_secret: "cs",
+        refresh_token: "rt", project_id: "proj-1",
+      },
+      googleResponses: {
+        token: { status: 200, body: { access_token: "at-1", expires_in: 3600 } },
+        userinfo: { status: 200, body: { email: "user-a@example.com", verified_email: true } },
+        loadCodeAssist: { status: 200, body: { currentTier: { id: "free-tier", name: "Antigravity" } } },
+        quota: {
+          status: 200,
+          body: {
+            groups: [{
+              displayName: "Claude and GPT models",
+              buckets: [
+                { bucketId: "3p-weekly", window: "weekly", resetTime: "2026-11-18T05:18:41Z", remainingFraction: 0 },
+                { bucketId: "3p-5h", window: "5h", disabled: true, resetTime: "2026-11-16T03:18:12Z", remainingFraction: 1 },
+              ],
+            }],
+          },
+        },
+      },
+    });
+
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const snap = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+
+    const primary = snap.machines.find((m: any) => m.id === "host-primary");
+    const card = primary.providers.find((p: any) => p.providerId === "acp-antigravity");
+    expect(card).toBeDefined();
+    expect(card.id).toBe("acp-antigravity");
+    expect(card.accountLabel).toBe("user-a@example.com");
+    expect(card.usage.status).toBe("ok");
+    expect(card.usage.planLabel).toBe("Antigravity");
+    // Disabled 5h bucket skipped; only the weekly bucket remains.
+    expect(card.usage.windows).toHaveLength(1);
+    expect(card.usage.windows[0].label).toBe("Claude Weekly");
+    expect(card.usage.windows[0].usedPercent).toBe(100);
+    expect(card.usage.windows[0].resetsAt).toBe("2026-11-18T05:18:41Z");
+
+    // The native card must not leak onto other hosts.
+    const remote = snap.machines.find((m: any) => m.id === "host-remote");
+    expect(remote.providers.filter((p: any) => p.providerId === "acp-antigravity")).toHaveLength(0);
+  });
+
+  // Pool exclusion: account parked at priority 0 and owned by the native card
+  // must disappear from the agy pool listing.
+  it("Native ACP: migrated pool account leaves the agy tab once the native card reports", async () => {
+    const baseDir = path.join(tmpUserHome, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
+    for (const label of ["user-a@example.com", "other@example.com"]) {
+      const dir = path.join(baseDir, label, ".gemini", "antigravity-cli");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "antigravity-oauth-token"),
+        JSON.stringify({ token: "t", auth_method: "consumer", id_token_email: label }),
+      );
+    }
+    fs.writeFileSync(
+      path.join(baseDir, "..", "accounts-state.json"),
+      JSON.stringify({ accounts: {
+        "user-a@example.com": { priority: 0 },
+        "other@example.com": { priority: 1 },
+      } }),
+    );
+
+    const h = setupHarness({
+      hosts: [{ id: "host-primary", name: "Primary", status: "connected" }],
+      primaryHostId: "host-primary",
+      sources: [],
+      inventories: {},
+      providers: [
+        { id: "agy", displayName: "Antigravity", logoUrl: null },
+        { id: "acp-antigravity", displayName: "Google Antigravity", logoUrl: null },
+      ],
+      antigravityProfile: {
+        client_id: "cid", client_secret: "cs",
+        refresh_token: "rt", project_id: "proj-1",
+      },
+      googleResponses: {
+        token: { status: 200, body: { access_token: "at-1", expires_in: 3600 } },
+        userinfo: { status: 200, body: { email: "user-a@example.com", verified_email: true } },
+        loadCodeAssist: { status: 200, body: { currentTier: { name: "Antigravity" } } },
+        quota: {
+          status: 200,
+          body: {
+            groups: [{
+              displayName: "Gemini models",
+              buckets: [
+                { bucketId: "g-5h", window: "5h", resetTime: "2026-11-16T03:18:12Z", remainingFraction: 0.5 },
+              ],
+            }],
+          },
+        },
+      },
+    });
+
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+
+    const snap = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+
+    const agyLabels = snap.machines[0].providers
+      .filter((p: any) => p.providerId === "agy")
+      .map((p: any) => p.accountLabel);
+    expect(agyLabels).toEqual(["other@example.com"]);
   });
 
   // Frontend regression: app.bundle.js client schema and card warning renderer
