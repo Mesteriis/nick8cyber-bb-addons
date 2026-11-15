@@ -16,13 +16,32 @@
 import { OrchestratorError } from "./errors.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
+  levelRole,
   quotaGroupOf,
+  quotaGroupsForOneOff,
   type PolicyLoad,
   type PolicyRoute,
 } from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
-import { runChecked, runJson, type BbCli } from "./bb-cli.js";
-import type { DispatchStepsResult, SetupError } from "./delegate.js";
+import {
+  presetModelMap,
+  runChecked,
+  runJson,
+  type BbCli,
+} from "./bb-cli.js";
+import {
+  expectedParentNotify,
+  RELEASE_AUDIT_LEVEL,
+  type DispatchStepsResult,
+  type SetupError,
+} from "./delegate.js";
+import {
+  deliverReleaseNotice,
+  parseAuditVerdict,
+  verdictDetailsInBody,
+} from "./release.js";
+import { DEFAULT_HANDOFF_PATH } from "./roles.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -39,11 +58,37 @@ const THREAD_START_FAILED = "thread.start failed";
 
 /** §5.2 typed signal: `errorInfo.category` values that mean quota. */
 const QUOTA_CATEGORIES = new Set(["rate-limit", "billing"]);
-const QUOTA_HOLD_MS = 15 * 60 * 1000;
-const APPROVAL_NOTIFY_MS = 10 * 60 * 1000;
-const DISPATCH_GRACE_MS = 5 * 60 * 1000;
+/** §18.5 (PLUG-245): дефолты policy.timing — значения переопределяются
+ * ключами `timing` политики. */
+const DEFAULT_QUOTA_HOLD_MINUTES = 15;
+const DEFAULT_APPROVAL_REPEAT_MINUTES = 10;
+const DEFAULT_POST_DISPATCH_GRACE_MINUTES = 5;
+const DEFAULT_BB_NOTIFY_WAIT_SECONDS = 120;
 const DEFAULT_FIRST_RESPONSE_SECONDS = 90;
 const DEFAULT_MAX_RUN_SECONDS = 7200;
+/** §16.5 `routes.*.startSeconds` — no turn for this long → one message. */
+const DEFAULT_START_SECONDS = 600;
+/** §16.5 `routes.*.idleSeconds` — response silence → one message. */
+const DEFAULT_IDLE_SECONDS = 1800;
+/** §16.5: the executor's report rides the result message under this cap. */
+const RESULT_OUTPUT_CAP = 3000;
+/** §16.5: BB is the primary outcome channel — its child-* notice gets
+ * this long to reach the coordinator's journal before the plugin checks
+ * the journal and sends its own line. */
+/** §16.5: the coordinator journal's compaction event (SDK `thread/compacted`). */
+const COMPACTION_EVENT_TYPE = "thread/compacted";
+/** §17.2 r26 (PLUG-215 мелко 1): claude-code reports ONE compaction as a
+ * pair — `item/completed` (contextCompaction) and `thread/compacted` land
+ * ~1 seq apart (~0.2 s live). A different-kind compaction event within
+ * this many seq of the last reminded one is the pair's second half, not
+ * a new compaction. */
+const COMPACTION_PAIR_SEQ = 8;
+
+/** §17.2 r26 (PLUG-211 Б4): `setup_errors` step marking an intentional
+ * parent-notifications mute — written BEFORE `off`, cleared only after
+ * the `auto` restore lands. The §7 pass restores `auto` for any mark
+ * left behind (crash between steps, failed update). */
+const NOTIFY_MUTED_STEP = "notify-muted";
 /** §5.1 rev 18: the BB server rejects `events.list` pages over 100. */
 const EVENT_PAGE_SIZE = 100;
 /** Coverage kept from the 500×20 days: 100 pages × 100 events. */
@@ -73,7 +118,109 @@ const RESPONSE_EVENT_TYPES = new Set([
 
 const ACTIVE = new Set(["dispatching", "running"]);
 const isActive = (status: string) => ACTIVE.has(status);
+/** §16.2: statuses a fresh `turn/started` revives to `running`. */
+const REVIVABLE = new Set(["done", "failed", "cancelled"]);
+/** §16.2: superseded statuses — a `turn/started` on them is a rogue turn
+ * that is always stopped (auto-retry lifting an already-replaced round). */
+const SUPERSEDED = new Set(["reissued", "stalled", "quota"]);
+/** §16.2: the tasks plugin's comment fan-out prefix — a turn opened by
+ * it is a notification wake, not a revive. */
+const TRACKER_COMMENT_PREFIX = "New comment on task ";
+
+/** §16.2: text of a `client/turn/requested` journal entry. */
+const requestText = (e: WatchdogThreadEvent): string =>
+  (
+    ((e.data as { input?: { text?: string }[] } | null | undefined)?.input ??
+      []) as { text?: string }[]
+  )
+    .map((p) => p?.text ?? "")
+    .join("")
+    .trim();
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/**
+ * §16.1 shared loop: drop the thread's queued BB auto-retry rows before
+ * an own stop — an uncancelled retry lifts the thread back minutes
+ * later. `no_pending_retry` means the row already fired between the
+ * status read and the cancel — that is a drained queue, not a failure
+ * (PLUG-184). A thread may hold more than one row (accepted and
+ * unaccepted input), so status→cancel repeats until the queue reads
+ * empty (≤3 cancels, one status re-read after each).
+ */
+export async function cancelProviderRetries(
+  providerRetry:
+    | {
+        pending(threadId: string): Promise<unknown[]>;
+        cancel(threadId: string): Promise<void>;
+      }
+    | undefined,
+  threadId: string,
+): Promise<true | string> {
+  if (!providerRetry) return true;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let pending: unknown[];
+    try {
+      pending = await providerRetry.pending(threadId);
+    } catch (e) {
+      return `provider-retry status: ${message(e)}`;
+    }
+    if (pending.length === 0) return true;
+    try {
+      await providerRetry.cancel(threadId);
+    } catch (e) {
+      if (/no_pending_retry/i.test(message(e))) continue; // fired — re-read
+      return `provider-retry cancel: ${message(e)}`;
+    }
+  }
+  return "provider-retry: queue still non-empty after cancels";
+}
+
+/** §16.1: the `bb provider-retry status|cancel <id> --json` CLI seam —
+ * shared by the watchdog deps and `orchestrator cancel`. */
+export function providerRetryCli(
+  bbCli: BbCli,
+): NonNullable<WatchdogDeps["providerRetry"]> {
+  return {
+    pending: async (threadId) => {
+      const res = await runJson<{ retries?: unknown[] }>(bbCli, [
+        "provider-retry",
+        "status",
+        threadId,
+        "--json",
+      ]);
+      return res.retries ?? [];
+    },
+    cancel: async (threadId) => {
+      const res = await bbCli.run([
+        "provider-retry",
+        "cancel",
+        threadId,
+        "--json",
+      ]);
+      if (res.exitCode === 0) return;
+      // The live CLI answers `no_pending_retry` with exit 1, the code in
+      // the stdout JSON and the human sentence in stderr (PLUG-190) —
+      // the row fired between status and cancel, i.e. a drained queue.
+      try {
+        const j = JSON.parse(res.stdout) as
+          | { error?: { code?: unknown } }
+          | null
+          | undefined;
+        if (j?.error?.code === "no_pending_retry") return;
+      } catch {
+        // not JSON — fall through to the text check
+      }
+      if (/no_pending_retry/i.test(`${res.stdout}\n${res.stderr}`)) return;
+      throw new OrchestratorError(
+        "bb-cli-failed",
+        `bb provider-retry cancel ${threadId} failed (exit ` +
+          `${res.exitCode}): ${
+            res.stderr.trim() || res.stdout.trim() || "no output"
+          }`,
+      );
+    },
+  };
+}
 
 /** The thread DTO subset the watchdog reads (status + tombstones). */
 export interface WatchdogThreadDto {
@@ -81,6 +228,14 @@ export interface WatchdogThreadDto {
   status?: string | null;
   archivedAt?: number | null;
   deletedAt?: number | null;
+  /** §16.5 binding verify: the executor's parent link and notify mode. */
+  parentThreadId?: string | null;
+  parentNotifications?: string | null;
+  /** §4 r30 (е 4): label-lookup fields the `list` seam returns. */
+  title?: string | null;
+  titleFallback?: string | null;
+  createdAt?: number | null;
+  visibility?: string | null;
 }
 
 /** One stored event-stream row (subset of `ThreadEventRow`). */
@@ -111,12 +266,39 @@ export interface WatchdogThreads {
     input: unknown[];
   }): Promise<unknown>;
   stop(args: { threadId: string }): Promise<unknown>;
+  /** §16.5: the executor's own report text (`bb thread output`). */
+  output(args: { threadId: string }): Promise<{ output?: string | null } | null>;
+  /** §16.5 binding re-verify: re-apply parent + visibility on a drift. */
+  update(args: {
+    threadId: string;
+    parentThreadId?: string | null;
+    visibility?: string;
+  }): Promise<unknown>;
+  /** §4 r30 (е 4): children of the coordinator for the own-spawn label
+   * lookup. Optional — absent → straight to the `tasks threads` path. */
+  list?(args: {
+    parentThreadId?: string;
+    includeHidden?: boolean;
+    limit?: number;
+  }): Promise<FindThreadCandidate[]>;
+  /** §4 r30 (е 4): the `pluginMetadata.delegationId` read per candidate. */
+  getPluginMetadata?(args: {
+    threadId: string;
+  }): Promise<Record<string, unknown> | null | undefined>;
 }
 
 /** The `turn.failed` lifecycle event fields the watchdog consumes. */
 export interface TurnFailedInfo {
   threadId: string;
   errorInfo?: { category?: string | null } | null;
+}
+
+/** §4.1 round result: the executor environment facts the watchdog needs. */
+export interface RoundEnvironment {
+  id?: string | null;
+  path?: string | null;
+  branchName?: string | null;
+  mergeBaseBranch?: string | null;
 }
 
 export interface ReconcileSummary {
@@ -131,6 +313,8 @@ export interface ReconcileSummary {
 
 export interface WatchdogDeps {
   store: DelegationStore;
+  /** §18.1: the language catalog (defaults to T_RU). */
+  t?: T;
   bbCli: BbCli;
   threads: WatchdogThreads;
   loadPolicy(): Promise<PolicyLoad>;
@@ -151,7 +335,33 @@ export interface WatchdogDeps {
   ): Promise<{ status: "running" | "cancelled"; setupErrors: SetupError[] }>;
   /** §7: retry failed §4.4–4.6 steps on a `running` row. */
   retrySetup(row: DelegationRow): Promise<SetupError[]>;
+  /**
+   * §16.1: BB's own provider auto-retry queue (`bb provider-retry
+   * status|cancel <thread-id>`). `pending` answers the thread's queued
+   * retry rows — a non-empty list means the thread's "failure" is a
+   * transient the provider will retry itself, not an outcome.
+   * `cancel` drops the queued retries before an own `threads.stop` —
+   * an uncancelled retry would lift the thread back after the stop.
+   * Optional: an absent seam reads as "no retry ever pending" (tests
+   * that do not exercise §16.1 need no fake).
+   */
+  providerRetry?: {
+    pending(threadId: string): Promise<unknown[]>;
+    cancel(threadId: string): Promise<void>;
+  };
+  /**
+   * §4.1 round result at `done`: resolve the executor's environment and
+   * run git inside it. Optional — tests without a git seam skip the
+   * collection entirely.
+   */
+  round?: {
+    environment(threadId: string): Promise<RoundEnvironment | null>;
+    git(repo: string, args: string[]): Promise<string>;
+  };
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
+  /** §18.6: the handoff path for the §16.5 compaction reminder —
+   * read lazily so a settings change applies without a reload. */
+  handoffPath?(): string;
   now?: () => number;
   log?: {
     info?(message: string): void;
@@ -197,10 +407,105 @@ export async function findTaskThreadId(
   return undatable?.threadId ?? null;
 }
 
+/** The `threads.list` row the label lookup reads (r30 е 4). */
+export interface FindThreadCandidate {
+  id: string;
+  title?: string | null;
+  titleFallback?: string | null;
+  createdAt?: number | null;
+}
+
+/** The SDK seams the label lookup uses (r30 е 4). */
+export interface DelegatedThreadFinder {
+  list?(args: {
+    parentThreadId?: string;
+    includeHidden?: boolean;
+    limit?: number;
+  }): Promise<FindThreadCandidate[]>;
+  getPluginMetadata?(args: {
+    threadId: string;
+  }): Promise<Record<string, unknown> | null | undefined>;
+}
+
+/**
+ * §4 r30 (е 4): find the executor thread of a `dispatching` row with no
+ * `thread_id` — shared by the §7 reconcile and `cancel`. An own-spawn
+ * thread is labelled `pluginMetadata.delegationId` and titled `KEY · …`
+ * under the coordinator: look at the coordinator's children first —
+ * metadata match, then the `createdAt >= row.created_at` + `KEY · `
+ * title fallback (candidates READABLY labelled with another record's
+ * delegationId are skipped — they are proven to be someone else's
+ * executor). `bb tasks threads` is the last resort for EVERY row: an
+ * old record whose dispatch ran before the `own-spawn` marker existed
+ * would otherwise lose its executor — unsupervised, then
+ * double-dispatched on reissue.
+ */
+export async function findDelegatedThreadId(
+  row: DelegationRow,
+  deps: {
+    bbCli: BbCli;
+    threads?: DelegatedThreadFinder;
+  },
+): Promise<string | null> {
+  let children: FindThreadCandidate[] | null = null;
+  try {
+    children =
+      (await deps.threads?.list?.({
+        parentThreadId: row.coordinator_thread_id,
+        includeHidden: true,
+        limit: 200,
+      })) ?? null;
+  } catch {
+    children = null; // a broken list must not hide the tasks fallback
+  }
+  if (children) {
+    const candidates = children.filter(
+      (t) =>
+        typeof t.id === "string" &&
+        typeof t.createdAt === "number" &&
+        t.createdAt >= row.created_at,
+    );
+    // A candidate READABLY labelled with ANOTHER delegation's id is
+    // proven to belong to a different record — the title fallback must
+    // never pick it (that would steal the other delegation's executor).
+    const foreign = new Set<string>();
+    if (deps.threads?.getPluginMetadata) {
+      for (const t of candidates) {
+        try {
+          const meta = await deps.threads.getPluginMetadata({
+            threadId: t.id,
+          });
+          const label = (meta as { delegationId?: unknown } | null)
+            ?.delegationId;
+          if (meta && label !== undefined) {
+            if (label === row.id) return t.id;
+            foreign.add(t.id);
+          }
+        } catch {
+          // unreadable metadata — the title filter below still applies
+        }
+      }
+    }
+    const titled = candidates
+      .filter((t) => !foreign.has(t.id))
+      .filter((t) =>
+        (t.title ?? t.titleFallback ?? "").startsWith(`${row.task_key} · `),
+      )
+      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+    if (titled[0]) return titled[0].id;
+  }
+  // Nothing found under the coordinator: `bb tasks threads` is the last
+  // resort for EVERY row — not only `own-spawn`-marked fallback ones.
+  // An old row whose dispatch pre-dates the marker would otherwise lose
+  // its executor (unsupervised, then double-dispatched on reissue).
+  return findTaskThreadId(deps.bbCli, row.task_key, row.created_at);
+}
+
 export function createWatchdog(deps: WatchdogDeps) {
   const store = deps.store;
   const now = deps.now ?? Date.now;
   const log = deps.log ?? {};
+  const t = deps.t ?? T_RU;
   /** `system/thread/interrupted` seen in the stream since the latest turn. */
   const interrupted = new Set<number>();
   /** Latest provider/system error text per delegation, for `failed` reports. */
@@ -243,12 +548,38 @@ export function createWatchdog(deps: WatchdogDeps) {
   const routeInfo = async (row: DelegationRow) => {
     const load = await deps.loadPolicy();
     const route = load.policy?.routes[row.route];
+    // §2.3 r24 (PLUG-182): a `preset:` one-off is not in the policy
+    // routes — a quota burn holds the quota group of every same-provider
+    // AND same-model policy route plus the one-off's own name. The
+    // `preset list` call is lazy (PLUG-186): only the quota path needs
+    // the groups — pattern checks must not pay up to 15s per event.
+    let cachedGroups: string[] | undefined;
+    const quotaGroups = async (): Promise<string[]> => {
+      if (cachedGroups) return cachedGroups;
+      if (route) {
+        cachedGroups = [quotaGroupOf(route, row.route)];
+      } else if (row.route.startsWith("preset:")) {
+        const models = await presetModelMap(deps.bbCli);
+        cachedGroups = quotaGroupsForOneOff(
+          load.policy,
+          {
+            route: row.route,
+            provider: row.provider,
+            modelId: models.get(row.preset),
+          },
+          models,
+        );
+      } else {
+        cachedGroups = [row.route];
+      }
+      return cachedGroups;
+    };
     return {
       load,
       policy: load.policy,
       level: load.policy?.levels[row.level],
       route,
-      quotaGroup: route ? quotaGroupOf(route, row.route) : row.route,
+      quotaGroups,
       patterns: [...BUILTIN_QUOTA_PATTERNS, ...(route?.quotaPatterns ?? [])],
       unavailablePatterns: [
         ...BUILTIN_UNAVAILABLE_PATTERNS,
@@ -308,6 +639,32 @@ export function createWatchdog(deps: WatchdogDeps) {
     await commentOnTask(row, text);
   };
 
+  /**
+   * §17.2 (e2e 4): `bb thread update --parent-notifications <off|auto>` —
+   * the quiet stop mutes BB's own «child interrupted» notice around the
+   * stop so the coordinator does not get a second outcome message.
+   */
+  const setParentNotify = async (
+    threadId: string,
+    mode: "off" | "auto",
+  ): Promise<boolean> => {
+    try {
+      await runChecked(deps.bbCli, [
+        "thread",
+        "update",
+        threadId,
+        "--parent-notifications",
+        mode,
+      ]);
+      return true;
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: parent-notifications ${mode} ${threadId}: ${message(e)}`,
+      );
+      return false;
+    }
+  };
+
   const hasSetupError = (row: DelegationRow, step: string) => {
     try {
       const parsed = JSON.parse(row.setup_errors) as { step?: string }[];
@@ -318,10 +675,86 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /**
+   * §16.1: the thread's pending BB auto-retry rows are cancelled before
+   * an own stop or reissue — an uncancelled retry would lift the thread
+   * back. Returns true when the queue is provably empty (or absent);
+   * an error string when the status read or the cancel failed.
+   */
+  const ensureRetryCancelled = async (
+    row: DelegationRow,
+  ): Promise<true | string> => {
+    if (!deps.providerRetry || !row.thread_id) return true;
+    const res = await cancelProviderRetries(
+      deps.providerRetry,
+      row.thread_id,
+    );
+    if (res === true && hasSetupError(row, "provider-retry-pending")) {
+      store.clearSetupError(row.id, "provider-retry-pending");
+    }
+    return res;
+  };
+
+  /**
+   * §16.1 — the FIRST check of every outcome entry point: a pending BB
+   * provider-retry row means the thread's "failure" is a queued automatic
+   * retry, not an outcome. The delegation stays `running` (a premature
+   * `failed` revives — the queued retry owes the thread a turn, §16.2)
+   * and carries `provider-retry-pending`. Returns true when NO outcome
+   * may be decided now — a retry is pending, or the queue could not be
+   * read (unreadable is not "empty", same rule as the journal §5.1 rev 18).
+   */
+  const retryBlocksOutcome = async (
+    row: DelegationRow,
+  ): Promise<boolean> => {
+    if (!deps.providerRetry || !row.thread_id) return false;
+    let pending: unknown[];
+    try {
+      pending = await deps.providerRetry.pending(row.thread_id);
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: provider-retry status ${row.thread_id}: ${message(e)}`,
+      );
+      return true; // defer — the next pass re-checks
+    }
+    if (pending.length === 0) {
+      if (hasSetupError(row, "provider-retry-pending")) {
+        store.clearSetupError(row.id, "provider-retry-pending");
+      }
+      return false;
+    }
+    if (!hasSetupError(row, "provider-retry-pending")) {
+      store.addSetupError(row.id, "provider-retry-pending", "auto-retry queued");
+    }
+    if (row.status === "failed") {
+      // §16.2/PLUG-184: only the task's LAST round may revive — a queued
+      // retry on a superseded executor must not lift it back. The
+      // active-sibling check runs inside revive()'s transaction so the
+      // partial unique index cannot trip mid-handler.
+      if (
+        store.hasNewerForTask(row.task_key, row.id) ||
+        !store.revive(row.id)
+      ) {
+        const err = await ensureRetryCancelled(row);
+        if (err !== true) {
+          log.warn?.(
+            `orchestrator: auto-retry cancel on superseded ${row.thread_id}: ${err}`,
+          );
+        }
+      }
+    }
+    log.info?.(
+      `orchestrator: delegation #${row.id} — provider-retry pending, stays running`,
+    );
+    return true;
+  };
+
+  /**
    * §5.4 rev 13: a reissue is allowed only after the old executor is
-   * confirmed stopped — `threads.stop` answered without an error AND the
-   * thread is not `active`. Returns true when confirmed; on failure the
-   * `watchdog-stop` setup error marks the row for the §7 retry.
+   * confirmed stopped — §16.1 cancels the thread's own auto-retry rows
+   * first, `threads.stop` answered without an error AND the thread read
+   * back `idle`/`error` (§16.5: only those two confirm an own stop).
+   * Returns true when confirmed; on failure the `watchdog-stop` setup
+   * error marks the row for the §7 retry.
    */
   const confirmStop = async (row: DelegationRow): Promise<boolean> => {
     const fail = async (why: string) => {
@@ -333,6 +766,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       return false;
     };
     if (!row.thread_id) return true;
+    // §16.1: BB's own auto-retry row is cancelled BEFORE our stop —
+    // a failed cancel means the stop is not confirmed either.
+    const cancelled = await ensureRetryCancelled(row);
+    if (cancelled !== true) return fail(cancelled);
     try {
       await deps.threads.stop({ threadId: row.thread_id });
     } catch (e) {
@@ -344,14 +781,15 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     let thread: WatchdogThreadDto | null;
     try {
-      thread = await deps.threads.get({ threadId: row.thread_id });
+      thread = await getThread(row.thread_id);
     } catch (e) {
       return fail(`threads.get: ${message(e)}`);
     }
-    if (thread && thread.status === "active") {
-      return fail("thread is still active after stop");
-    }
-    return true;
+    // §16.5: only `idle`/`error` (or a gone thread) confirms the stop —
+    // `stopping`/`active`/anything else is retried by the §7 pass.
+    if (!thread || thread.deletedAt || thread.archivedAt) return true;
+    if (thread.status === "idle" || thread.status === "error") return true;
+    return fail(`thread status is ${thread.status ?? "?"}, not stopped`);
   };
 
   // ── Outcomes (§5.3, §5.4) ────────────────────────────────────────────
@@ -359,31 +797,78 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** §5.4: report the outcome, and auto-reissue when the level allows. */
   const outcomeAndMaybeReissue = async (
     row: DelegationRow,
-    outcome: "stalled" | "quota" | "unavailable",
+    outcome: "stalled" | "quota" | "unavailable" | "failed",
     detail: string,
   ) => {
     const info = await routeInfo(row);
     const outcomeText =
       outcome === "stalled"
-        ? "исполнитель завис"
+        ? t("wd.stalled")
         : outcome === "unavailable"
           ? detail
-            ? `маршрут недоступен (${detail.slice(0, 120)})`
-            : "маршрут недоступен"
-          : detail
-            ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-            : "квота исполнителя исчерпана";
+            ? t("wd.unavailableDetail", { detail: detail.slice(0, 120) })
+            : t("wd.unavailable")
+          : outcome === "failed"
+            ? detail
+              ? t("wd.failedDetail", { detail: detail.slice(0, 120) })
+              : t("wd.failed")
+            : detail
+              ? t("wd.quotaDetail", { detail: detail.slice(0, 120) })
+              : t("wd.quota");
+    // §16.1: no reissue while the thread's own auto-retry is uncancelled
+    // — the queued retry would lift the reissued-away thread back. A
+    // cancel failure is a stop-not-confirmed: the §7 retry loop covers
+    // it and the coordinator hears about it exactly once.
+    const cancelled = await ensureRetryCancelled(row);
+    if (cancelled !== true) {
+      const current = store.get(row.id) ?? row;
+      if (!hasSetupError(current, "watchdog-stop")) {
+        store.addSetupError(
+          row.id,
+          "watchdog-stop",
+          t("wd.stopNotConfirmed", { cancelled }),
+        );
+      }
+      if (!hasSetupError(current, "watchdog-stop-reported")) {
+        store.addSetupError(row.id, "watchdog-stop-reported", "coordinator notified");
+        await report(
+          row,
+          t("wd.cancelRetryFailed", {
+            outcome: outcomeText,
+            task: row.task_key,
+            route: row.route,
+            cancelled,
+          }),
+        );
+      }
+      return;
+    }
     let nextName: string | undefined;
     let nextRoute: PolicyRoute | undefined;
     if (info.level?.autoFallback && info.policy) {
-      // §5.4 rev 13: the next available route AFTER the current one in the
-      // chain; only routes an auto-reissue already used are excluded
-      // (`reissue_of IS NOT NULL`), manual delegations do not count.
-      const used = store.routesUsedByTask(row.task_key);
+      // §5.4 rev 13 + §16.8/§2.3 (PLUG-182): for a natural chain route the
+      // candidates are the routes AFTER the current one (only routes an
+      // auto-reissue already used are excluded — `reissue_of IS NOT
+      // NULL`). An explicit --route/--preset delegation restarts from the
+      // chain's beginning and skips every route this task already ran on.
       const held = store.heldGroups(now());
       const unavailable = new Set(info.load.unavailableRoutes);
       const idx = info.level.chain.indexOf(row.route);
-      const candidates = idx === -1 ? info.level.chain : info.level.chain.slice(idx + 1);
+      const restart = idx === -1 || row.explicit_route !== 0;
+      const candidates = restart
+        ? info.level.chain
+        : info.level.chain.slice(idx + 1);
+      // §17.2 (мелко 4): «один маршрут — один перевыпуск» считается в
+      // пределах ЗАХОДА — со второго захода сработавшие маршруты снова
+      // доступны резерву; то же для маршрутов, уже пройденных задачей
+      // при явном --route/--preset.
+      // §17.2 r26 (PLUG-211 С2/мелко 2): «в пределах захода» means the
+      // reissue CHAIN — review and release-audit dispatches share the
+      // round-number space but form their own chains, so their reserve
+      // counts separately and never eats the executor round's budget.
+      const used = restart
+        ? store.chainUsedRoutes(row)
+        : store.chainUsedRoutes(row, { reissuesOnly: true });
       for (const name of candidates) {
         const r = info.policy.routes[name];
         if (!r || used.has(name) || unavailable.has(name)) continue;
@@ -413,9 +898,11 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.addSetupError(row.id, "reissue-conflict", message(e));
           await report(
             row,
-            `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} — ` +
-              `перевыпуск за координатором: у задачи уже есть активное ` +
-              `делегирование`,
+            t("wd.reissueConflict", {
+              outcome: outcomeText,
+              task: row.task_key,
+              route: row.route,
+            }),
           );
         }
         return;
@@ -427,8 +914,13 @@ export function createWatchdog(deps: WatchdogDeps) {
           });
           await report(
             row,
-            `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} → ` +
-              `перевыпущено на ${nextName}, новый тред ${res.threadId ?? "—"}`,
+            t("wd.reissued", {
+              outcome: outcomeText,
+              task: row.task_key,
+              route: row.route,
+              next: nextName,
+              thread: res.threadId ?? "—",
+            }),
           );
         } catch (e) {
           const code = (e as { code?: string }).code;
@@ -441,24 +933,36 @@ export function createWatchdog(deps: WatchdogDeps) {
           await report(
             row,
             code === "dispatch-failed"
-              ? `${outcomeText}: задача ${row.task_key}, перевыпуск потерян — ` +
-                  `раздача на ${nextName} отклонена (${message(e)})`
-              : `${outcomeText}: задача ${row.task_key}, перевыпуск на ` +
-                  `${nextName} не удался: ${message(e)}`,
+              ? t("wd.reissueRefused", {
+                  outcome: outcomeText,
+                  task: row.task_key,
+                  next: nextName,
+                  error: message(e),
+                })
+              : t("wd.reissueFailed", {
+                  outcome: outcomeText,
+                  task: row.task_key,
+                  next: nextName,
+                  error: message(e),
+                }),
           );
         }
         return;
       }
     }
     const reason = !info.level?.autoFallback
-      ? "autoFallback выключен"
+      ? t("wd.noAutoFallback")
       : nextName
-        ? "запись уже ушла из исхода"
-        : "нет доступного маршрута в цепочке";
+        ? t("wd.rowGone")
+        : t("wd.noRoute");
     await report(
       row,
-      `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} — ` +
-        `перевыпуск за координатором (${reason})`,
+      t("wd.reissueCoordinator", {
+        outcome: outcomeText,
+        task: row.task_key,
+        route: row.route,
+        reason,
+      }),
     );
   };
 
@@ -469,7 +973,7 @@ export function createWatchdog(deps: WatchdogDeps) {
    */
   const afterOutcomeStatus = async (
     row: DelegationRow,
-    outcome: "stalled" | "quota",
+    outcome: "stalled" | "quota" | "failed",
     detail: string,
   ) => {
     // §7: the outcome reason outlives the stop retry — the reissue report
@@ -477,10 +981,14 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (detail) store.addSetupError(row.id, "outcome-detail", detail);
     const outcomeText =
       outcome === "stalled"
-        ? "исполнитель завис"
-        : detail
-          ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-          : "квота исполнителя исчерпана";
+        ? t("wd.stalled")
+        : outcome === "failed"
+          ? detail
+            ? t("wd.failedDetail", { detail: detail.slice(0, 120) })
+            : t("wd.failed")
+          : detail
+            ? t("wd.quotaDetail", { detail: detail.slice(0, 120) })
+            : t("wd.quota");
     if (await confirmStop(row)) {
       await outcomeAndMaybeReissue(row, outcome, detail);
       return;
@@ -491,9 +999,12 @@ export function createWatchdog(deps: WatchdogDeps) {
       store.addSetupError(row.id, "watchdog-stop-reported", "coordinator notified");
       await report(
         row,
-        `${outcomeText}: задача ${row.task_key}, маршрут ${row.route}, ` +
-          `тред ${row.thread_id ?? "—"} — не удалось остановить исполнителя, ` +
-          `перевыпуск отложен, сверка повторит`,
+        t("wd.stopFailed", {
+          outcome: outcomeText,
+          task: row.task_key,
+          route: row.route,
+          thread: row.thread_id ?? "—",
+        }),
       );
     }
   };
@@ -501,8 +1012,12 @@ export function createWatchdog(deps: WatchdogDeps) {
   /**
    * §5.3 `interrupted`: a non-manual interruption is not a cancellation.
    * First time — resume the executor (`queue-if-active`), keep `running`,
-   * bump `resume_count`, notify the coordinator. A repeat interruption is
-   * treated like `stalled`. Returns true when the delegation ended.
+   * notify the coordinator. A repeat interruption is treated like
+   * `stalled`. Repeats are counted per outcome kind (r23): the
+   * `interrupted-resume-sent` mark gates the interrupt repeat, the
+   * `errored-resume-sent` mark the errored one — `resume_count` itself is
+   * statistics only, so an errored resume does not burn the interrupt's
+   * one retry (PLUG-176). Returns true when the delegation ended.
    */
   const handleInterrupted = async (
     row: DelegationRow,
@@ -511,23 +1026,29 @@ export function createWatchdog(deps: WatchdogDeps) {
   ): Promise<boolean> => {
     const fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return true;
-    if (fresh.resume_count >= 1) {
-      await toStalled(fresh, `повторное прерывание хода (${reason})`);
+    if (hasSetupError(fresh, "interrupted-resume-sent")) {
+      await toStalled(fresh, t("wd.interruptedAgain", { reason }));
       return true;
     }
     // §5.3 rev 15: the interrupt time opens the window for the NEW turn —
     // if none starts within `firstResponseSeconds`, the row is treated as
     // a repeat interruption. `resume-await` marks the wait; a following
     // idle must not read as `done` while the resume is still in flight.
+    // `interrupted-resume-sent` is this outcome's own repeat mark (r23).
     store.bumpResume(fresh.id);
     store.setTurnStarted(fresh.id, at);
     store.addSetupError(fresh.id, "resume-await", reason);
-    await sendToExecutor(fresh, `ход прерван (${reason}), продолжай задачу`);
+    store.addSetupError(fresh.id, "interrupted-resume-sent", "1");
+    await sendToExecutor(fresh, t("wd.resumeInterrupt", { reason }));
     await notifyCoordinator(
       fresh,
-      `ход исполнителя прерван (${reason}): задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"} — ` +
-        `послал продолжение (resume #${fresh.resume_count + 1})`,
+      t("wd.resumed", {
+        reason,
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+        n: fresh.resume_count + 1,
+      }),
     );
     return false;
   };
@@ -549,7 +1070,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.setStatus(fresh.id, "quota"); // status first, stop second (§5.3)
     clearMarks(fresh.id);
     const info = await routeInfo(fresh);
-    store.hold(info.quotaGroup, now() + QUOTA_HOLD_MS, detail.slice(0, 200));
+    const { policy: p2 } = await deps.loadPolicy();
+    const holdMs =
+      (p2?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
+    for (const group of await info.quotaGroups()) {
+      store.hold(group, now() + holdMs, detail.slice(0, 200));
+    }
     await afterOutcomeStatus(fresh, "quota", detail);
   };
 
@@ -568,8 +1094,11 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     store.setStatus(fresh.id, "stalled"); // §5.3: unavailable lands as stalled
     clearMarks(fresh.id);
-    const reason = `маршрут недоступен: ${detail.slice(0, 180)}`;
-    store.hold(fresh.route, now() + QUOTA_HOLD_MS, reason);
+    const reason = t("wd.unavailableReason", { detail: detail.slice(0, 180) });
+    const { policy: p3 } = await deps.loadPolicy();
+    const holdMs =
+      (p3?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
+    store.hold(fresh.route, now() + holdMs, reason);
     store.addSetupError(fresh.id, "outcome-detail", reason);
     await outcomeAndMaybeReissue(fresh, "unavailable", detail);
   };
@@ -592,9 +1121,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     ) {
       return false;
     }
-    const reason = `маршрут недоступен: ${text.slice(0, 180)}`;
+    const reason = t("wd.unavailableReason", { detail: text.slice(0, 180) });
+    const { policy: p4 } = await deps.loadPolicy();
+    const holdMs =
+      (p4?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
     store.setStatus(row.id, "stalled");
-    store.hold(row.route, now() + QUOTA_HOLD_MS, reason);
+    store.hold(row.route, now() + holdMs, reason);
     store.addSetupError(row.id, "outcome-detail", reason);
     await outcomeAndMaybeReissue(store.get(row.id) ?? row, "unavailable", text);
     return true;
@@ -603,12 +1135,36 @@ export function createWatchdog(deps: WatchdogDeps) {
   const toFailed = async (row: DelegationRow, errorText: string) => {
     const fresh = store.get(row.id);
     if (!fresh || !isActive(fresh.status)) return;
-    store.setStatus(fresh.id, "failed");
+    store.setStatus(fresh.id, "failed"); // status first, stop second (§5.3)
     clearMarks(fresh.id);
+    const info = await routeInfo(fresh);
+    // §5.4 r23: `failed` reissues through the same confirmed-stop gate —
+    // without it a dead executor stayed `failed` forever (503 UNAVAILABLE
+    // on a review route was the live case that motivated ADR-0024).
+    if (info.level?.autoFallback) {
+      await afterOutcomeStatus(fresh, "failed", errorText);
+      return;
+    }
+    // §16.1/PLUG-184: a final `failed` without autoFallback still owns a
+    // stop — the queued BB auto-retry is cancelled first so the dead
+    // executor cannot lift back; a failed cancel retries through the
+    // §7 watchdog-stop loop.
+    const cancelled = await ensureRetryCancelled(fresh);
+    if (cancelled !== true) {
+      store.addSetupError(
+        fresh.id,
+        "watchdog-stop",
+        t("wd.stopNotConfirmed", { cancelled }),
+      );
+    }
     await report(
       fresh,
-      `исполнитель завершился с ошибкой: задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"} — ${errorText.slice(0, 300)}`,
+      t("wd.failedReport", {
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+        error: errorText.slice(0, 300),
+      }),
     );
   };
 
@@ -617,13 +1173,31 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (!fresh || !isActive(fresh.status)) return;
     store.setStatus(fresh.id, "cancelled");
     clearMarks(fresh.id);
+    // §16.1/PLUG-184: a cancelled row's queued auto-retry would lift the
+    // stopped thread back — drop it best-effort (the thread is already
+    // gone or stopped, so a failure only logs).
+    const retryCancel = await ensureRetryCancelled(fresh);
+    if (retryCancel !== true) {
+      log.warn?.(
+        `orchestrator: cancelled #${fresh.id} auto-retry: ${retryCancel}`,
+      );
+    }
     // §5.3: comment, no reissue. The interrupt/archive/delete already
     // stopped the thread — nothing to stop.
     await commentOnTask(
       fresh,
-      `делегирование отменено: ${reason} (задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"})`,
+      t("wd.cancelledComment", {
+        reason,
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+      }),
     );
+    // §16.5: cancelled delivers a result too — the same one-message
+    // format as `done` («без отчёта» when the output is empty).
+    const finished = store.get(fresh.id) ?? fresh;
+    await collectRoundResult(finished);
+    await deliverResult(finished);
   };
 
   // ── Event stream (§5.1) ──────────────────────────────────────────────
@@ -642,6 +1216,21 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /**
+   * §5.1/§16.5: a response event sets the turn's first-response marker and
+   * refreshes `last_response_at` (the `idleSeconds` clock). The DB write
+   * is throttled — a delta stream fires far more often than the 30-minute
+   * silence window needs.
+   */
+  const bumpResponse = (id: number, row: DelegationRow, at: number) => {
+    store.setFirstResponse(id, at);
+    if (row.last_response_at == null || at - row.last_response_at > 10_000) {
+      store.setLastResponse(id, at);
+      // §16.5/PLUG-184: a response after the silence notice re-arms it.
+      store.clearSetupError(id, "idle-notified");
+    }
+  };
+
+  /**
    * One stream event → delegation markers; returns true when the event
    * terminated the delegation (quota) and the batch should stop.
    */
@@ -655,6 +1244,8 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (ev.type === "turn/started") {
       store.setTurnStarted(id, ev.createdAt);
       store.clearSetupError(id, "resume-await"); // the resumed turn began
+      // §16.1: the queued provider retry materialized — clear its mark.
+      store.clearSetupError(id, "provider-retry-pending");
       interrupted.delete(id);
       return false;
     }
@@ -674,20 +1265,16 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (text) lastErrorText.set(id, text);
       // §5.2 rev 13: a provider that says "I will retry" is not a quota.
       if (data.willRetry === true) return false;
-      // §5.2: the typed category first, the text patterns as fallback.
+      // §16.1: mid-turn quota is decided by the typed category ONLY — a
+      // text pattern while the turn still runs is noise, not a verdict;
+      // the text check stays for turn-ending signals (turn/completed,
+      // thread.failed, the idle tail, `errored`).
       const category = (
         data.errorInfo as { category?: unknown } | undefined
       )?.category;
       if (typeof category === "string" && QUOTA_CATEGORIES.has(category)) {
         await toQuota(row, `${ev.type}: ${category}`);
         return true;
-      }
-      if (text) {
-        const info = await routeInfo(row);
-        if (matchesQuota(text, info.patterns)) {
-          await toQuota(row, `${ev.type}: ${text.slice(0, 200)}`);
-          return true;
-        }
       }
       return false;
     }
@@ -710,12 +1297,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (ev.type === "item/started" || ev.type === "item/completed") {
       const item = data.item as { type?: unknown } | undefined;
       if (item?.type !== "userMessage") {
-        store.setFirstResponse(id, ev.createdAt);
+        bumpResponse(id, row, ev.createdAt);
       }
       return false;
     }
     if (RESPONSE_EVENT_TYPES.has(ev.type)) {
-      store.setFirstResponse(id, ev.createdAt);
+      bumpResponse(id, row, ev.createdAt);
     }
     return false;
   };
@@ -786,6 +1373,961 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
   };
 
+  /**
+   * §5.3 r23 `errored`: collect the current turn's tail (newest → oldest
+   * up to its start). When the tail holds a `turn/completed`, that event
+   * alone decides: only `status = "failed"` or an `error` field is
+   * errored — `interrupted` is a new-message/stop interruption, not an
+   * error, and errors arriving AFTER the completion (the agent process
+   * exiting, stray provider noise) never count (PLUG-176). Without a
+   * `turn/completed`, the newest verdict event decides: a trailing
+   * `turn.failed` or `provider/error`/`system/error` without
+   * `willRetry = true` ends the turn errored, while a response event or a
+   * retrying error means the agent kept working. Returns null when the
+   * journal cannot be read — unknown is not "clean" (§5.1 rev 18).
+   */
+  const lastTurnError = async (
+    row: DelegationRow,
+  ): Promise<{ text: string } | { clean: true; completed: boolean } | null> => {
+    if (!row.thread_id) return { clean: true, completed: false };
+    let events: WatchdogThreadEvent[];
+    try {
+      events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "100",
+      });
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: events.tail ${row.thread_id}: ${message(e)}`,
+      );
+      return null;
+    }
+    // The turn's tail, newest first, up to the turn's start boundary.
+    const tail: WatchdogThreadEvent[] = [];
+    for (const ev of events) {
+      if (row.turn_started_at != null && ev.createdAt < row.turn_started_at) {
+        break; // older turns are out of scope
+      }
+      if (ev.type === "turn/started") break;
+      tail.push(ev);
+    }
+    const completed = tail.find((e) => e.type === "turn/completed");
+    if (completed) {
+      const data = (completed.data ?? {}) as Record<string, unknown>;
+      const errText =
+        errorTextOf(data.error as Record<string, unknown> | undefined) ??
+        errorTextOf(data);
+      if (data.status === "failed" || data.error != null) {
+        return {
+          text: errText ?? `turn/completed: status ${String(data.status)}`,
+        };
+      }
+      return { clean: true, completed: true };
+    }
+    // §17.2 (С2): without the last turn's `turn/completed` the turn is
+    // still in flight — clean-looking but NOT finished.
+    for (const ev of tail) {
+      const data = (ev.data ?? {}) as Record<string, unknown>;
+      if (ev.type === "turn.failed" || ev.type === "turn/failed") {
+        return { text: errorTextOf(data) ?? "turn failed" };
+      }
+      if (ev.type === "provider/error" || ev.type === "system/error") {
+        // §5.3: `willRetry` means the provider is still retrying — the
+        // turn did not end with an error and idle carries no verdict.
+        if (data.willRetry === true) {
+          return { clean: true, completed: false };
+        }
+        return { text: errorTextOf(data) ?? ev.type };
+      }
+      if (ev.type === "item/started" || ev.type === "item/completed") {
+        const item = data.item as { type?: unknown } | undefined;
+        if (item?.type !== "userMessage") {
+          return { clean: true, completed: false };
+        }
+        continue;
+      }
+      if (RESPONSE_EVENT_TYPES.has(ev.type)) {
+        return { clean: true, completed: false };
+      }
+    }
+    return { clean: true, completed: false };
+  };
+
+  /**
+   * §5.3 `errored`: first time — «продолжай» to the executor and one line
+   * to the coordinator, `running` stays (resume_count + 1); a repeat
+   * `errored` is `failed` and follows §5.4. Quota and unavailable texts
+   * still outrank the safety outcome.
+   */
+  const handleErrored = async (
+    row: DelegationRow,
+    text: string,
+    at: number,
+  ) => {
+    const fresh = store.get(row.id);
+    if (!fresh || fresh.status !== "running") return;
+    // §16.1: a queued BB auto-retry is not an `errored` — checked first.
+    if (await retryBlocksOutcome(fresh)) return;
+    const info = await routeInfo(fresh);
+    if (matchesQuota(text, info.patterns)) {
+      await toQuota(fresh, `errored: ${text.slice(0, 200)}`);
+      return;
+    }
+    if (isUnavailable(fresh, text, info.unavailablePatterns)) {
+      await toUnavailable(fresh, `errored: ${text.slice(0, 200)}`);
+      return;
+    }
+    if (hasSetupError(fresh, "errored-resume-sent")) {
+      await toFailed(fresh, t("wd.erroredAgain", { text: text.slice(0, 200) }));
+      return;
+    }
+    // The resume opens a new first-response window — `resume-await`
+    // carries the kind so the timer and the idle pass can tell an errored
+    // resume (→ `failed` on repeat) from an interrupted one (→ `stalled`).
+    store.bumpResume(fresh.id);
+    store.setTurnStarted(fresh.id, at);
+    store.addSetupError(fresh.id, "resume-await", `errored: ${text.slice(0, 200)}`);
+    store.addSetupError(fresh.id, "errored-resume-sent", "1");
+    await sendToExecutor(
+      fresh,
+      t("wd.resumeErrored", { text: text.slice(0, 300) }),
+    );
+    await notifyCoordinator(
+      fresh,
+      t("wd.resumedErrored", {
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+        n: fresh.resume_count + 1,
+        text: text.slice(0, 300),
+      }),
+    );
+  };
+
+  /**
+   * §4.1 round result at `done`: the executor's worktree answers — its
+   * branch, HEAD, commit count over the merge base and cleanliness — into
+   * `result_*`. A foreign branch, zero commits or a dirty copy gets one
+   * coordinator line. Review-level and auditor delegations commit
+   * nothing, so the check does not run for them; env/git failures land
+   * in `round-result`, never in the outcome.
+   */
+  const collectRoundResult = async (row: DelegationRow) => {
+    if (!deps.round || !row.thread_id) return;
+    if (row.level === "review") return;
+    const role = store.threadRole(row.thread_id)?.role;
+    if (role === "auditor" || role === "release-auditor") return;
+    try {
+      const env = await deps.round.environment(row.thread_id);
+      if (!env?.path) {
+        store.addSetupError(
+          row.id,
+          "round-result",
+          t("wd.noEnv"),
+        );
+        return;
+      }
+      const git = (args: string[]) => deps.round!.git(env.path!, args);
+      const sha = (await git(["rev-parse", "HEAD"])).trim();
+      const branch = await git(["symbolic-ref", "--short", "HEAD"])
+        .then((s) => s.trim())
+        .catch(() => null);
+      // PLUG-250: untracked `node_modules` (a directory or a symlink)
+      // is reproducible dependency state, not uncommitted work — every
+      // other status line still counts as dirty.
+      const dirty = (await git(["status", "--porcelain"]))
+        .split("\n")
+        .some((l) => {
+          const p = l.trim();
+          if (!p.startsWith("?? ")) return p.length > 0;
+          const f = p.slice(3).replace(/\/$/, "");
+          return f !== "node_modules" && !f.endsWith("/node_modules");
+        });
+      // §17.2 (мелко 1): the round's own commits are counted from the
+      // round's start — `continue_from` (заходы 2+) or the branch's
+      // reflog «branch: Created from <sha>» entry (заход 1, §16.3) —
+      // never from `mergeBaseBranch`, whose drift made «коммитов нет»
+      // unsound in later rounds.
+      let commits: number | null = null;
+      let start = row.continue_from?.trim() || null;
+      if (!start) {
+        const ref = (branch ?? env.branchName)?.trim();
+        if (ref) {
+          const reflog = await git([
+            "log",
+            "-g",
+            "--format=%H%x00%gs",
+            `refs/heads/${ref}`,
+          ]).catch(() => "");
+          for (const line of reflog.split("\n")) {
+            const sep = line.indexOf("\0");
+            if (sep < 0) continue;
+            if (/^branch: Created from\b/.test(line.slice(sep + 1))) {
+              start = line.slice(0, sep);
+              break;
+            }
+          }
+        }
+      }
+      if (start) {
+        const out = await git(["rev-list", "--count", `${start}..HEAD`]);
+        const n = Number(out.trim());
+        commits = Number.isFinite(n) ? n : 0;
+      }
+      // §17.2 r26 (PLUG-211 С3): no start anchor at all — «коммитов нет»
+      // cannot be proven; `commits` stays null rather than a false alarm.
+      // (The continue_from/`branch: Created from` semantics are
+      // unchanged — the count is this round's own commits.)
+      store.setRoundResult(row.id, {
+        envId: env.id ?? null,
+        branch,
+        sha,
+        commits,
+        dirty,
+      });
+      const problems: string[] = [];
+      if (env.branchName && branch !== env.branchName) {
+        problems.push(
+          t("wd.wrongBranch", { branch: branch ?? "—", expected: env.branchName }),
+        );
+      }
+      // §16.5 one channel (PLUG-184): the doubts ride the single result
+      // message, not a second send. «Коммитов нет» is noise for a
+      // cancelled round — the executor may have been stopped mid-work.
+      // §4.1 r28: a `no_code` delegation expects NO commits — «коммитов
+      // нет» never applies; commits that appeared anyway are the doubt.
+      if (row.no_code) {
+        if (commits !== null && commits > 0) {
+          problems.push(t("wd.noCodeCommits", { n: commits }));
+        }
+      } else if (commits === 0 && row.status !== "cancelled") {
+        problems.push(t("wd.noCommits"));
+      }
+      if (dirty) problems.push(t("wd.dirtyCopy"));
+      if (problems.length) {
+        store.addSetupError(row.id, "round-problems", problems.join("; "));
+      } else {
+        store.clearSetupError(row.id, "round-problems");
+      }
+    } catch (e) {
+      store.addSetupError(row.id, "round-result", message(e));
+    }
+  };
+
+  /**
+   * §16.2: a `turn/started` after the last processed seq on a finished
+   * delegation (`done`/`failed`/`cancelled`) means BB or the coordinator
+   * started the thread again — a queued provider retry materializing, a
+   * `bb thread tell` lifting the thread back, anything. Without another
+   * ACTIVE delegation on the task the row goes back to `running`
+   * (`revived_count += 1`); this also covers the `autoFallback = false`
+   * `failed` BB revives without supervision and the tell-interrupted
+   * `done`. With another active delegation the duplicate turn is stopped
+   * and the coordinator hears one line. Returns true when the row's
+   * outcome must NOT be delivered/decided right now.
+   */
+  /**
+   * §16.2/PLUG-184: a rogue turn on a finished delegation is suppressed —
+   * the queued BB auto-retry is cancelled FIRST (§16.1 ordering), then
+   * the thread is stopped and the stop is confirmed by a read-back
+   * (idle|error|gone per §16.5). A confirmed stop advances last_seq past
+   * this wake; an unconfirmed one leaves it, so the next event pass
+   * retries — suppression is repeatable, never a one-shot mark. The
+   * coordinator hears exactly one line (`revived-suppressed`).
+   */
+  const suppressWake = async (
+    row: DelegationRow,
+    turnSeq: number,
+    reason: string,
+  ) => {
+    const cancelErr = await ensureRetryCancelled(row);
+    if (cancelErr !== true) {
+      log.warn?.(
+        `orchestrator: suppress #${row.id} auto-retry cancel: ${cancelErr}`,
+      );
+    }
+    // §17.2 (e2e 4): the suppressed turn is a past round — mute BB's
+    // «child interrupted» notice for the stop; the plugin's own
+    // `revived-suppressed` line is the sanctioned channel. §17.2 r26
+    // (PLUG-211 Б4): the `notify-muted` mark lands BEFORE `off` — a
+    // crash or a failed `auto` must not leave the thread muted forever
+    // (the §7 pass restores `auto` while the mark stands).
+    store.addSetupError(row.id, NOTIFY_MUTED_STEP, row.thread_id!);
+    await setParentNotify(row.thread_id!, "off");
+    let confirmed = false;
+    try {
+      await deps.threads.stop({ threadId: row.thread_id! });
+      const t = await getThread(row.thread_id!).catch(() => null);
+      confirmed =
+        !t ||
+        !!t.deletedAt ||
+        !!t.archivedAt ||
+        t.status === "idle" ||
+        t.status === "error";
+    } catch (e) {
+      if (/not.?found|does not exist|deleted|archiv/i.test(message(e))) {
+        confirmed = true;
+      } else {
+        log.warn?.(
+          `orchestrator: suppress stop ${row.thread_id}: ${message(e)}`,
+        );
+      }
+    }
+    if (confirmed) {
+      // This wake is handled — a NEW turn/started re-fires suppression.
+      store.advanceLastSeq(row.id, turnSeq);
+      // §17.2 r26 (PLUG-211 Б4): a failed `auto` keeps the mark — the §7
+      // pass retries the restore instead of dropping the thread's
+      // delivery forever.
+      if (
+        await setParentNotify(row.thread_id!, expectedParentNotify(row.level))
+      ) {
+        store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
+      }
+    } else {
+      log.warn?.(
+        `orchestrator: suppress stop of ${row.thread_id} unconfirmed — next pass retries`,
+      );
+    }
+    const cur = store.get(row.id) ?? row;
+    if (!hasSetupError(cur, "revived-suppressed")) {
+      store.addSetupError(
+        row.id,
+        "revived-suppressed",
+        "coordinator notified",
+      );
+      await notifyCoordinator(
+        row,
+        t("wd.revived", {
+          task: row.task_key,
+          thread: row.thread_id ?? "—",
+          status: row.status,
+          reason,
+          action: confirmed ? t("wd.stopped") : t("wd.stopping"),
+        }),
+      );
+    }
+  };
+
+  /**
+   * §16.2 r25 (PLUG-193): a wake opened ONLY by tracker comment
+   * notifications is not a revive and never reaches the coordinator —
+   * the rogue turn of a TERMINAL delegation is just stopped (the plugin
+   * journal records it), the status stands and the cursor moves past
+   * the consumed turn. The stop is confirmed by a read-back like
+   * suppressWake's; an unconfirmed stop keeps the cursor so the next
+   * pass retries.
+   */
+  const silentStopWake = async (row: DelegationRow, turnSeq: number) => {
+    let confirmed = false;
+    // §16.2 (spec 560588a): the thread's own auto-retry rows go BEFORE
+    // the silent stop — an uncancelled retry would lift the rogue turn
+    // back; a failed cancel is an unconfirmed stop retried next pass.
+    const cancelled = await ensureRetryCancelled(row);
+    if (cancelled !== true) {
+      log.warn?.(
+        `orchestrator: tracker-wake stop of ${row.thread_id} ` +
+          `unconfirmed — auto-retry cancel: ${cancelled}`,
+      );
+      return;
+    }
+    // §17.2 (e2e 4 + r26 PLUG-211 Б4): mute BB's «child interrupted»
+    // notice for the stop — a stopped turn's outcome would otherwise
+    // reach the coordinator as a second child-completed. The mark is
+    // written BEFORE `off`; `auto` returns once the stop confirms, and
+    // the §7 pass restores it whenever the restore never landed.
+    store.addSetupError(row.id, NOTIFY_MUTED_STEP, row.thread_id!);
+    await setParentNotify(row.thread_id!, "off");
+    try {
+      await deps.threads.stop({ threadId: row.thread_id! });
+      const t = await getThread(row.thread_id!).catch(() => null);
+      confirmed =
+        !t ||
+        !!t.deletedAt ||
+        !!t.archivedAt ||
+        t.status === "idle" ||
+        t.status === "error";
+    } catch (e) {
+      if (/not.?found|does not exist|deleted|archiv/i.test(message(e))) {
+        confirmed = true;
+      } else {
+        log.warn?.(
+          `orchestrator: tracker-wake stop ${row.thread_id}: ${message(e)}`,
+        );
+      }
+    }
+    if (confirmed) {
+      store.advanceLastSeq(row.id, turnSeq);
+      // §17.2 (r26 PLUG-211 Б4): the mute was for the stop — restore
+      // delivery afterwards; a failed restore keeps the mark for §7.
+      // §2 r10 п.4 (release): the auditor's expected mode is `off`.
+      if (
+        await setParentNotify(row.thread_id!, expectedParentNotify(row.level))
+      ) {
+        store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
+      }
+      log.info?.(
+        `orchestrator: delegation #${row.id} tracker wake ` +
+          `stopped silently (turn seq ${turnSeq})`,
+      );
+    } else {
+      log.warn?.(
+        `orchestrator: tracker-wake stop of ${row.thread_id} ` +
+          `unconfirmed — next pass retries`,
+      );
+    }
+  };
+
+  /**
+   * §16.2 r25 (PLUG-193): the wake verdict reads EVERY
+   * `client/turn/requested` above `last_seq` — BB writes the request
+   * when a message is QUEUED, not when its turn starts, so judging each
+   * `turn/started` by the request right before it misreads queued
+   * batches: a coordinator's tell arriving mid-turn between two tracker
+   * comments was consumed as a tracker wake and the executor worked
+   * unsupervised. All-requests-tracker → silent stop, status stands,
+   * cursor consumed. Any other request — or none at all (an
+   * unattributed turn such as an auto-retry resume) — → the general
+   * rule: superseded/newer → suppress, otherwise revive. A full window
+   * is read on — the "all requests are tracker" verdict needs EVERY
+   * request after `last_seq`, so the scan keeps paging (pages ≤100,
+   * §5.1 rev 18) until the journal tail is reached (PLUG-196).
+   */
+  type WakeVerdict =
+    | "none"
+    | "silent"
+    | "revived"
+    | "suppressed"
+    | "unreadable";
+  const scanTerminalWake = async (
+    row: DelegationRow,
+  ): Promise<WakeVerdict> => {
+    const events: WatchdogThreadEvent[] = [];
+    try {
+      let after = row.last_seq ?? 0;
+      let tailReached = false;
+      for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+        const chunk = await deps.threads.events.list({
+          threadId: row.thread_id!,
+          afterSeq: String(after),
+          order: "asc",
+          limit: "50",
+          types: ["turn/started", "client/turn/requested"],
+        });
+        events.push(...chunk);
+        if (chunk.length < 50) {
+          tailReached = true;
+          break;
+        }
+        after = Math.max(...chunk.map((e) => e.seq));
+      }
+      if (!tailReached) {
+        // Page cap hit with a full last page — the tail is unread, the
+        // all-tracker verdict would be unproven. Defer to a later pass.
+        log.warn?.(
+          `orchestrator: revive check ${row.thread_id}: page cap reached`,
+        );
+        return "unreadable";
+      }
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: revive check ${row.thread_id}: ${message(e)}`,
+      );
+      return "unreadable"; // a later pass re-checks
+    }
+    const starts = events.filter((e) => e.type === "turn/started");
+    if (starts.length === 0) return "none";
+    const turnSeq = Math.max(...starts.map((e) => e.seq));
+    const requests = events.filter(
+      (e) => e.type === "client/turn/requested",
+    );
+    if (
+      requests.length > 0 &&
+      requests.every((r) =>
+        requestText(r).startsWith(TRACKER_COMMENT_PREFIX),
+      )
+    ) {
+      await silentStopWake(row, turnSeq);
+      return "silent";
+    }
+    const superseded = SUPERSEDED.has(row.status);
+    const newer = store.hasNewerForTask(row.task_key, row.id);
+    if (superseded || newer) {
+      await suppressWake(
+        row,
+        turnSeq,
+        newer
+          ? t("wd.newerExists")
+          : t("wd.outcomeRecorded", { status: row.status }),
+      );
+      return "suppressed";
+    }
+    if (!store.revive(row.id)) {
+      // Lost the race — another delegation of the task is active
+      // (the revive() transaction guards the partial unique index).
+      await suppressWake(
+        row,
+        turnSeq,
+        t("wd.newerExists"),
+      );
+      return "suppressed";
+    }
+    clearMarks(row.id);
+    log.info?.(`orchestrator: delegation #${row.id} revived (turn/started)`);
+    // Drain the stream so the new turn's `turn/started` reopens
+    // supervision (turn_started_at, cleared marks).
+    await processStream(store.get(row.id) ?? row);
+    return "revived";
+  };
+
+  const maybeRevive = async (row: DelegationRow): Promise<boolean> => {
+    if (
+      !row.thread_id ||
+      !(REVIVABLE.has(row.status) || SUPERSEDED.has(row.status))
+    ) {
+      return false;
+    }
+    const verdict = await scanTerminalWake(row);
+    // A finished row keeps delivering its outcome; "suppressed" blocks
+    // only for superseded statuses (they never reach the delivery list
+    // anyway), "revived" always blocks — the outcome is void.
+    return (
+      verdict === "revived" ||
+      (verdict === "suppressed" && SUPERSEDED.has(row.status))
+    );
+  };
+
+  /**
+   * §16.5: did BB itself report this executor's outcome to the
+   * coordinator? The coordinator's journal is scanned (pages ≤ 100,
+   * §5.1) for a `client/turn/requested` system message that arrived
+   * after the executor's last turn started: `systemMessageKind`
+   * `child-completed`/`child-interrupted` with
+   * `systemMessageSubject.threadId` = the executor's thread, or a
+   * `child-outcome-batch` listing it in `outcomes`. A batch without a
+   * thread list never counts — an unattributed batch cannot stand in
+   * for a notice about THIS executor (PLUG-200 #4). Returns null when
+   * the journal could not be read to its tail: unproven is not "absent".
+   */
+  const coordinatorSawOutcome = async (
+    row: DelegationRow,
+  ): Promise<boolean | null> => {
+    if (!row.thread_id) return false;
+    const since = row.turn_started_at ?? 0;
+    let after = 0;
+    try {
+      for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+        const chunk = await deps.threads.events.list({
+          threadId: row.coordinator_thread_id,
+          afterSeq: String(after),
+          order: "asc",
+          limit: String(EVENT_PAGE_SIZE),
+          types: ["client/turn/requested"],
+        });
+        for (const e of chunk) {
+          if (e.createdAt <= since) continue;
+          const d = e.data as
+            | {
+                systemMessageKind?: unknown;
+                systemMessageSubject?: {
+                  threadId?: unknown;
+                  outcomes?: unknown;
+                } | null;
+              }
+            | null
+            | undefined;
+          const kind = d?.systemMessageKind;
+          const subj = d?.systemMessageSubject;
+          if (
+            (kind === "child-completed" || kind === "child-interrupted") &&
+            subj?.threadId === row.thread_id
+          ) {
+            return true;
+          }
+          if (kind === "child-outcome-batch") {
+            const outcomes = subj?.outcomes;
+            if (
+              Array.isArray(outcomes) &&
+              outcomes.some(
+                (o) =>
+                  (o as { threadId?: unknown } | null)?.threadId ===
+                  row.thread_id,
+              )
+            ) {
+              return true;
+            }
+          }
+        }
+        if (chunk.length < EVENT_PAGE_SIZE) return false;
+        after = Math.max(...chunk.map((e) => e.seq));
+      }
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: coordinator journal ` +
+          `${row.coordinator_thread_id}: ${message(e)}`,
+      );
+      return null;
+    }
+    return null; // page cap — the journal tail was not proven
+  };
+
+  /**
+   * §16.5: BB is the primary outcome channel — `parentNotifications =
+   * auto` (§4 step 4) makes it report the executor's `done`/`cancelled`
+   * to the coordinator itself. RESULT_BB_GRACE_MS after the finished row
+   * is first seen (and at every §7 pass until confirmed) the plugin
+   * checks the coordinator's journal for BB's notice about the
+   * executor's thread; found — `result_notice = bb`, no message.
+   * Absent — the plugin's own ONE line (branch, sha7, copy cleanliness,
+   * executor output ≤ 3000 or «без отчёта»), `result_notice = plugin`.
+   * A doubtful (§4.1) result still gets the one-line header when BB
+   * already carried the report — the doubt rides it, the body does not
+   * repeat (PLUG-200 #1); an empty result always gets the plugin line.
+   * `result_notified_at` is the durable delivery record; a gone
+   * coordinator records the delivery with a NULL `result_notice` so the
+   * row never rescans.
+   */
+  const deliverResult = async (row: DelegationRow) => {
+    // §16.2 hedge: a revived thread voids the outcome — check first.
+    if (await maybeRevive(row)) return;
+    const fresh = store.get(row.id) ?? row;
+    // PLUG-190: only a RECORDED delivery ends the resend — a `-1` claim
+    // left by a crash mid-delivery is stale work, not a delivered result
+    // (`claimResultDelivery` re-takes it after two minutes).
+    if ((fresh.result_notified_at ?? 0) > 0 || fresh.result_notice != null) {
+      return;
+    }
+    if (fresh.status !== "done" && fresh.status !== "cancelled") return;
+    // §2 r10 п.4 (release): the release-auditor's outcome is read by the
+    // release pump from the journal — the §16.5 handoff is never sent
+    // for it; a recorded delivery keeps the rescan pass out.
+    if (fresh.level === RELEASE_AUDIT_LEVEL) {
+      store.setResultNotified(fresh.id, null);
+      return;
+    }
+    // §16.5: the `result-window` marker opens BB's grace window at the
+    // finished row's first sight (it survives restarts; a revive clears
+    // it in store.revive). A `-1` claim skips the window — that row
+    // already waited it out before the send was claimed (or the claim
+    // predates the window).
+    if (fresh.result_notified_at == null) {
+      const win = store.findSetupError(fresh, "result-window");
+      if (!win) {
+        store.addSetupError(fresh.id, "result-window", String(now()));
+        return;
+      }
+      const { policy: p7 } = await deps.loadPolicy();
+      const bbGrace =
+        (p7?.timing?.bbNotifyWaitSeconds ?? DEFAULT_BB_NOTIFY_WAIT_SECONDS) *
+        1000;
+      if (now() - Number(win.message) < bbGrace) return;
+    }
+    // §16.5 exactly-once (PLUG-184): the conditional claim below is the
+    // atomic gate — event-driven and reconcile paths cannot both send.
+    // Anything that bails afterwards releases the claim so the §7 pass
+    // retries instead of losing the result forever.
+    if (!store.claimResultDelivery(fresh.id)) return;
+    let output: string | null = null;
+    if (fresh.thread_id) {
+      try {
+        const res = await deps.threads.output({ threadId: fresh.thread_id });
+        output = res?.output ?? null;
+      } catch (e) {
+        if (!/not.?found|does not exist|deleted|archiv/i.test(message(e))) {
+          log.warn?.(
+            `orchestrator: output ${fresh.thread_id}: ${message(e)}`,
+          );
+          store.releaseResultClaim(fresh.id);
+          return; // transient read error — the §7 pass retries
+        }
+      }
+    }
+    let coord: WatchdogThreadDto | null;
+    try {
+      coord = await getThread(fresh.coordinator_thread_id);
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: coordinator ${fresh.coordinator_thread_id}: ${message(e)}`,
+      );
+      store.releaseResultClaim(fresh.id);
+      return;
+    }
+    if (!coord || coord.deletedAt || coord.archivedAt) {
+      log.info?.(
+        `orchestrator: delegation #${fresh.id} — coordinator gone, result dropped`,
+      );
+      store.setResultNotified(fresh.id, null);
+      return;
+    }
+    const report = output?.trim() ?? "";
+    // §16.5 one channel: the round's doubts ride the result message.
+    const doubt = store.findSetupError(fresh, "round-problems")?.message;
+    // §16.5: BB's own notice about this thread in the coordinator's
+    // journal satisfies the delivery (`result_notice = bb`). A doubtful
+    // result is journal-checked too: when BB already carried the report
+    // the plugin adds only the one-line header — the coordinator must
+    // not read the same 3000 chars twice (PLUG-200 #1). An unreadable
+    // journal is not "absent": the claim is released so the §7 pass
+    // re-checks — until the retry limit is spent, after which a late
+    // duplicate beats a lost result (PLUG-200 #2).
+    // PLUG-224: the coordinator's own `orchestrator cancel` never gets
+    // a «без отчёта» tail — and BB's `child-interrupted` notice may
+    // satisfy the delivery even with an empty report, so the journal
+    // check runs for it too.
+    const selfCancelled =
+      fresh.status === "cancelled" &&
+      hasSetupError(fresh, "coordinator-cancel");
+    let bbCarried = false;
+    if (report.length > 0 || selfCancelled) {
+      const seen = await coordinatorSawOutcome(fresh);
+      if (seen === null) {
+        await trackRetry(
+          fresh,
+          t("wd.journalCheck"),
+          "events.list failed",
+        );
+        const retried = store.get(fresh.id) ?? fresh;
+        if (!hasSetupError(retried, "retry-exhausted")) {
+          store.releaseResultClaim(fresh.id);
+          return;
+        }
+      } else if (seen && !doubt) {
+        store.setResultNotified(fresh.id, "bb");
+        store.resetRetry(fresh.id);
+        return;
+      } else {
+        bbCarried = seen;
+      }
+    }
+    const branch = fresh.result_branch ?? "—";
+    const sha7 = fresh.result_sha ? fresh.result_sha.slice(0, 7) : "—";
+    const copy =
+      fresh.result_dirty == null
+        ? "—"
+        : fresh.result_dirty
+          ? t("wd.copyDirty")
+          : t("wd.copyClean");
+    const body =
+      report.length > 0
+        ? report.slice(0, RESULT_OUTPUT_CAP)
+        : selfCancelled
+          ? ""
+          : t("wd.noReport");
+    try {
+      await deps.threads.send({
+        threadId: coord.id,
+        mode: "queue-if-active",
+        input: [
+          {
+            type: "text",
+            text:
+              t("wd.resultLine", {
+                task: fresh.task_key,
+                level: fresh.level,
+                thread: fresh.thread_id ?? "—",
+                status: fresh.status,
+                branch,
+                sha: sha7,
+                copy,
+              }) +
+              (doubt ? t("wd.doubtSuffix", { doubt }) : "") +
+              (bbCarried || body === "" ? "" : `\n${body}`),
+            mentions: [],
+          },
+        ],
+      });
+    } catch (e) {
+      store.releaseResultClaim(fresh.id);
+      await trackRetry(fresh, t("wd.deliverResult"), message(e));
+      return;
+    }
+    store.setResultNotified(fresh.id, "plugin");
+    store.resetRetry(fresh.id);
+  };
+
+  // ── §17 r31 «Вердикт обязателен» ────────────────────────────────────
+
+  /** An unfinished `item/backgroundTask` in the journal tail — the
+   * provider lifts its own turn for it, so a verdict check waits (r31:
+   * no reminder while background work is open). null = journal
+   * unreadable, treated like open work (never a "missing"). */
+  const openBackgroundItem = async (
+    row: DelegationRow,
+  ): Promise<boolean | null> => {
+    if (!row.thread_id) return false;
+    let events: WatchdogThreadEvent[];
+    try {
+      events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "100",
+      });
+    } catch {
+      return null;
+    }
+    const done = new Set<string>();
+    const open = new Set<string>();
+    for (const ev of events) {
+      const item = ((ev.data ?? {}) as {
+        item?: { type?: unknown; id?: unknown };
+      }).item;
+      const id = typeof item?.id === "string" ? item.id : null;
+      if (!id) continue;
+      if (
+        ev.type === "item/backgroundTask/completed" ||
+        (ev.type === "item/completed" && item?.type === "backgroundTask")
+      ) {
+        done.add(id);
+      } else if (
+        (ev.type === "item/started" && item?.type === "backgroundTask") ||
+        ev.type === "item/backgroundTask/progress"
+      ) {
+        open.add(id);
+      }
+    }
+    return [...open].some((id) => !done.has(id));
+  };
+
+  /** The auditor's last message — same `item/completed` agentMessage
+   * text the release pump reads. */
+  const auditorLastMessage = async (
+    row: DelegationRow,
+  ): Promise<string | null | undefined> => {
+    if (!row.thread_id) return null;
+    let events: WatchdogThreadEvent[];
+    try {
+      events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "50",
+        types: ["item/completed"],
+      });
+    } catch {
+      return undefined;
+    }
+    for (const ev of events) {
+      const item = ((ev.data ?? {}) as {
+        item?: { type?: unknown; text?: unknown };
+      }).item;
+      if (item?.type === "agentMessage" && typeof item.text === "string") {
+        return item.text;
+      }
+    }
+    return null;
+  };
+
+  /** §17 r31 verdict check — "verdict" (any parseable verdict), "missing"
+   * (a verdict-less turn end), "wait" (open background work or an
+   * unreadable source — never a miss). Lookup order: for an ordinary
+   * reviewer the last agent task comment, then the thread's last
+   * message; for the release auditor the last thread message ONLY (a
+   * comment-only verdict does not count for it). */
+  const reviewerVerdict = async (
+    row: DelegationRow,
+    role: "auditor" | "release-audit",
+  ): Promise<{
+    state: "verdict" | "missing" | "wait";
+    /** §18.5: у вердикта ревьюера — значения для review.verdict. */
+    verdict?: "OK" | "CHANGES";
+    blockers?: number | null;
+  }> => {
+    const bg = await openBackgroundItem(row);
+    if (bg !== false) return { state: "wait" };
+    if (role === "release-audit") {
+      const text = await auditorLastMessage(row);
+      if (text === undefined) return { state: "wait" };
+      if (text == null) return { state: "missing" };
+      return parseAuditVerdict(text).unparseable
+        ? { state: "missing" }
+        : { state: "verdict" };
+    }
+    try {
+      const show = await runJson<{
+        comments?: {
+          kind?: string;
+          threadId?: string | null;
+          body?: string;
+          createdAt?: string;
+        }[];
+      }>(deps.bbCli, ["tasks", "show", row.task_key, "--json"]);
+      const comments = (show.comments ?? [])
+        .filter((c) => c.kind === "agent" && c.threadId === row.thread_id)
+        .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+      const last = comments.at(-1);
+      if (last?.body) {
+        const d = verdictDetailsInBody(last.body);
+        if (d) {
+          return { state: "verdict", verdict: d.verdict, blockers: d.blockers };
+        }
+      }
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: verdict comments ${row.task_key}: ${message(e)}`,
+      );
+      return { state: "wait" };
+    }
+    if (row.thread_id) {
+      try {
+        const res = await deps.threads.output({ threadId: row.thread_id });
+        if (res?.output) {
+          const d = verdictDetailsInBody(res.output);
+          if (d) {
+            return {
+              state: "verdict",
+              verdict: d.verdict,
+              blockers: d.blockers,
+            };
+          }
+        }
+      } catch (e) {
+        log.warn?.(
+          `orchestrator: verdict output ${row.thread_id}: ${message(e)}`,
+        );
+        return { state: "wait" };
+      }
+    }
+    return { state: "missing" };
+  };
+
+  /** Journal tip seq at the reminder's send time — a second miss counts
+   * only on a `turn/started` seq ABOVE it (r31). null = journal
+   * unreadable: the seq is unknown, so NO reminder is recorded — a 0
+   * would let the next idle count any old turn/started as the second
+   * miss (ревью PLUG-244 заход 1, Н9). */
+  const journalTipSeq = async (
+    row: DelegationRow,
+  ): Promise<number | null> => {
+    if (!row.thread_id) return 0;
+    try {
+      const events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "1",
+      });
+      return events[0]?.seq ?? 0;
+    } catch {
+      return null;
+    }
+  };
+
+  const lastTurnStartedSeq = async (
+    row: DelegationRow,
+  ): Promise<number | null> => {
+    if (!row.thread_id) return null;
+    try {
+      const events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "1",
+        types: ["turn/started"],
+      });
+      return events[0]?.seq ?? null;
+    } catch {
+      return null;
+    }
+  };
+
   const evaluateIdle = async (
     row: DelegationRow,
     thread: WatchdogThreadDto,
@@ -795,7 +2337,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (thread.deletedAt || thread.archivedAt) {
       await toCancelled(
         row,
-        thread.deletedAt ? "тред удалён" : "тред в архиве",
+        thread.deletedAt ? t("wd.threadDeleted") : t("wd.threadArchived"),
       );
       return;
     }
@@ -805,7 +2347,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const interruptedNow = await recentInterrupt(row);
     if (interruptedNow === null) return; // interrupt lookup failed too
     if (interruptedNow) {
-      await toCancelled(row, "ход прерван (system/thread/interrupted)");
+      await toCancelled(row, t("wd.interruptedCancel"));
       return;
     }
     // `done` only after a turn started and with an empty queue (§5.3).
@@ -818,17 +2360,156 @@ export function createWatchdog(deps: WatchdogDeps) {
       log.warn?.(`orchestrator: queuedMessages ${thread.id}: ${message(e)}`);
       return;
     }
-    // §5.3 rev 15: a resumed turn that never began is a repeat
-    // interruption — `stalled` → §5.4, never `done`.
-    if (hasSetupError(row, "resume-await")) {
+    // §5.3 rev 15/23: a resume that never lifted a new turn repeats the
+    // failure — an errored resume lands `failed`, an interrupted one
+    // `stalled`; both follow §5.4 and neither is `done`.
+    const resumeAwait = store.findSetupError(row, "resume-await");
+    if (resumeAwait) {
       if (queue.length === 0) {
-        await toStalled(row, "продолжение не подняло новый ход");
+        if (resumeAwait.message.startsWith("errored:")) {
+          await toFailed(row, t("wd.resumeNoTurn"));
+        } else {
+          await toStalled(row, t("wd.resumeNoTurn"));
+        }
       }
       return; // queue holds the resume message — give it time to deliver
     }
     if (queue.length === 0) {
-      store.setStatus(row.id, "done");
+      // §5.3 r23 `errored`: the turn may have ended with an error while
+      // the thread went idle — the journal tail decides between a resume
+      // nudge (→ `failed` on repeat) and `done`.
+      const verdict = await lastTurnError(row);
+      if (verdict === null) return; // unreadable journal is not a clean one
+      if ("text" in verdict) {
+        await handleErrored(row, verdict.text, now());
+        return;
+      }
+      // §17.2 (С2): `done` stands on the last turn's `turn/completed`
+      // actually read — without it the turn is still in flight.
+      if (!verdict.completed) return;
+      // §17.2 (С2): and the thread is re-read right before the write —
+      // BB may already have started the next turn while this handler
+      // waited in the plugin queue; an active thread is not `done`.
+      const latest = await getThread(thread.id);
+      if (
+        !latest ||
+        latest.status !== "idle" ||
+        latest.deletedAt ||
+        latest.archivedAt
+      ) {
+        return;
+      }
+      // §17 r31 «Вердикт обязателен»: a reviewer or the release auditor
+      // cannot go `done` without a verdict — the first miss keeps the
+      // row running under ONE reminder; a second verdict-less turn that
+      // STARTED after the reminder ends it without OK (a reviewer gets
+      // the one coordinator line instead of §16.5's delivery; the
+      // auditor's release is rejected «аудит без вердикта»).
+      const r31Role =
+        row.level === RELEASE_AUDIT_LEVEL
+          ? "release-audit"
+          : levelRole((await deps.loadPolicy()).policy, row.level);
+      // §18.5: вердикт ревьюера — в событие review.verdict той же
+      // транзакцией, что и переход в done (у release-audit исход —
+      // события выкладки).
+      let reviewVerdict:
+        | { verdict: string; blockers: number | null }
+        | undefined;
+      if (r31Role === "auditor" || r31Role === "release-audit") {
+        const verdictCheck = await reviewerVerdict(row, r31Role);
+        if (verdictCheck.state === "wait") return;
+        if (verdictCheck.state === "missing") {
+          const cur = store.get(row.id) ?? row;
+          if (cur.verdict_nudged_at == null) {
+            const tip = await journalTipSeq(row);
+            if (tip == null) return; // журнал не прочитан — wait
+            await sendToExecutor(
+              row,
+              r31Role === "release-audit"
+                ? t("wd.verdictNudgeRelease")
+                : t("wd.verdictNudgeReview"),
+            );
+            store.setVerdictNudge(row.id, tip);
+            return;
+          }
+          const startedSeq = await lastTurnStartedSeq(row);
+          // The second miss counts only on a turn started AFTER the
+          // reminder — re-evaluating the same completed turn is not it.
+          if (
+            startedSeq == null ||
+            startedSeq <= (cur.verdict_nudge_seq ?? 0)
+          ) {
+            return;
+          }
+          // Н10 (ревью PLUG-244 заход 1): выкладка аудитора отклоняется
+          // ДО перехода делегирования в done — насос, прочитав
+          // «done + auditing», успел бы отклонить её своей строкой
+          // «ответ не парсится» и вышло бы две строки. Условный перевод
+          // решает гонку: кто перевёл — тот и шлёт строку; уже
+          // отклонённая/отсутствующая выкладка строки не получает.
+          if (row.level === RELEASE_AUDIT_LEVEL) {
+            const release = store.activeReleaseByTask(row.task_key);
+            // «без вердикта» отклоняет только аудит: publishing —
+            // середина публикации, её исход решает насос (ревью заход 2).
+            // Строка пишется в записи атомарно с переходом (п.5 r10) и
+            // уходит тем же протоколом доставки, что строки насоса.
+            if (
+              release &&
+              store.transitionReleaseStatus(
+                release.id,
+                ["auditing"],
+                "rejected",
+                t("wd.noVerdictReason"),
+                {
+                  kind: "rejected",
+                  text:
+                    t("wd.releaseRejectedText", { task: row.task_key }),
+                },
+              )
+            ) {
+              await deliverReleaseNotice(
+                deps,
+                store.getRelease(release.id) ?? release,
+              );
+            }
+          }
+          if (!store.setStatusIf(row.id, "running", "done")) return;
+          clearMarks(row.id);
+          const finished = store.get(row.id) ?? row;
+          await collectRoundResult(finished);
+          if (finished.level !== RELEASE_AUDIT_LEVEL) {
+            await report(
+              finished,
+              t("wd.reviewNoVerdict", {
+                task: finished.task_key,
+                thread: finished.thread_id ?? "—",
+              }),
+            );
+          }
+          // The one r31 line IS the outcome — §16.5's own delivery does
+          // not ride alongside.
+          store.setResultNotified(finished.id, "plugin");
+          return;
+        }
+        if (r31Role === "auditor" && verdictCheck.verdict) {
+          reviewVerdict = {
+            verdict: verdictCheck.verdict,
+            blockers: verdictCheck.blockers ?? null,
+          };
+        }
+        // verdict present — the ordinary done path below
+      }
+      // PLUG-184: the status move is conditional — a row that left
+      // `running` meanwhile (manual cancel, revive) never flips to done.
+      if (!store.setStatusIf(row.id, "running", "done", { reviewVerdict })) {
+        return;
+      }
       clearMarks(row.id);
+      const finished = store.get(row.id) ?? row;
+      await collectRoundResult(finished);
+      // §16.5: the §4.1 round result is collected — now the result
+      // message goes out (or is recorded for the §7 resend pass).
+      await deliverResult(finished);
     }
   };
 
@@ -854,7 +2535,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     sequence?: number;
   }) => {
     const row = store.byThreadId(payload.thread.id);
-    if (!row || !isActive(row.status)) return;
+    if (!row) return;
+    if (!isActive(row.status)) {
+      // §16.2: a `turn/started` on a finished delegation revives it.
+      await maybeRevive(row);
+      return;
+    }
     await processStream(row);
   };
 
@@ -884,6 +2570,8 @@ export function createWatchdog(deps: WatchdogDeps) {
     // `failed` rows pass: a stronger signal in this event may upgrade the
     // outcome (§5.2/§5.3 precede `failed` whenever it is re-evaluated).
     if (!row || !(isActive(row.status) || row.status === "failed")) return;
+    // §16.1: a queued BB auto-retry is not an outcome — checked first.
+    if (await retryBlocksOutcome(row)) return;
     const streamRead = await processStream(row);
     const fresh = store.get(row.id);
     // A later, stronger signal may still upgrade a premature `failed` —
@@ -907,6 +2595,14 @@ export function createWatchdog(deps: WatchdogDeps) {
   const onTurnFailed = async (event: TurnFailedInfo) => {
     const row = store.byThreadId(event.threadId);
     if (!row) return;
+    // §16.1: a queued BB auto-retry is not an outcome — checked first,
+    // even before the typed quota category (§16.1's retry outranks it).
+    if (
+      (isActive(row.status) || row.status === "failed") &&
+      (await retryBlocksOutcome(row))
+    ) {
+      return;
+    }
     // §5.2 first signal: the typed category — it wins even over a `failed`
     // a premature thread.failed already committed (rev 13 ordering).
     const category = event.errorInfo?.category;
@@ -962,10 +2658,14 @@ export function createWatchdog(deps: WatchdogDeps) {
   ) => {
     const row = store.byThreadId(thread.id);
     if (!row || !isActive(row.status)) return;
-    // §5.3: at most one approval notification per 10 minutes.
+    // §5.3: at most one approval notification per approvalRepeatMinutes.
+    const { policy: p5 } = await deps.loadPolicy();
+    const approvalMs =
+      (p5?.timing?.approvalRepeatMinutes ?? DEFAULT_APPROVAL_REPEAT_MINUTES) *
+      60_000;
     if (
       row.last_approval_notified_at != null &&
-      now() - row.last_approval_notified_at < APPROVAL_NOTIFY_MS
+      now() - row.last_approval_notified_at < approvalMs
     ) {
       return;
     }
@@ -974,9 +2674,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       (interaction as { id?: string } | undefined)?.id ?? "<interactionId>";
     await notifyCoordinator(
       row,
-      `исполнитель ждёт решения: задача ${row.task_key}, маршрут ${row.route}, ` +
-        `тред ${row.thread_id} — ${describeInteraction(interaction)}. ` +
-        `Реши: bb thread interactions approve|deny|grant|answer|respond ${id} ${row.thread_id}`,
+      t("wd.approvalWait", {
+        task: row.task_key,
+        route: row.route,
+        thread: row.thread_id ?? "—",
+        interaction: describeInteraction(interaction),
+        id,
+      }),
     );
   };
 
@@ -988,27 +2692,59 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (!row || !isActive(row.status)) return;
     const text =
       reason === "archived"
-        ? "тред в архиве"
+        ? t("wd.threadArchived")
         : reason === "deleted"
-          ? "тред удалён"
-          : "тред не найден";
+          ? t("wd.threadDeleted")
+          : t("wd.threadNotFound");
     await toCancelled(row, text);
   };
 
   /** §5.1 first-response window + §5.3 `maxRunSeconds` — the timer pass. */
   const checkTimers = async () => {
     const { policy } = await deps.loadPolicy();
-    const firstMs =
-      (policy?.firstResponseSeconds ?? DEFAULT_FIRST_RESPONSE_SECONDS) * 1000;
+    // §2 rule 4 (r23): a route's own `firstResponseSeconds` overrides the
+    // global window — slow cold starts (agy takes 2–3 min) must not stall.
+    // §17.2 (e2e 8): a `--preset` one-off route has no entry in
+    // `policy.routes` — it borrows the window of ANY policy route on the
+    // same provider, then `firstResponseSecondsByProvider`, then global.
+    const firstMsOf = (row: DelegationRow) => {
+      const own = policy?.routes[row.route]?.firstResponseSeconds;
+      if (own !== undefined) return own * 1000;
+      if (policy && row.route.startsWith("preset:")) {
+        const routeWindow = Object.values(policy.routes).find(
+          (r) =>
+            r.provider === row.provider &&
+            r.firstResponseSeconds !== undefined,
+        )?.firstResponseSeconds;
+        if (routeWindow !== undefined) return routeWindow * 1000;
+        const byProvider =
+          policy.firstResponseSecondsByProvider?.[row.provider];
+        if (byProvider !== undefined) return byProvider * 1000;
+      }
+      return (
+        (policy?.firstResponseSeconds ?? DEFAULT_FIRST_RESPONSE_SECONDS) *
+        1000
+      );
+    };
+    // §16.5: `routes.*.startSeconds` (no turn began) and
+    // `routes.*.idleSeconds` (response silence) — one message each,
+    // never a stop.
+    const startMsOf = (row: DelegationRow) =>
+      (policy?.routes[row.route]?.startSeconds ?? DEFAULT_START_SECONDS) *
+      1000;
+    const idleMsOf = (row: DelegationRow) =>
+      (policy?.routes[row.route]?.idleSeconds ?? DEFAULT_IDLE_SECONDS) *
+      1000;
     const maxRunMs =
       (policy?.maxRunSeconds ?? DEFAULT_MAX_RUN_SECONDS) * 1000;
-    const t = now();
+    const nowMs = now();
     for (const row of store.listActive()) {
       if (row.status !== "running") continue;
+      const firstMs = firstMsOf(row);
       if (
         row.turn_started_at != null &&
         row.first_response_at == null &&
-        t - row.turn_started_at > firstMs
+        nowMs - row.turn_started_at > firstMs
       ) {
         // §5.1 rev 13: drain the event log first — a response already
         // recorded after `last_seq` cancels the stalled decision.
@@ -1022,21 +2758,27 @@ export function createWatchdog(deps: WatchdogDeps) {
           fresh.status !== "running" ||
           fresh.turn_started_at == null ||
           fresh.first_response_at != null ||
-          t - fresh.turn_started_at <= firstMs
+          nowMs - fresh.turn_started_at <= firstMs
         ) {
           continue;
         }
         // Re-read the thread: a finished turn may already have idled it.
         const thread = await getThread(row.thread_id);
-        // §5.3 rev 15: a pending resume shares the window — an idle
-        // executor with an empty queue never began the new turn → stalled.
-        if (hasSetupError(fresh, "resume-await")) {
+        // §5.3 rev 15/23: a pending resume shares the window — an idle
+        // executor with an empty queue never began the new turn. An
+        // errored resume lands `failed`, an interrupted one `stalled`.
+        const resumeAwait = store.findSetupError(fresh, "resume-await");
+        if (resumeAwait) {
           if (!thread || thread.status !== "active") {
             const queue = await deps.threads.queuedMessages
               .list({ threadId: row.thread_id! })
               .catch(() => null);
             if (queue && queue.length === 0) {
-              await toStalled(fresh, "продолжение не подняло новый ход");
+              if (resumeAwait.message.startsWith("errored:")) {
+                await toFailed(fresh, t("wd.resumeNoTurn"));
+              } else {
+                await toStalled(fresh, t("wd.resumeNoTurn"));
+              }
             }
           }
           continue;
@@ -1044,19 +2786,71 @@ export function createWatchdog(deps: WatchdogDeps) {
         if (thread && thread.status === "active") {
           await toStalled(
             fresh,
-            `нет первого ответа за ${Math.round(firstMs / 1000)}с`,
+            t("wd.noFirstResponse", { s: Math.round(firstMs / 1000) }),
           );
           continue;
         }
       }
-      if (row.timeout_notified_at == null && t - row.created_at > maxRunMs) {
-        store.setTimeoutNotified(row.id, t);
+      if (row.timeout_notified_at == null && nowMs - row.created_at > maxRunMs) {
+        store.setTimeoutNotified(row.id, nowMs);
         // §5.3: one message, never a stop.
         await notifyCoordinator(
           row,
-          `делегирование #${row.id} дольше maxRunSeconds ` +
-            `(${Math.round(maxRunMs / 1000)}с): задача ${row.task_key}, ` +
-            `маршрут ${row.route}, тред ${row.thread_id} — не останавливаю`,
+          t("wd.maxRunNotice", {
+            id: row.id,
+            s: Math.round(maxRunMs / 1000),
+            task: row.task_key,
+            route: row.route,
+            thread: row.thread_id ?? "—",
+          }),
+        );
+      }
+      // §16.5 `startSeconds`: the executor never started a turn — one
+      // message (the dispatch itself may have quietly not fired).
+      const startMs = startMsOf(row);
+      if (
+        row.turn_started_at == null &&
+        !hasSetupError(row, "start-notified") &&
+        nowMs - row.created_at > startMs
+      ) {
+        store.addSetupError(row.id, "start-notified", "1");
+        await notifyCoordinator(
+          row,
+          t("wd.startNotice", {
+            id: row.id,
+            s: Math.round(startMs / 1000),
+            task: row.task_key,
+            route: row.route,
+            thread: row.thread_id ?? "—",
+          }),
+        );
+      }
+      // §16.5 `idleSeconds`: response silence — one message. PLUG-184:
+      // silence is measured from the LATER of the last response and the
+      // current turn's start — a new turn after a long auto-retry wait
+      // or resume must not fire the notice instantly. And a thread with
+      // a queued BB auto-retry is sleeping on BB, not silent.
+      const idleMs = idleMsOf(row);
+      const lastResp = Math.max(
+        row.last_response_at ?? row.first_response_at ?? 0,
+        row.turn_started_at ?? 0,
+      );
+      if (
+        lastResp > 0 &&
+        !hasSetupError(row, "idle-notified") &&
+        !hasSetupError(row, "provider-retry-pending") &&
+        nowMs - lastResp > idleMs
+      ) {
+        store.addSetupError(row.id, "idle-notified", "1");
+        await notifyCoordinator(
+          row,
+          t("wd.idleNotice", {
+            id: row.id,
+            s: Math.round(idleMs / 1000),
+            task: row.task_key,
+            route: row.route,
+            thread: row.thread_id ?? "—",
+          }),
         );
       }
     }
@@ -1080,10 +2874,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.addSetupError(row.id, "retry-exhausted", last);
     await report(
       row,
-      `исчерпан предел повторов (${RETRY_LIMIT}): ${action} по ` +
-        `делегированию #${row.id} — последняя ошибка: ${last}. Ручное ` +
-        `решение: \`bb orchestrator show ${row.id}\` и ` +
-        `\`bb orchestrator cancel ${row.id}\`, затем раздать заново`,
+      t("wd.retryExhausted", {
+        limit: RETRY_LIMIT,
+        action,
+        id: row.id,
+        last,
+      }),
     );
   };
 
@@ -1110,9 +2906,12 @@ export function createWatchdog(deps: WatchdogDeps) {
   const reportReissueDone = async (row: DelegationRow) => {
     const prev = row.reissue_of != null ? store.get(row.reissue_of) : undefined;
     const text =
-      `перевыпуск завершён: задача ${row.task_key}, ` +
-      `маршрут ${prev?.route ?? "?"} → ${row.route}, ` +
-      `новый тред ${row.thread_id ?? "—"}`;
+      t("wd.reissueDone", {
+        task: row.task_key,
+        prev: prev?.route ?? "?",
+        route: row.route,
+        thread: row.thread_id ?? "—",
+      });
     await report(row, text);
   };
 
@@ -1120,23 +2919,27 @@ export function createWatchdog(deps: WatchdogDeps) {
     row: DelegationRow,
     s: ReconcileSummary,
   ) => {
-    if (now() - row.created_at < DISPATCH_GRACE_MS) return;
+    const { policy: p6 } = await deps.loadPolicy();
+    const dispatchGrace =
+      (p6?.timing?.postDispatchGraceMinutes ??
+        DEFAULT_POST_DISPATCH_GRACE_MINUTES) * 60_000;
+    if (now() - row.created_at < dispatchGrace) return;
     // §7 retry limit: an exhausted reissue stays `dispatching` for the
     // coordinator to resolve by hand — retries stop entirely.
     if (hasSetupError(row, "retry-exhausted")) return;
     if (!row.thread_id) {
-      // «Результат раздачи неизвестен»: find the thread the tasks plugin
-      // attached after the record was created.
+      // «Результат раздачи неизвестен»: r30 е 4 — an own-spawn thread is
+      // found by its `delegationId` label under the coordinator;
+      // `bb tasks threads` is the last resort for every row.
       let threadId: string | null;
       try {
-        threadId = await findTaskThreadId(
-          deps.bbCli,
-          row.task_key,
-          row.created_at,
-        );
+        threadId = await findDelegatedThreadId(row, {
+          bbCli: deps.bbCli,
+          threads: deps.threads,
+        });
       } catch (e) {
         if (row.reissue_of != null) {
-          await trackRetry(row, "доведение перевыпуска", message(e));
+          await trackRetry(row, t("wd.finishReissue"), message(e));
         }
         throw new OrchestratorError("bb-cli-failed", message(e));
       }
@@ -1172,13 +2975,16 @@ export function createWatchdog(deps: WatchdogDeps) {
               );
               await report(
                 row,
-                `перевыпуск потерян: задача ${row.task_key}, маршрут ` +
-                  `${row.route} — раздача отклонена (${message(e)})`,
+                t("wd.reissueDispatchLost", {
+                  task: row.task_key,
+                  route: row.route,
+                  error: message(e),
+                }),
               );
             } else {
               // `dispatch-unknown` leaves the row `dispatching`; the
               // §7 limit bounds how long the next passes may retry.
-              await trackRetry(row, "доведение перевыпуска", message(e));
+              await trackRetry(row, t("wd.finishReissue"), message(e));
             }
           }
           return;
@@ -1187,8 +2993,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         s.removed++;
         await commentOnTask(
           row,
-          `раздача не подтверждена: делегирование #${row.id} удалено ` +
-            `(тред не найден через bb tasks threads)`,
+          t("wd.dispatchNotConfirmed", { id: row.id }),
         );
         return;
       }
@@ -1211,14 +3016,14 @@ export function createWatchdog(deps: WatchdogDeps) {
   const reconcileRunning = async (row: DelegationRow, s: ReconcileSummary) => {
     const thread = await getThread(row.thread_id);
     if (!thread) {
-      await toCancelled(row, "тред не найден");
+      await toCancelled(row, t("wd.threadNotFound"));
       s.cancelled++;
       return;
     }
     if (thread.deletedAt || thread.archivedAt) {
       await toCancelled(
         row,
-        thread.deletedAt ? "тред удалён" : "тред в архиве",
+        thread.deletedAt ? t("wd.threadDeleted") : t("wd.threadArchived"),
       );
       s.cancelled++;
       return;
@@ -1233,14 +3038,17 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (thread.status === "idle") {
         await evaluateIdle(fresh, thread, streamRead);
       } else if (thread.status === "error") {
-        const text = lastErrorText.get(fresh.id) ?? "thread failed";
-        const info = await routeInfo(fresh);
-        if (matchesQuota(text, info.patterns)) {
-          await toQuota(fresh, `thread.error: ${text.slice(0, 200)}`);
-        } else if (isUnavailable(fresh, text, info.unavailablePatterns)) {
-          await toUnavailable(fresh, `thread.error: ${text.slice(0, 200)}`);
-        } else {
-          await toFailed(fresh, text);
+        // §16.1: a queued BB auto-retry is not an outcome — checked first.
+        if (!(await retryBlocksOutcome(fresh))) {
+          const text = lastErrorText.get(fresh.id) ?? "thread failed";
+          const info = await routeInfo(fresh);
+          if (matchesQuota(text, info.patterns)) {
+            await toQuota(fresh, `thread.error: ${text.slice(0, 200)}`);
+          } else if (isUnavailable(fresh, text, info.unavailablePatterns)) {
+            await toUnavailable(fresh, `thread.error: ${text.slice(0, 200)}`);
+          } else {
+            await toFailed(fresh, text);
+          }
         }
       }
       fresh = store.get(row.id);
@@ -1249,6 +3057,395 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §7: repeat unfinished §4.4–4.6 steps (setup_errors + the bypass check).
     const retried = await deps.retrySetup(fresh);
     s.retriedSteps += retried.length;
+    // §16.5/PLUG-184 + §4 r30 п.4: the executor→coordinator binding is
+    // verified by `bb thread show --json` — the SDK thread DTO omits
+    // `parentNotifications`, so reading the DTO never confirms. A
+    // READ ERROR retries next pass with NO update (a blind update on an
+    // already-bound thread sends `ownership-assigned`); a confirmed
+    // drift is re-applied — `auto` is required so BB itself delivers
+    // the executor's outcome notice (§16.5). The marker records the
+    // mode it confirmed: an r24 `confirmed` row re-verifies once,
+    // which also migrates live `stuck` executors to `auto`.
+    const wantNotify = expectedParentNotify(fresh.level);
+    if (
+      fresh.thread_id &&
+      store.findSetupError(fresh, "attach-verified")?.message !== wantNotify
+    ) {
+      let facts:
+        | {
+            parentThreadId?: string | null;
+            parentNotifications?: string | null;
+            visibility?: string | null;
+          }
+        | null = null;
+      let readErr: string | null = null;
+      try {
+        const res = await runJson<{
+          thread?: {
+            parentThreadId?: string | null;
+            parentNotifications?: string | null;
+            visibility?: string | null;
+          };
+        }>(deps.bbCli, ["thread", "show", fresh.thread_id, "--json"]);
+        facts = res.thread ?? null;
+      } catch (e) {
+        readErr = `thread show: ${message(e)}`;
+      }
+      if (
+        facts &&
+        facts.parentThreadId === fresh.coordinator_thread_id &&
+        facts.parentNotifications === wantNotify &&
+        facts.visibility === "hidden"
+      ) {
+        store.addSetupError(fresh.id, "attach-verified", wantNotify);
+        // A confirmed binding retires every earlier verify failure —
+        // different texts must not pile up next to the success marker.
+        store.clearSetupError(fresh.id, "attach-verify");
+      } else if (!facts) {
+        // r30 п.4: a read failure → retry next pass, NO update.
+        const err = readErr ?? "thread show: no thread payload";
+        store.addSetupError(fresh.id, "attach-verify", err);
+        const cur = store.get(fresh.id) ?? fresh;
+        if (!hasSetupError(cur, "attach-verify-reported")) {
+          store.addSetupError(fresh.id, "attach-verify-reported", "1");
+          await notifyCoordinator(
+            fresh,
+            t("wd.attachVerify", {
+              task: fresh.task_key,
+              thread: fresh.thread_id ?? "—",
+              err,
+            }),
+          );
+        }
+      } else {
+        let err: string | null = null;
+        if (
+          facts.parentThreadId !== fresh.coordinator_thread_id ||
+          facts.visibility !== "hidden"
+        ) {
+          try {
+            await deps.threads.update({
+              threadId: fresh.thread_id,
+              parentThreadId: fresh.coordinator_thread_id,
+              visibility: "hidden",
+            });
+          } catch (e) {
+            err = `threads.update: ${message(e)}`;
+          }
+        }
+        if (facts.parentNotifications !== wantNotify) {
+          try {
+            await runChecked(deps.bbCli, [
+              "thread",
+              "update",
+              fresh.thread_id,
+              "--parent-notifications",
+              wantNotify,
+            ]);
+          } catch (e) {
+            err = `${err ? `${err}; ` : ""}parent-notifications: ${message(e)}`;
+          }
+        }
+        const cur = store.get(fresh.id) ?? fresh;
+        if (err) {
+          store.addSetupError(fresh.id, "attach-verify", err);
+          if (!hasSetupError(cur, "attach-verify-reported")) {
+            store.addSetupError(fresh.id, "attach-verify-reported", "1");
+            await notifyCoordinator(
+              fresh,
+              t("wd.attachVerify", {
+                task: fresh.task_key,
+                thread: fresh.thread_id ?? "—",
+                err,
+              }),
+            );
+          }
+        } else {
+          store.clearSetupError(fresh.id, "attach-verify");
+        }
+      }
+    }
+  };
+
+  /**
+   * §16.5: after a compaction the coordinator gets one §3 reminder —
+   * delegation flow and the HANDOFF location. The newest `thread/compacted`
+   * seq per coordinator is the durable cursor (`plugin_meta`), so a plugin
+   * restart neither repeats nor loses the reminder.
+   */
+  const compactionReminders = async (s: ReconcileSummary) => {
+    const isCompaction = (e: WatchdogThreadEvent) =>
+      e.type === COMPACTION_EVENT_TYPE ||
+      // §17.2 (e2e 7): Codex never emits `thread/compacted` — its
+      // compaction is an `item/completed` with
+      // `item.type = "contextCompaction"`.
+      (e.type === "item/completed" &&
+        ((e.data as { item?: { type?: unknown } } | null | undefined)
+          ?.item?.type === "contextCompaction"));
+    // §17.2 (мелко 6): only coordinators with ACTIVE delegations are
+    // polled — a dormant coordinator needs no §3 reminder, and scanning
+    // the whole history of coordinators every minute was pure waste.
+    for (const coordId of store.activeCoordinatorThreadIds()) {
+      const key = `compact-seq:${coordId}`;
+      const stored = store.metaGet(key);
+      if (stored === undefined) {
+        // PLUG-184/B1: first sight of this coordinator (e.g. a fresh r25
+        // plugin on an old base) — seed the cursor at the journal tip;
+        // old compactions owe nobody a reminder.
+        try {
+          const tip = await deps.threads.events.list({
+            threadId: coordId,
+            order: "desc",
+            limit: "1",
+          });
+          store.metaSet(key, String(tip[0]?.seq ?? 0));
+        } catch (e) {
+          s.errors.push(`compact scan ${coordId}: ${message(e)}`);
+        }
+        continue;
+      }
+      // §17.2 r26 (PLUG-211 С1): scan BY TYPE from the cursor — a busy
+      // coordinator emits >50 `item/completed` between passes, and the
+      // old fixed `desc limit 50` window lost the compaction event.
+      const events: WatchdogThreadEvent[] = [];
+      let after = Number(stored);
+      let tail = false;
+      try {
+        for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+          const chunk = await deps.threads.events.list({
+            threadId: coordId,
+            afterSeq: String(after),
+            order: "asc",
+            limit: "50",
+            types: [COMPACTION_EVENT_TYPE, "item/completed"],
+          });
+          events.push(...chunk);
+          if (chunk.length < 50) {
+            tail = true;
+            break;
+          }
+          after = Math.max(...chunk.map((e) => e.seq));
+        }
+      } catch (e) {
+        s.errors.push(`compact scan ${coordId}: ${message(e)}`);
+        continue;
+      }
+      const scannedTip = events.length
+        ? events[events.length - 1].seq
+        : Number(stored);
+      const latest = [...events].reverse().find(isCompaction);
+      if (!latest) {
+        // The tail was read — nothing pending, skip rescanning it; an
+        // unscanned tail keeps the cursor so the next pass continues.
+        if (tail) store.metaSet(key, String(scannedTip));
+        continue;
+      }
+      // §17.2 r26 (PLUG-215 мелко 1): the reminder fires once per
+      // COMPACTION, not per event — a pass landing between the pair's
+      // halves (contextCompaction then thread/compacted, or back) must
+      // not send a second reminder. The durable `compact-reminded` mark
+      // records seq + kind of the last reminded event; a different-kind
+      // event within COMPACTION_PAIR_SEQ of it is the same compaction.
+      const remindedKey = `compact-reminded:${coordId}`;
+      const [remindedSeqRaw, remindedKind] = (
+        store.metaGet(remindedKey) ?? ""
+      ).split(":");
+      const latestKind =
+        latest.type === COMPACTION_EVENT_TYPE ? "compacted" : "item";
+      if (
+        remindedKind !== undefined &&
+        remindedKind !== latestKind &&
+        latest.seq - Number(remindedSeqRaw) <= COMPACTION_PAIR_SEQ
+      ) {
+        store.metaSet(key, String(tail ? scannedTip : latest.seq));
+        continue;
+      }
+      let coord: WatchdogThreadDto | null;
+      try {
+        coord = await getThread(coordId);
+      } catch (e) {
+        s.errors.push(`compact scan ${coordId}: ${message(e)}`);
+        continue;
+      }
+      if (!coord || coord.deletedAt || coord.archivedAt) {
+        // nobody to remind — still mark progress
+        store.metaSet(key, String(tail ? scannedTip : latest.seq));
+        continue;
+      }
+      // §17.2 (мелко 6): the reminder counts only THIS coordinator's
+      // delegations — global totals belong to nobody's memory.
+      const counts = store.countsByStatusForCoordinator(coordId);
+      const parts = Object.entries(counts)
+        .map(([st, n]) => `${st}: ${n}`)
+        .join(", ");
+      try {
+        await deps.threads.send({
+          threadId: coordId,
+          mode: "queue-if-active",
+          input: [
+            {
+              type: "text",
+              text:
+                t("wd.compactReminder", {
+                  parts: parts || t("wd.none"),
+                  handoff: deps.handoffPath?.() ?? DEFAULT_HANDOFF_PATH,
+                }),
+              mentions: [],
+            },
+          ],
+        });
+        store.metaSet(remindedKey, `${latest.seq}:${latestKind}`);
+        store.metaSet(key, String(tail ? scannedTip : latest.seq));
+      } catch (e) {
+        s.errors.push(`compact remind ${coordId}: ${message(e)}`);
+      }
+    }
+  };
+
+  /**
+   * §17.2 r26 (PLUG-211 Б4): a `notify-muted` mark means a quiet stop
+   * muted BB notices and the `auto` restore never landed (crash between
+   * steps, failed `bb thread update`, an unconfirmed stop). The mark is
+   * written BEFORE `off`, so a thread can never stay muted without this
+   * pass noticing — restore `auto` while the mark stands, clear it only
+   * on success (a gone thread's mark just goes away).
+   */
+  const restoreMutedNotify = async (s: ReconcileSummary) => {
+    for (const row of store.listBySetupError(NOTIFY_MUTED_STEP)) {
+      try {
+        if (!row.thread_id) {
+          store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
+          continue;
+        }
+        const t = await getThread(row.thread_id);
+        if (!t || t.deletedAt || t.archivedAt) {
+          store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
+          continue;
+        }
+        if (
+          await setParentNotify(
+            row.thread_id,
+            expectedParentNotify(row.level),
+          )
+        ) {
+          store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
+        }
+      } catch (e) {
+        s.errors.push(
+          `delegation #${row.id} notify-muted restore: ${message(e)}`,
+        );
+      }
+    }
+  };
+
+  /** §16.5 rollout (PLUG-193 #4): give up the last_seq sync after this
+   * many incomplete passes (a permanently unreadable journal). */
+  const LASTSEQ_SYNC_PASSES = 10;
+
+  /**
+   * §16.5 rollout (PLUG-190): delegations closed BEFORE the delivery
+   * columns existed carry a stale `last_seq` — on the live base ten
+   * terminal rows had turn/started events above their cursor, so the
+   * first post-upgrade event would revive them on a HISTORICAL turn or
+   * suppress a thread's CURRENT work. One pass lifts every such row's
+   * cursor to its thread's journal tip; `plugin_meta` makes it
+   * once-per-install, and a journal that cannot be read retries the
+   * pass on the next reconcile (a gone thread cannot revive — it counts
+   * as synced). PLUG-193 #4: the scope is rows terminal AT THE
+   * MIGRATION (`result_notice='legacy'`, `listLegacyTerminal`) — a row
+   * closed after the rollout keeps its live cursor so a genuine
+   * post-cursor turn still reaches the §16.2 wake rule.
+   */
+  const syncTerminalLastSeq = async (s: ReconcileSummary) => {
+    if (store.metaGet("legacy-lastseq") === "1") return;
+    let complete = true;
+    for (const row of store.listLegacyTerminal()) {
+      let tip: WatchdogThreadEvent[] | undefined;
+      try {
+        tip = await deps.threads.events.list({
+          threadId: row.thread_id!,
+          order: "desc",
+          limit: "1",
+        });
+      } catch {
+        tip = undefined;
+      }
+      if (tip === undefined) {
+        // An unreadable journal retries next pass unless the thread
+        // itself is gone (a gone thread cannot produce a reviving turn).
+        let gone = false;
+        try {
+          const t = await getThread(row.thread_id);
+          gone = !t || !!t.deletedAt || !!t.archivedAt;
+        } catch (e) {
+          s.errors.push(`lastseq sync ${row.thread_id}: ${message(e)}`);
+        }
+        if (!gone) complete = false;
+        continue;
+      }
+      if (tip[0]) store.advanceLastSeq(row.id, tip[0]!.seq);
+    }
+    if (complete) {
+      store.metaSet("legacy-lastseq", "1");
+      return;
+    }
+    // PLUG-193 #4: an unrecoverable read must not rescan the whole
+    // terminal list forever — bound the retries, then record the flag
+    // with a journal error (the unscanned rows keep a stale cursor and
+    // are still covered by the §16.2 wake scan below).
+    const attempts =
+      Number(store.metaGet("legacy-lastseq-attempts") ?? "0") + 1;
+    store.metaSet("legacy-lastseq-attempts", String(attempts));
+    if (attempts >= LASTSEQ_SYNC_PASSES) {
+      store.metaSet("legacy-lastseq", "1");
+      log.error?.(
+        `orchestrator: lastseq sync incomplete after ${attempts} ` +
+          `passes — giving up`,
+      );
+    }
+  };
+
+  /**
+   * §16.2 r25 (PLUG-193 #3): a plugin restart mid-turn loses the
+   * `experimental_thread.events` kick — the reconcile pass applies the
+   * revive rule to every terminal row whose journal still holds
+   * post-cursor turns. Bounded: each terminal row is scanned ONCE per
+   * process start — an unreadable journal keeps the row pending for
+   * the next pass, a gone thread counts as scanned (it cannot produce
+   * a reviving turn). Wakes while the plugin runs arrive through
+   * onThreadEvents.
+   */
+  let terminalWakesPrimed = false;
+  const terminalWakesPending = new Set<number>();
+  const scanTerminalWakes = async (s: ReconcileSummary) => {
+    if (!terminalWakesPrimed) {
+      terminalWakesPrimed = true;
+      for (const row of store.listTerminalWithThread()) {
+        terminalWakesPending.add(row.id);
+      }
+    }
+    for (const id of [...terminalWakesPending]) {
+      const row = store.get(id);
+      if (!row || isActive(row.status) || !row.thread_id) {
+        terminalWakesPending.delete(id);
+        continue;
+      }
+      s.scanned++;
+      const verdict = await scanTerminalWake(row);
+      if (verdict !== "unreadable") {
+        terminalWakesPending.delete(id);
+        continue;
+      }
+      // Unreadable journal — retry next pass unless the thread is gone.
+      let gone = false;
+      try {
+        const t = await getThread(row.thread_id);
+        gone = !t || !!t.deletedAt || !!t.archivedAt;
+      } catch (e) {
+        s.errors.push(`wake scan ${row.thread_id}: ${message(e)}`);
+      }
+      if (gone) terminalWakesPending.delete(id);
+    }
   };
 
   const reconcile = async (): Promise<ReconcileSummary> => {
@@ -1273,10 +3470,10 @@ export function createWatchdog(deps: WatchdogDeps) {
         summary.errors.push(`delegation #${row.id}: ${message(e)}`);
       }
     }
-    // §5.4 rev 13: stalled/quota rows whose stop never confirmed get the
-    // stop retried; once confirmed, the reissue decision runs as usual.
-    // §7: bounded by retry_count — exhausted rows stop retrying.
-    for (const row of store.listByStatuses(["stalled", "quota"])) {
+    // §5.4 rev 13/23: stalled/quota/failed rows whose stop never confirmed
+    // get the stop retried; once confirmed, the reissue decision runs as
+    // usual. §7: bounded by retry_count — exhausted rows stop retrying.
+    for (const row of store.listByStatuses(["stalled", "quota", "failed"])) {
       if (!hasSetupError(row, "watchdog-stop")) continue;
       if (hasSetupError(row, "retry-exhausted")) continue;
       summary.scanned++;
@@ -1288,16 +3485,23 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.clearSetupError(row.id, "watchdog-stop-reported");
           store.resetRetry(row.id);
           const cur = store.get(row.id) ?? row;
+          // PLUG-190: `failed` on a level without autoFallback was already
+          // reported by toFailed — the retry only owed the auto-retry
+          // cancel, not a second «завершился с ошибкой» message.
+          if (cur.status === "failed") {
+            const info = await routeInfo(cur);
+            if (!info.level?.autoFallback) continue;
+          }
           await outcomeAndMaybeReissue(
             cur,
-            cur.status as "stalled" | "quota",
+            cur.status as "stalled" | "quota" | "failed",
             detail,
           );
         } else {
           const fresh = store.get(row.id) ?? row;
           await trackRetry(
             fresh,
-            "остановка исполнителя",
+            t("wd.executorStop"),
             store.findSetupError(fresh, "watchdog-stop")?.message ??
               "stop not confirmed",
           );
@@ -1306,10 +3510,66 @@ export function createWatchdog(deps: WatchdogDeps) {
         summary.errors.push(`delegation #${row.id}: ${message(e)}`);
       }
     }
+    // §16.5 rollout: stale cursors on pre-upgrade terminal rows first —
+    // a historical turn must not decide revive/suppress below.
+    try {
+      await syncTerminalLastSeq(summary);
+    } catch (e) {
+      summary.errors.push(`lastseq sync: ${message(e)}`);
+    }
+    // §16.2 r25: terminal rows with post-cursor turns (a wake missed at
+    // a plugin restart) get the revive rule once per process start.
+    try {
+      await scanTerminalWakes(summary);
+    } catch (e) {
+      summary.errors.push(`terminal wakes: ${message(e)}`);
+    }
+    // §16.5: every done/cancelled row delivers its result exactly once —
+    // the pass resends until `result_notified_at` records the delivery.
+    for (const row of store.listPendingResult()) {
+      summary.scanned++;
+      try {
+        await deliverResult(row);
+      } catch (e) {
+        summary.errors.push(`delegation #${row.id}: ${message(e)}`);
+      }
+    }
+    // §16.5: the post-compaction §3 reminder — one per compaction event.
+    try {
+      await compactionReminders(summary);
+    } catch (e) {
+      summary.errors.push(`compact reminders: ${message(e)}`);
+    }
+    // §17.2 r26 (PLUG-215 мелко 3): the `auto` restore gets its own
+    // try — a reminder exception must not skip it for the whole pass.
+    try {
+      await restoreMutedNotify(summary);
+    } catch (e) {
+      summary.errors.push(`notify-muted restore: ${message(e)}`);
+    }
     return summary;
   };
 
+  /**
+   * §17.2 (e2e 1): `merge` called on BB's outcome notice can land before
+   * the watchdog wrote `done` — run this row's stream read and idle
+   * evaluation now so the caller re-checks a fresh row, not a stale one.
+   */
+  const syncDelegationRow = async (row: DelegationRow) => {
+    const fresh = store.get(row.id) ?? row;
+    if (fresh.status !== "running" || !fresh.thread_id) return;
+    const thread = await getThread(fresh.thread_id);
+    if (!thread) return;
+    const streamRead = await processStream(fresh);
+    const cur = store.get(fresh.id);
+    if (!cur || cur.status !== "running") return;
+    await evaluateIdle(cur, thread, streamRead);
+  };
+
   return {
+    /** §17.2 (e2e 1): force the row's bookkeeping up to date (merge). */
+    syncDelegation: (row: DelegationRow) =>
+      deps.enqueue(() => syncDelegationRow(row)),
     onThreadEvents: (payload: { thread: WatchdogThreadDto; sequence?: number }) =>
       deps.enqueue(() => onThreadEvents(payload)),
     onThreadActive: (thread: WatchdogThreadDto) =>

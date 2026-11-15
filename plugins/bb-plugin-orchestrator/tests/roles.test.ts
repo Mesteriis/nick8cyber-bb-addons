@@ -9,12 +9,25 @@ import {
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
   decideRole,
+  DEFAULT_HANDOFF_PATH,
+  DEFAULT_USER_THREAD_PLUGINS,
+  HANDOFF_PATH_MAX,
   handleMessageDispatch,
+  handoffPathError,
+  parseRoleTexts,
+  reviewLevelName,
+  roleForLevel,
+  roleInstructions,
   ROLE_INSTRUCTIONS_MAX,
+  roleTextsError,
   ROLES,
   type RoleDecisionProbes,
 } from "../src/roles.js";
-import { buildAgentConfiguration } from "../src/agent-config.js";
+import { parsePolicy } from "../src/policy.js";
+import {
+  buildAgentConfiguration,
+  migratePluginThreadRoles,
+} from "../src/agent-config.js";
 import { pendingRoleRpc } from "../server.js";
 
 function makeStore() {
@@ -201,14 +214,34 @@ test("decideRole: parent → executor; app → pending pick; else orchestrator",
     }),
     "orchestrator",
   );
-  // cli / plugin / sdk / internal → orchestrator
-  for (const origin of ["cli", "plugin", "sdk", null]) {
+  // §17.1 (аудит Б3): cli → orchestrator; plugin/sdk/automation-born →
+  // no role at all (the `none` row blocks the configure-time fallback).
+  assert.equal(decideRole(facts({ origin: "cli" }), noProbes), "orchestrator");
+  for (const origin of ["plugin", "sdk", null]) {
     assert.equal(
       decideRole(facts({ origin }), noProbes),
-      "orchestrator",
+      "none",
       `origin ${origin}`,
     );
   }
+});
+
+test("§17.1: a plugin-origin dispatch records the none row, no coordinator", () => {
+  const { store, hook } = makeStore();
+  const decision = hook(
+    dispatch({
+      thread: {
+        id: "thr_plugin",
+        status: "pending",
+        originPluginId: "advisor",
+      },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.deepEqual(decision, { action: "proceed" });
+  assert.equal(store.threadRole("thr_plugin")!.role, "none");
 });
 
 test("hook: first app message records the project's pick", () => {
@@ -414,6 +447,13 @@ test("§3 budget: longest role + a 1500-char rule stays under 4096", () => {
   );
 });
 
+test("§17.1: orchestrator and executor instructions forbid host changes", () => {
+  for (const id of ["orchestrator", "executor"] as const) {
+    const text = ROLES[id].instructions;
+    assert.match(text, /ни sudo, ни установки пакетов/, `${id} bans sudo/pkg`);
+  }
+});
+
 test("injectInstructions=false: no texts for any role, tools stay", () => {
   const ctxFor = (id: string) =>
     makePluginAgentConfigurationContext({ thread: { id } });
@@ -428,7 +468,7 @@ test("injectInstructions=false: no texts for any role, tools stay", () => {
     probes: probes("orchestrator"),
   });
   assert.equal(orch.instructions, undefined);
-  assert.equal(orch.tools.length, 3);
+  assert.equal(orch.tools.length, 4);
   assert.deepEqual(orch.skills, ["orchestrator-setup"]);
   const exec = buildAgentConfiguration(ctxFor("thr_e"), {
     ...deps,
@@ -468,7 +508,7 @@ test("a role row beats the fallback markers in both directions", () => {
       probes: { ...base, roleByThreadId: () => "orchestrator" },
     },
   );
-  assert.equal(orch.tools.length, 3);
+  assert.equal(orch.tools.length, 4);
   assert.ok(orch.instructions!.includes("RULE"));
 });
 
@@ -481,4 +521,614 @@ test("role instructions carry no site process rules (PLUG-148)", () => {
   // the executor text points at the task's own contract instead
   assert.match(ROLES.executor.instructions, /Работа с git/);
   assert.match(ROLES.executor.instructions, /контракту из описания задачи/);
+});
+
+
+// ── §2.3 r24 / §16.7 r25: policy-aware roles, verdict + handoff text ──
+
+test("§2.3 roleForLevel: policy-aware — auditor levels map to auditor", () => {
+  const policy = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: {
+        "review-mid": { role: "auditor", chain: ["r"] },
+        exec: { chain: ["r"] },
+      },
+      routes: { r: { preset: "p", provider: "x" } },
+    }),
+  ).policy;
+  assert.equal(roleForLevel("review-mid", policy), "auditor");
+  assert.equal(roleForLevel("exec", policy), "executor");
+  assert.equal(roleForLevel("release-audit", policy), "release-auditor");
+  // Without the policy the historical name rule applies.
+  assert.equal(roleForLevel("review"), "auditor");
+  assert.equal(roleForLevel("review-mid"), "executor");
+});
+
+test("§16.7: invalid policy → root chat default is no role; pick still applies", () => {
+  const badPolicy: RoleDecisionProbes = { ...noProbes, policy: () => null };
+  assert.equal(decideRole(facts({ origin: "app" }), badPolicy), null);
+  assert.equal(decideRole(facts({ origin: "cli" }), badPolicy), null);
+  // An explicit non-orchestrator pending pick still wins.
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...badPolicy,
+      pendingRole: (p) => (p === "proj_a" ? "executor" : undefined),
+    }),
+    "executor",
+  );
+  // PLUG-182: the new-chat window writes `orchestrator` itself on open —
+  // under an invalid policy that pick is the default, not a choice.
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...badPolicy,
+      pendingRole: (p) => (p === "proj_a" ? "orchestrator" : undefined),
+    }),
+    null,
+  );
+  // Valid policy → defaults back to orchestrator.
+  const good = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: { simple: { chain: ["s"] } },
+      routes: { s: { preset: "p", provider: "x" } },
+    }),
+  ).policy;
+  assert.equal(
+    decideRole(facts({ origin: "app" }), { ...noProbes, policy: () => good }),
+    "orchestrator",
+  );
+  // Valid policy → the window's orchestrator pick applies as before.
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...noProbes,
+      policy: () => good,
+      pendingRole: (p) => (p === "proj_a" ? "orchestrator" : undefined),
+    }),
+    "orchestrator",
+  );
+  // tasks origin keeps its mapping under an invalid policy.
+  assert.equal(
+    decideRole(
+      facts({ originPluginId: "tasks", title: "PLUG-9 · do x" }),
+      badPolicy,
+    ),
+    "executor",
+  );
+});
+
+test("§16.7 auditor instructions demand the JSON verdict; §13.1 handoff on doers", () => {
+  const auditor = ROLES.auditor.instructions;
+  assert.match(auditor, /\{"verdict":"OK"\|"CHANGES","blockers"/);
+  assert.ok(!auditor.includes("HANDOFF"), "auditor keeps no handoff file");
+  assert.ok(
+    !ROLES["release-auditor"].instructions.includes("HANDOFF"),
+    "release-auditor keeps no handoff file",
+  );
+  for (const id of ["orchestrator", "executor"] as const) {
+    const text = ROLES[id].instructions;
+    assert.match(text, /HANDOFF\.md/, `${id} handoff rule`);
+    assert.match(text, /\$BB_THREAD_STORAGE/, `${id} storage path`);
+    assert.match(
+      text,
+      /~\/\.cache\/bb-handoff/,
+      `${id} fallback path when no storage`,
+    );
+  }
+});
+
+// ── §17.1 r26 (PLUG-211 Б1/Б2): userThreadPlugins + the r26 role fix ──
+
+test("§17.1 r26 (Б2): a userThreadPlugins thread inherits the source role", () => {
+  // a listed plugin's thread with a decidable source inherits it —
+  // like any side chat (the list itself is not needed on this branch).
+  assert.equal(
+    decideRole(
+      facts({
+        origin: "plugin",
+        originPluginId: "handoff",
+        sourceThreadId: "thr_src",
+      }),
+      {
+        ...noProbes,
+        threadRole: (id) =>
+          id === "thr_src" ? { role: "executor" } : undefined,
+      },
+    ),
+    "executor",
+  );
+});
+
+test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestrator", () => {
+  // §18.6: the DEFAULT list is empty — a listed plugin is configured
+  // explicitly, like the author's install does.
+  const userPlugins = () => ["handoff", "external-compact"];
+  // no source thread — the continued human chat gets the default role
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
+      ...noProbes,
+      userThreadPlugins: userPlugins,
+    }),
+    "orchestrator",
+  );
+  // §17.1 (PLUG-215 С2): a source without a recorded role falls through
+  // to the PARENT branch — the parent rule beats userThreadPlugins: a
+  // handed-off worker is an executor, not a human chat.
+  assert.equal(
+    decideRole(
+      facts({
+        origin: "plugin",
+        originPluginId: "handoff",
+        sourceThreadId: "thr_src",
+        parentThreadId: "thr_p",
+      }),
+      { ...noProbes, userThreadPlugins: userPlugins },
+    ),
+    "executor",
+  );
+  // a plugin NOT in the configured list keeps `none` — the list decides
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
+      ...noProbes,
+      userThreadPlugins: () => [],
+    }),
+    "none",
+  );
+  // other plugin ids still get none
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "advisor" }), noProbes),
+    "none",
+  );
+  assert.equal(
+    decideRole(
+      facts({ origin: "plugin", originPluginId: "live-call" }),
+      noProbes,
+    ),
+    "none",
+  );
+  // §16.7: an invalid policy leaves even a human-chat plugin role-less
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
+      ...noProbes,
+      userThreadPlugins: userPlugins,
+      policy: () => null,
+    }),
+    null,
+  );
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a configured external-compact continues the human chat", () => {
+  const userPlugins = () => ["handoff", "external-compact"];
+  // `bb external-compact` continues the human chat in a new thread —
+  // without a decidable source it gets the orchestrator default.
+  assert.equal(
+    decideRole(
+      facts({ origin: "plugin", originPluginId: "external-compact" }),
+      { ...noProbes, userThreadPlugins: userPlugins },
+    ),
+    "orchestrator",
+  );
+  // …and inherits the source role when decidable.
+  assert.equal(
+    decideRole(
+      facts({
+        origin: "plugin",
+        originPluginId: "external-compact",
+        sourceThreadId: "thr_src",
+      }),
+      {
+        ...noProbes,
+        userThreadPlugins: userPlugins,
+        threadRole: (id) =>
+          id === "thr_src" ? { role: "auditor" } : undefined,
+      },
+    ),
+    "auditor",
+  );
+});
+
+test("§18.6: an EMPTY userThreadPlugins default denies handoff threads", () => {
+  // A new installation's default list is empty — a handoff-born thread
+  // is plugin-born like any other and records `none`.
+  assert.equal(
+    decideRole(
+      facts({ origin: "plugin", originPluginId: "handoff" }),
+      noProbes,
+    ),
+    "none",
+  );
+});
+
+test("§17.1 r26 (PLUG-215 С2): the parent rule beats userThreadPlugins", () => {
+  // a handed-off WORKER (the plugin's thread kept its parent) is an
+  // executor — the human-chat default is for parentless threads only.
+  const userPlugins = () => ["handoff", "external-compact"];
+  for (const pluginId of ["handoff", "external-compact"]) {
+    assert.equal(
+      decideRole(
+        facts({
+          origin: "plugin",
+          originPluginId: pluginId,
+          parentThreadId: "thr_p",
+        }),
+        { ...noProbes, userThreadPlugins: userPlugins },
+      ),
+      "executor",
+      pluginId,
+    );
+  }
+});
+
+test("§17.1 r26 (Б2): the hook records orchestrator for a handoff thread", () => {
+  const { store, probes } = makeStore();
+  const hook = (ctx: MessageDispatchHookContext) =>
+    handleMessageDispatch(
+      ctx,
+      {
+        ...probes,
+        userThreadPlugins: () => ["handoff", "external-compact"],
+      },
+      (threadId, role) => store.setThreadRole(threadId, role, "hook"),
+    );
+  const decision = hook(
+    dispatch({
+      thread: { id: "thr_ho", status: "pending", originPluginId: "handoff" },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.deepEqual(decision, { action: "proceed" });
+  assert.equal(store.threadRole("thr_ho")!.role, "orchestrator");
+});
+
+test("§17.1 r26 (Б1): the one-time migration rewrites plugin orchestrator rows", async () => {
+  const { store } = makeStore();
+  // live pre-r26 rows: plugin-created threads wrongly recorded
+  // `orchestrator` before the §17.1 plugin rule existed.
+  for (const id of ["thr_adv", "thr_call", "thr_persp", "thr_ext"]) {
+    store.setThreadRole(id, "orchestrator", "hook");
+  }
+  store.setThreadRole("thr_app", "orchestrator", "hook"); // human chat
+  store.setThreadRole("thr_cli", "orchestrator", "hook"); // bb thread spawn
+  store.setThreadRole("thr_ho", "orchestrator", "hook"); // handoff — user chat
+  store.setThreadRole("thr_del", "orchestrator", "delegate"); // not hook-written
+  const origins = new Map<string, string | null>([
+    ["thr_adv", "advisor"],
+    ["thr_call", "live-call"],
+    ["thr_persp", "perspectives"],
+    ["thr_ext", "external-compact"],
+    ["thr_app", null],
+    ["thr_cli", null],
+    ["thr_ho", "handoff"],
+    ["thr_del", "advisor"],
+  ]);
+  const moved = await migratePluginThreadRoles(store, {
+    threadOriginPluginId: async (id) => origins.get(id),
+    userThreadPlugins: ["handoff", "external-compact"],
+  });
+  assert.equal(moved, 3);
+  for (const id of ["thr_adv", "thr_call", "thr_persp"]) {
+    assert.equal(store.threadRole(id)!.role, "none", id);
+  }
+  // PLUG-215 Б1: external-compact is in the configured userThreadPlugins —
+  // its orchestrator row is not stale and survives the migration.
+  for (const id of ["thr_app", "thr_cli", "thr_ho", "thr_ext"]) {
+    assert.equal(store.threadRole(id)!.role, "orchestrator", id);
+  }
+  // a `delegate`-sourced row is the delegate path's own correction —
+  // the migration only owns hook-written rows
+  assert.equal(store.threadRole("thr_del")!.role, "orchestrator");
+  // a thread whose origin read fails is skipped, not rewritten
+  store.setThreadRole("thr_gone", "orchestrator", "hook");
+  const warns: string[] = [];
+  const moved2 = await migratePluginThreadRoles(store, {
+    threadOriginPluginId: async (id) => {
+      if (id === "thr_gone") throw new Error("thread not found");
+      return origins.get(id);
+    },
+    userThreadPlugins: ["handoff", "external-compact"],
+    log: { warn: (m) => warns.push(m) },
+  });
+  // the first pass already rewrote the live rows — only the skipped
+  // thread is left in scope
+  assert.equal(moved2, 0);
+  assert.equal(store.threadRole("thr_gone")!.role, "orchestrator");
+  assert.equal(warns.length, 1);
+});
+
+test("decideRole: an orchestrator-origin (own-spawn) thread is an executor too (r30 д)", () => {
+  // §4 r30 д: own-spawn executors carry originPluginId "orchestrator"
+  assert.equal(
+    decideRole(
+      facts({ originPluginId: "orchestrator", title: "PLUG-7 · do it" }),
+      {
+        ...noProbes,
+        activeDelegationByTaskKey: (k) =>
+          k === "PLUG-7" ? { level: "simple" } : undefined,
+      },
+    ),
+    "executor",
+  );
+  // the level still decides auditor vs executor
+  assert.equal(
+    decideRole(
+      facts({
+        originPluginId: "orchestrator",
+        title: "PLUG-7 · review it",
+        parentThreadId: "thr_parent", // the origin rule beats the parent one
+      }),
+      {
+        ...noProbes,
+        activeDelegationByTaskKey: (k) =>
+          k === "PLUG-7" ? { level: "review" } : undefined,
+      },
+    ),
+    "auditor",
+  );
+  // no delegation row → executor, like a tasks thread
+  assert.equal(
+    decideRole(
+      facts({ originPluginId: "orchestrator", title: null }),
+      noProbes,
+    ),
+    "executor",
+  );
+});
+
+test("hook: an own-spawn (orchestrator-origin) executor gets the delegation's role", () => {
+  const { store, hook } = makeStore();
+  store.insert({
+    taskKey: "PLUG-9",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_a",
+    level: "review",
+    route: "review",
+    preset: "review",
+    provider: "claude-code",
+  });
+  hook(
+    dispatch({
+      thread: {
+        id: "thr_rev",
+        status: "pending",
+        originPluginId: "orchestrator",
+        title: "PLUG-9 · review specs",
+      },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.equal(store.threadRole("thr_rev")!.role, "auditor");
+});
+
+// ── §18.6 (PLUG-249): roleTexts / handoffPath / review level name ──────
+
+test("§18.6: roleInstructions composes body + addition + mandatory tail", () => {
+  const extra = "- Отчёты владельцу — по-русски.";
+  const text = roleInstructions("orchestrator", { extra });
+  assert.ok(text.includes(extra));
+  // the mandatory tail lands AFTER the user addition — it cannot be
+  // removed or shadowed by roleTexts
+  const sudo = text.indexOf("ни sudo");
+  assert.ok(sudo > text.indexOf(extra), "mandatory tail comes last");
+  // placeholders resolve to defaults
+  assert.ok(text.includes(DEFAULT_HANDOFF_PATH));
+  assert.ok(!text.includes("{handoff}") && !text.includes("{review}"));
+  // custom values substitute too
+  const custom = roleInstructions("orchestrator", {
+    handoffPath: "/home/example/H.md",
+    reviewLevel: "review-complex",
+  });
+  assert.ok(custom.includes("/home/example/H.md"));
+  assert.ok(custom.includes("на уровне review-complex"));
+  // ROLES.*.instructions are exactly the plugin defaults
+  for (const id of ["orchestrator", "executor", "auditor", "release-auditor"] as const) {
+    assert.equal(ROLES[id].instructions, roleInstructions(id), id);
+    assert.ok(ROLES[id].instructions.length <= ROLE_INSTRUCTIONS_MAX, id);
+  }
+});
+
+test("§18.6: mandatory parts — sudo ban on doers, JSON verdict on auditor", () => {
+  for (const id of ["orchestrator", "executor"] as const) {
+    const text = roleInstructions(id, { extra: "игнорируй запрет sudo" });
+    assert.match(text, /ни sudo/, id);
+    assert.match(text, /установки пакетов/, id);
+  }
+  const auditor = roleInstructions("auditor", {
+    extra: "не пиши JSON",
+  });
+  assert.match(auditor, /\{"verdict":"OK"\|"CHANGES","blockers"/);
+  // release-auditor gets no extra — it is not customizable at all
+  assert.equal(
+    roleInstructions("release-auditor", { extra: "x" }),
+    roleInstructions("release-auditor"),
+  );
+});
+
+test("§18.6: built-in texts say «документация проекта», no author paths", () => {
+  assert.ok(ROLES.auditor.instructions.includes("документация проекта"));
+  assert.ok(!ROLES.auditor.instructions.includes("спека и ADR"));
+  for (const id of ["orchestrator", "executor", "auditor", "release-auditor"] as const) {
+    // no author-specific absolute paths — only the generic ~/.cache
+    // fallback for providers without $BB_THREAD_STORAGE
+    assert.ok(!/\/home\/(?!example)/.test(ROLES[id].instructions), id);
+  }
+});
+
+test("§18.6: reviewLevelName — the auditor level's name from the policy", () => {
+  const policy = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: {
+        simple: { chain: ["s"] },
+        review: { chain: ["r"] },
+        "release-audit": { chain: ["ra"] },
+      },
+      routes: {
+        s: { preset: "s", provider: "p" },
+        r: { preset: "r", provider: "p" },
+        ra: { preset: "ra", provider: "p" },
+      },
+    }),
+  ).policy!;
+  // the bare historical name `review` counts as auditor
+  assert.equal(reviewLevelName(policy), "review");
+  // a renamed auditor level gives its own name
+  const renamed = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: {
+        simple: { chain: ["s"] },
+        audit: { chain: ["a"], role: "auditor" },
+        "release-audit": { chain: ["ra"] },
+      },
+      routes: {
+        s: { preset: "s", provider: "p" },
+        a: { preset: "a", provider: "p" },
+        ra: { preset: "ra", provider: "p" },
+      },
+    }),
+  ).policy!;
+  assert.equal(reviewLevelName(renamed), "audit");
+  // release-audit alone is never picked; no auditor level → the default
+  const execOnly = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: {
+        simple: { chain: ["s"] },
+        "release-audit": { chain: ["ra"] },
+      },
+      routes: {
+        s: { preset: "s", provider: "p" },
+        ra: { preset: "ra", provider: "p" },
+      },
+    }),
+  ).policy!;
+  assert.equal(reviewLevelName(execOnly), "review");
+  assert.equal(reviewLevelName(null), "review");
+});
+
+test("§18.6: parseRoleTexts — keys, types, the 2500 limit, whole-doc errors", () => {
+  // a valid document yields the trimmed additions
+  const ok = parseRoleTexts(
+    JSON.stringify({
+      orchestrator: "  - custom  ",
+      executor: "- do x",
+      auditor: "- check y",
+    }),
+  );
+  assert.equal(ok.errors.length, 0);
+  assert.equal(ok.texts.orchestrator, "- custom");
+  // unknown keys — release-auditor included — are errors, and a broken
+  // document applies NOTHING (ignored whole)
+  for (const bad of [
+    '{"release-auditor": "x"}',
+    '{"janitor": "x"}',
+    '{"executor": 42}',
+    '["executor"]',
+    "{bad",
+  ]) {
+    const l = parseRoleTexts(bad);
+    assert.ok(l.errors.length > 0, bad);
+    assert.deepEqual(l.texts, {}, bad);
+  }
+  // an addition pushing the composed text over the BB budget errors
+  const l = parseRoleTexts(
+    JSON.stringify({ executor: "x".repeat(ROLE_INSTRUCTIONS_MAX) }),
+  );
+  assert.ok(
+    l.errors.some((e) => e.path === "roleTexts.executor"),
+    "over-limit executor",
+  );
+  // a mixed document — one bad key poisons the whole thing
+  const mixed = parseRoleTexts(
+    JSON.stringify({ orchestrator: "- ok", auditor: 1 }),
+  );
+  assert.deepEqual(mixed.texts, {});
+  // empty / whitespace means "no additions", no error
+  assert.equal(parseRoleTexts("").errors.length, 0);
+  assert.equal(parseRoleTexts("  ").errors.length, 0);
+  // the needs-configuration line names the first issue
+  assert.match(roleTextsError(mixed) ?? "", /roleTexts\.auditor/);
+  assert.equal(roleTextsError(ok), null);
+});
+
+test("§18.6: userThreadPlugins defaults to an EMPTY list", () => {
+  assert.deepEqual([...DEFAULT_USER_THREAD_PLUGINS], []);
+});
+
+test("§18.6: handoffPath — one line of at most 256 characters", () => {
+  assert.equal(handoffPathError(undefined), null);
+  assert.equal(handoffPathError(""), null);
+  assert.equal(handoffPathError("   "), null);
+  assert.equal(handoffPathError("/home/example/H.md"), null);
+  assert.equal(handoffPathError("p".repeat(HANDOFF_PATH_MAX)), null);
+  assert.match(
+    handoffPathError("p".repeat(HANDOFF_PATH_MAX + 1)) ?? "",
+    /256/,
+  );
+  assert.match(handoffPathError("a\nb") ?? "", /одной строкой/);
+  assert.match(handoffPathError("a\rb") ?? "", /одной строкой/);
+});
+
+test("§18.6: the 2500 limit is checked on the REAL substitutions", () => {
+  // An addition sized to fit under the default handoffPath (29 chars)…
+  const base = roleInstructions("orchestrator");
+  const extra = "y".repeat(ROLE_INSTRUCTIONS_MAX - base.length - 150);
+  const doc = JSON.stringify({ orchestrator: extra });
+  assert.equal(parseRoleTexts(doc).errors.length, 0, "fits by default");
+  // …overflows once a real 256-char handoffPath is substituted (+227).
+  const longPath = "/" + "p".repeat(HANDOFF_PATH_MAX - 1);
+  const real = parseRoleTexts(doc, { handoffPath: longPath });
+  assert.ok(real.errors.length > 0, "over the limit with the real path");
+  assert.deepEqual(real.texts, {}, "an over-limit document applies nothing");
+  // …and once a real review-level name longer than "review" is used —
+  // only for the orchestrator text, other roles are unaffected (the
+  // executor text carries no {review} and stays well under the limit).
+  const longLevel = "review-" + "l".repeat(HANDOFF_PATH_MAX);
+  const realLevel = parseRoleTexts(doc, { reviewLevel: longLevel });
+  assert.ok(realLevel.errors.length > 0, "over with the real level name");
+  const executorDoc = JSON.stringify({ executor: "- small note" });
+  assert.equal(
+    parseRoleTexts(executorDoc, {
+      handoffPath: longPath,
+      reviewLevel: longLevel,
+    }).errors.length,
+    0,
+    "executor text has no {review} substitution",
+  );
+});
+
+test("§18.6: composed role + a 1500-char rule stays under 4096 — the SDK never truncates the mandatory tail", () => {
+  // The biggest valid addition keeps the role text at exactly 2500; the
+  // coordinator instructions (role + rule + separator) then fit the SDK
+  // limit with the mandatory tail intact — never cut mid-text.
+  for (const id of ["orchestrator", "executor", "auditor"] as const) {
+    const full = roleInstructions(id);
+    const extra = "y".repeat(ROLE_INSTRUCTIONS_MAX - full.length - 1);
+    const text = roleInstructions(id, { extra });
+    assert.equal(text.length, ROLE_INSTRUCTIONS_MAX, id);
+    const config = buildAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: "thr_x" } }),
+      {
+        injectInstructions: true,
+        instructionsText: "r".repeat(1500),
+        probes: {
+          delegationByThreadId: () => undefined,
+          hasFreshDispatching: () => false,
+          roleByThreadId: () => (id === "orchestrator" ? id : undefined),
+        },
+        roleInstructions: () => text,
+      },
+    );
+    const composed = config.instructions ?? "";
+    assert.ok(composed.length <= 4096, `${id}: ${composed.length}`);
+    // the mandatory tail survives inside the composed instructions
+    assert.ok(
+      composed.includes(id === "auditor" ? '"blockers"' : "ни sudo"),
+      `${id}: mandatory tail truncated`,
+    );
+  }
 });

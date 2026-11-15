@@ -2,13 +2,14 @@
 title: provider-agy — восстановление после сбоев и сжатие
 status: approved
 owner: coordinator
-date: 2026-11-01
+date: 2026-11-14
+revision: 2 (§2 — выбор по тирам priority, PLUG-253)
 tags: [bb, plugins, provider-agy, recovery, compaction]
 ---
 
 # provider-agy — восстановление после сбоев и сжатие
 
-Контракт поведения моста `provider-agy` (Antigravity CLI как провайдер bb) при сбоях Google, аккаунтов и самого agy, и при сжатии контекста. Подробности реализации — в [README плагина](../../plugins/bb-plugin-provider-agy/README.md); решения — в [ADR 0002](../adr/0002-provider-agy-failure-recovery.md) и [ADR 0003](../adr/0003-provider-agy-compaction-fallback.md).
+Контракт поведения моста `provider-agy` (Antigravity CLI как провайдер bb) при сбоях Google, аккаунтов и самого agy, и при сжатии контекста. Подробности реализации — в [README плагина](../../plugins/bb-plugin-provider-agy/README.md); решения — в [ADR 0002](../adr/0002-provider-agy-failure-recovery.md), [ADR 0003](../adr/0003-provider-agy-compaction-fallback.md) и [ADR 0021](../adr/0021-provider-agy-acp-transport.md) (транспорт ACP с 10.11.2026).
 
 ## 1. Запрос владельца
 
@@ -16,7 +17,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 
 ## 2. Поведение
 
-**Пул аккаунтов.** Тред закрепляется за свободным наименее занятым аккаунтом из `bridge-data/accounts/` (только с файлом входа); разговор возобновляется на аккаунте-владельце.
+**Пул аккаунтов.** Тред закрепляется за свободным наименее занятым аккаунтом с высшим приоритетом среди свободных (LRU внутри тира; `priority: 0` не выбирается — см. provider-agy-acp.md §2.2) из `bridge-data/accounts/` (только с файлом входа); разговор возобновляется на аккаунте-владельце.
 
 | Сбой | Что делает мост |
 |---|---|
@@ -24,6 +25,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 | «not eligible», нужна проверка | Отложить на 24 ч (`AGY_INELIGIBLE_COOLDOWN_MS`), ссылка проверки в `bridge.log`, ход на свободный аккаунт |
 | «not eligible», страна | Отложить на 2 ч (`AGY_LOCATION_COOLDOWN_MS`), ход на свободный аккаунт |
 | ≥3 разных аккаунта отложены за 10 мин | Предохранитель: больше не откладывать, падать с исходным текстом (подозрение на сеть) |
+| Слёт Google-входа: `auth_required`, «Authentication required», «Silent sign-in failed», «not logged into Antigravity», «error getting token source» (ACP-транспорт) | Припарковать как ineligible + метка `parkedReason:"auth-dead"` в accounts-state.json; ход переигрывается на свободном аккаунте с `contextLost`; свободных нет — честный фейл «every pool account lost its Google sign-in; re-authenticate one and retry». Не квота, не toolError |
 | Google `API error (attempt N): … (code 500/502/503/504)` | `errorInfo {internal, 5xx}` → встроенный bb provider-retry повторяет ход (~1 мин, удвоение, до 4) |
 | Ошибка шага инструмента, auth/billing вместе с 5xx | Метки автоповтора нет |
 | Тишина ≥15 мин во время хода, тул не открыт | Убить agy; если в полёте один принятый ход без очереди — `errorInfo {stream-disconnected}` → bb повторяет |
@@ -44,7 +46,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 
 ## 3. Устройство и ограничения
 
-Все повторы моста идут через один таймер сессии (`autoRetryTimer`): выход умирающего agy игнорируется, очередь ходов сохраняет порядок, остановка треда таймер отменяет. Учёт аккаунтов — `bridge-data/accounts-state.json` (cooldown, время отказа, владелец разговора), переживает перезапуск моста. Повторы временных сбоев — не в мосте, а в bb provider-retry по `errorInfo`. Переходы на новый разговор объявляются `session/replaced` (`contextLost`) и `thread/identity`.
+Все повторы моста идут через один таймер сессии (`autoRetryTimer`): выход умирающего agy игнорируется, очередь ходов сохраняет порядок, остановка треда таймер отменяет. Учёт аккаунтов — `bridge-data/accounts-state.json` + `accounts-overlay.json` (метки: cooldown, время отказа) и `conversations-state.json` (владелец разговора), переживает перезапуск моста. Повторы временных сбоев — не в мосте, а в bb provider-retry по `errorInfo`. Переходы на новый разговор объявляются `session/replaced` (`contextLost`) и `thread/identity`.
 
 Ограничения: точную причину отказа Google в сжатии не сообщает (вероятно, размер разговора); при откате на разговор аккаунта, который сам ещё на квоте, первое сообщение уходит обычной ротацией со сводкой; живые треды получают новый код только после пересоздания своей сессии.
 
