@@ -59,6 +59,9 @@ export interface CallView {
   threadId: string | null;
   targetThreadId: string | null;
   targetProjectId: string | null;
+  /** §12.13: предмет звонка по сообщению — досылается в каждом hello, как threadId. */
+  targetMessageSeq: number | null;
+  targetSelectedText: string | null;
   keys: { active: number; of: number } | null;
   feed: FeedItem[];
   confirmation: Confirmation | null;
@@ -88,6 +91,8 @@ const IDLE: CallView = {
   threadId: null,
   targetThreadId: null,
   targetProjectId: null,
+  targetMessageSeq: null,
+  targetSelectedText: null,
   keys: null,
   feed: [],
   confirmation: null,
@@ -338,7 +343,7 @@ export class CallEngine {
     this.patch({ expandSignal: this.view.expandSignal + 1 });
   }
 
-  start(opts?: CallMode | { mode?: CallMode; threadId?: string; projectId?: string }) {
+  start(opts?: CallMode | { mode?: CallMode; threadId?: string; projectId?: string; messageSeq?: number; selectedText?: string }) {
     if (this.isActive()) {
       this.requestExpand();
       return;
@@ -346,6 +351,10 @@ export class CallEngine {
     const mode = typeof opts === "string" ? opts : opts?.mode;
     const threadId = typeof opts === "object" ? opts?.threadId : undefined;
     const projectId = typeof opts === "object" ? opts?.projectId : undefined;
+    const messageSeq = typeof opts === "object" ? opts?.messageSeq : undefined;
+    // §12.13: клиент режет выделение до 4000 и не шлёт пустым — иначе hello упадёт на проверке.
+    const selected = typeof opts === "object" && opts.selectedText ? opts.selectedText.slice(0, 4000) : undefined;
+    const selectedText = selected && selected.length > 0 ? selected : undefined;
     this.releaseAudio();
     this.ownerHeard = false;
     this.endRequested = false;
@@ -356,6 +365,8 @@ export class CallEngine {
       orb: "connecting",
       targetThreadId: threadId ?? null,
       targetProjectId: projectId ?? null,
+      targetMessageSeq: messageSeq ?? null,
+      targetSelectedText: selectedText ?? null,
       expandSignal: this.view.expandSignal + 1,
     };
     this.patch({});
@@ -367,6 +378,8 @@ export class CallEngine {
       ...(mode ? { mode } : {}),
       ...(threadId ? { threadId } : {}),
       ...(projectId ? { projectId } : {}),
+      ...(messageSeq !== undefined ? { messageSeq } : {}),
+      ...(selectedText ? { selectedText } : {}),
     });
   }
 
@@ -378,7 +391,7 @@ export class CallEngine {
   private unauthorizedRetried = false;
 
   /** Сокет звонка: первый вход ({mode, projectId, threadId}) или возврат после обрыва ({resume: callId}). */
-  private openSocket(hello: { mode?: CallMode; resume?: string; threadId?: string; projectId?: string }) {
+  private openSocket(hello: { mode?: CallMode; resume?: string; threadId?: string; projectId?: string; messageSeq?: number; selectedText?: string }) {
     if (!hello.resume) this.stoppedOutbox = [];
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     const sock = new WebSocket(`${wsProto}//${location.host}${CALL_WS_PATH}`);
@@ -460,6 +473,8 @@ export class CallEngine {
           mode: this.view.mode,
           ...(this.view.targetProjectId ? { projectId: this.view.targetProjectId } : {}),
           ...(this.view.targetThreadId ? { threadId: this.view.targetThreadId } : {}),
+          ...(this.view.targetMessageSeq !== null ? { messageSeq: this.view.targetMessageSeq } : {}),
+          ...(this.view.targetSelectedText ? { selectedText: this.view.targetSelectedText } : {}),
         });
         return;
       }
@@ -468,7 +483,13 @@ export class CallEngine {
         this.patch({ orb: "reconnecting", stateDetail: "связь прервалась" });
         const callId = this.view.callId;
         setTimeout(() => {
-          if (this.view.phase === "live" && !this.sock) this.openSocket({ resume: callId });
+          // §12.13: поля предмета — в каждом hello, включая возврат по обрыву сокета.
+          if (this.view.phase === "live" && !this.sock)
+            this.openSocket({
+              resume: callId,
+              ...(this.view.targetMessageSeq !== null ? { messageSeq: this.view.targetMessageSeq } : {}),
+              ...(this.view.targetSelectedText ? { selectedText: this.view.targetSelectedText } : {}),
+            });
         }, Math.min(500 * 2 ** (this.reconnectTries - 1), 4000));
         return;
       }
