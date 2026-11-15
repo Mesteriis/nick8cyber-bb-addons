@@ -247,6 +247,18 @@ function clearDevinStallStreak(sessionId) {
   removeWedgedDevinSession(sessionId);
 }
 
+function isDevinResourceExhaustedError(error) {
+  if (!error) return false;
+  if (error?.data && typeof error.data === "object" && error.data["cognition.ai/errorKind"] === "resource_exhausted") {
+    return true;
+  }
+  if (error?.code === -32011) {
+    return true;
+  }
+  const msg = typeof error?.message === "string" ? error.message : String(error);
+  return /quota.*exhausted|resource_exhausted/i.test(msg);
+}
+
 // -------------------------------------------------------------
 // Phase Watchdog (§7.1, §7.2, §7.3)
 // -------------------------------------------------------------

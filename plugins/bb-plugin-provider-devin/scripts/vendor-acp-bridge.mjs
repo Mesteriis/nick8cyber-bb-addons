@@ -138,7 +138,28 @@ replaceOnce(
       } catch (error) {`
 );
 
-// 9. reconcileExecutionSettings: update command without mutating construction.agent, include nextCommand !== prevCommand in restart (§6.2 п.3)
+replaceOnce(
+  `        if (isAcpAuthRequiredResponse(error)) {\n          throw error;\n        }`,
+  `        if (isAcpAuthRequiredResponse(error)) {
+          throw error;
+        }
+        if (isDevinLaunch && isDevinResourceExhaustedError(error)) {
+          addWedgedDevinSession(request.resumeProviderThreadId);
+        }`
+);
+
+// 9. reconcileExecutionSettings: update command without mutating construction.agent, include nextCommand !== prevCommand and devin model changes in restart (§6.2 п.3)
+replaceOnce(
+  `  const modelParams = launchSpec === null ? session.construction : buildAcpModelSelectionParams(\n    launchSpec,\n    options,\n    decodeAcpModelPickerOptions(options.providerOptions).parameterizedModelPicker,\n    decodeDialectId(options.providerOptions)\n  );`,
+  `  const effectiveLaunchSpec = launchSpec ?? (session.dialect?.id === "devin" ? { command: resolveDevinBin(), args: ["acp"] } : null);
+  const modelParams = effectiveLaunchSpec === null ? session.construction : buildAcpModelSelectionParams(
+    effectiveLaunchSpec,
+    options,
+    decodeAcpModelPickerOptions(options.providerOptions).parameterizedModelPicker,
+    decodeDialectId(options.providerOptions) ?? session.dialect?.id
+  );`
+);
+
 replaceOnce(
   `  const construction = {\n    ...session.construction,\n    modelSelection: modelParams.modelSelection,\n    launchReasoningLevel: modelParams.launchReasoningLevel,\n    envVars,\n    permissionMode: options.permissionMode,\n    workspaceWriteRoots\n  };`,
   `  const prevCommand = session.construction.agent.command;
@@ -156,7 +177,10 @@ replaceOnce(
 
 replaceOnce(
   `  const restart = session.connection.exited || session.restartAfterCancelError || launchArgsChanged || !isDeepStrictEqual(envVars ?? {}, session.construction.envVars ?? {});`,
-  `  const restart = session.connection.exited || session.restartAfterCancelError || nextCommand !== prevCommand || launchArgsChanged || !isDeepStrictEqual(envVars ?? {}, session.construction.envVars ?? {});`
+  `  const prevDevinModel = session.construction.modelSelection?.modelId ?? session.construction.modelSelection?.model ?? "swe-2-high";
+  const nextDevinModel = construction.modelSelection?.modelId ?? construction.modelSelection?.model ?? "swe-2-high";
+  const devinModelChanged = session.dialect?.id === "devin" && prevDevinModel !== nextDevinModel;
+  const restart = session.connection.exited || session.restartAfterCancelError || nextCommand !== prevCommand || launchArgsChanged || devinModelChanged || !isDeepStrictEqual(envVars ?? {}, session.construction.envVars ?? {});`
 );
 
 // 10. Soft steer in turn/steer (§2)
@@ -608,6 +632,11 @@ const enhancedRunTurn = `function runTurn(session, firstInput, turnAlreadyOpen =
               shouldRecoverStall = true;
               break;
             }
+            if (session.dialect?.id === "devin" && isDevinResourceExhaustedError(error)) {
+              addWedgedDevinSession(session.providerThreadId);
+              void session.connection.kill().catch(() => {});
+              throw error;
+            }
             if (!isSessionBusyError(error) || busyRetries >= SESSION_BUSY_MAX_RETRIES || session.stopping || session.cancelRequested) {
               throw error;
             }
@@ -636,6 +665,10 @@ const enhancedRunTurn = `function runTurn(session, firstInput, turnAlreadyOpen =
       } catch (error) {
         session.restartAfterCancelError = session.cancelRequested;
         session.promptRequestPending = false;
+        if (session.dialect?.id === "devin" && isDevinResourceExhaustedError(error)) {
+          addWedgedDevinSession(session.providerThreadId);
+          void session.connection.kill().catch(() => {});
+        }
         dropTurnInput(pending, "ACP turn failed before the prompt was sent");
         dropQueuedTurnInputs(
           session,

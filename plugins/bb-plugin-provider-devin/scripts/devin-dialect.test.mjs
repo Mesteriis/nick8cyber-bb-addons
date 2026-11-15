@@ -29,6 +29,7 @@ const {
   isBbSystemNotice,
   applyDevinAcpSessionMode,
   DEVIN_ACP_MODE_BY_PERMISSION_MODE,
+  isDevinResourceExhaustedError,
 } = new Function(
   "devinFsSync",
   "devinFsPromises",
@@ -36,7 +37,7 @@ const {
   "devinPath",
   "resolveDevinBin",
   "delegationPresentation",
-  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode, DEVIN_ACP_MODE_BY_PERMISSION_MODE };`,
+  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode, DEVIN_ACP_MODE_BY_PERMISSION_MODE, isDevinResourceExhaustedError };`,
 )(fsSync, fsPromises, fakeOs, path, () => "devin", delegationPresentation);
 
 // Реальное событие из bb (<thread> seq 2346), до выключения субагентов.
@@ -247,4 +248,14 @@ test("set_config_option error is fail-open: warning, no throw", async () => {
   assert.equal(requests.length, 1);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /failed to set ACP session mode "bypass"/);
+});
+
+test("isDevinResourceExhaustedError identifies quota and resource exhausted errors", () => {
+  assert.equal(isDevinResourceExhaustedError({ code: -32011, message: "Your daily usage quota has been exhausted. Visit https://app.devin.ai/settings/usage" }), true);
+  assert.equal(isDevinResourceExhaustedError({ data: { "cognition.ai/errorKind": "resource_exhausted" } }), true);
+  assert.equal(isDevinResourceExhaustedError({ message: "Daily usage quota exhausted" }), true);
+  assert.equal(isDevinResourceExhaustedError(new Error("resource_exhausted: out of tokens")), true);
+  assert.equal(isDevinResourceExhaustedError({ code: -32603, message: "Internal server error" }), false);
+  assert.equal(isDevinResourceExhaustedError(null), false);
+  assert.equal(isDevinResourceExhaustedError(undefined), false);
 });

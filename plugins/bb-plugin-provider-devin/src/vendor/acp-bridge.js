@@ -14589,6 +14589,18 @@ function clearDevinStallStreak(sessionId) {
   removeWedgedDevinSession(sessionId);
 }
 
+function isDevinResourceExhaustedError(error) {
+  if (!error) return false;
+  if (error?.data && typeof error.data === "object" && error.data["cognition.ai/errorKind"] === "resource_exhausted") {
+    return true;
+  }
+  if (error?.code === -32011) {
+    return true;
+  }
+  const msg = typeof error?.message === "string" ? error.message : String(error);
+  return /quota.*exhausted|resource_exhausted/i.test(msg);
+}
+
 // -------------------------------------------------------------
 // Phase Watchdog (§7.1, §7.2, §7.3)
 // -------------------------------------------------------------
@@ -24012,6 +24024,9 @@ async function startAgentSession(request) {
         if (isAcpAuthRequiredResponse(error)) {
           throw error;
         }
+        if (isDevinLaunch && isDevinResourceExhaustedError(error)) {
+          addWedgedDevinSession(request.resumeProviderThreadId);
+        }
         sessionId = void 0;
         session.loading = false;
         session.loadingSessionId = void 0;
@@ -24630,6 +24645,11 @@ function runTurn(session, firstInput, turnAlreadyOpen = false) {
               shouldRecoverStall = true;
               break;
             }
+            if (session.dialect?.id === "devin" && isDevinResourceExhaustedError(error)) {
+              addWedgedDevinSession(session.providerThreadId);
+              void session.connection.kill().catch(() => {});
+              throw error;
+            }
             if (!isSessionBusyError(error) || busyRetries >= SESSION_BUSY_MAX_RETRIES || session.stopping || session.cancelRequested) {
               throw error;
             }
@@ -24658,6 +24678,10 @@ function runTurn(session, firstInput, turnAlreadyOpen = false) {
       } catch (error) {
         session.restartAfterCancelError = session.cancelRequested;
         session.promptRequestPending = false;
+        if (session.dialect?.id === "devin" && isDevinResourceExhaustedError(error)) {
+          addWedgedDevinSession(session.providerThreadId);
+          void session.connection.kill().catch(() => {});
+        }
         dropTurnInput(pending, "ACP turn failed before the prompt was sent");
         dropQueuedTurnInputs(
           session,
@@ -24752,11 +24776,12 @@ function reconcileExecutionSettings(session, options) {
     session.cwd,
     ...decodeAdditionalWorkspaceWriteRoots(options.providerOptions)
   ] : session.policy.workspaceWriteRoots;
-  const modelParams = launchSpec === null ? session.construction : buildAcpModelSelectionParams(
-    launchSpec,
+  const effectiveLaunchSpec = launchSpec ?? (session.dialect?.id === "devin" ? { command: resolveDevinBin(), args: ["acp"] } : null);
+  const modelParams = effectiveLaunchSpec === null ? session.construction : buildAcpModelSelectionParams(
+    effectiveLaunchSpec,
     options,
     decodeAcpModelPickerOptions(options.providerOptions).parameterizedModelPicker,
-    decodeDialectId(options.providerOptions)
+    decodeDialectId(options.providerOptions) ?? session.dialect?.id
   );
   const prevCommand = session.construction.agent.command;
   const nextCommand = session.dialect.id === "devin" ? resolveDevinBin() : prevCommand;
@@ -24791,7 +24816,10 @@ function reconcileExecutionSettings(session, options) {
     dialectLaunchEnv(session.dialect.id, session.construction.permissionMode),
     dialectLaunchEnv(session.dialect.id, construction.permissionMode)
   ) || launchModelChanged;
-  const restart = session.connection.exited || session.restartAfterCancelError || nextCommand !== prevCommand || launchArgsChanged || !isDeepStrictEqual(envVars ?? {}, session.construction.envVars ?? {});
+  const prevDevinModel = session.construction.modelSelection?.modelId ?? session.construction.modelSelection?.model ?? "swe-2-high";
+  const nextDevinModel = construction.modelSelection?.modelId ?? construction.modelSelection?.model ?? "swe-2-high";
+  const devinModelChanged = session.dialect?.id === "devin" && prevDevinModel !== nextDevinModel;
+  const restart = session.connection.exited || session.restartAfterCancelError || nextCommand !== prevCommand || launchArgsChanged || devinModelChanged || !isDeepStrictEqual(envVars ?? {}, session.construction.envVars ?? {});
   cancelPendingPermissions(session);
   session.policy = {
     permissionMode: options.permissionMode,

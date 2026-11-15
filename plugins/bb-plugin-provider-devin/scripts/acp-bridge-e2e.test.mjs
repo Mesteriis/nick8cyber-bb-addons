@@ -80,8 +80,9 @@ class BridgeTestHarness {
     });
   }
 
-  startThread(threadId = "thr_test1", permissionMode = "accept-edits", command = this.fakeAgentPath, instructions = undefined) {
+  startThread(threadId = "thr_test1", permissionMode = "accept-edits", command = this.fakeAgentPath, instructions = undefined, extraOptions = {}) {
     const isFull = permissionMode === "full";
+    const { providerOptions, ...restExtra } = extraOptions;
     return this.send("thread/start", {
       threadId,
       cwd: this.testDir,
@@ -92,6 +93,7 @@ class BridgeTestHarness {
         permissionScope: isFull ? "full" : "workspace",
         approvalReviewer: isFull ? null : "user",
         permissionEscalation: isFull ? null : "ask",
+        ...restExtra,
         providerOptions: {
           acpDialect: "devin",
           acpLaunchSpec: {
@@ -100,6 +102,7 @@ class BridgeTestHarness {
             args: [],
             env: {},
           },
+          ...providerOptions,
         },
       },
     });
@@ -134,8 +137,9 @@ class BridgeTestHarness {
     });
   }
 
-  startTurn(threadId = "thr_test1", text = "hello", clientRequestId = "creq_23456789ab", permissionMode = "accept-edits", command = this.fakeAgentPath) {
+  startTurn(threadId = "thr_test1", text = "hello", clientRequestId = "creq_23456789ab", permissionMode = "accept-edits", command = this.fakeAgentPath, extraOptions = {}) {
     const isFull = permissionMode === "full";
+    const { providerOptions, ...restExtra } = extraOptions;
     return this.send("turn/start", {
       threadId,
       providerThreadId: "sess-1",
@@ -146,6 +150,7 @@ class BridgeTestHarness {
         permissionScope: isFull ? "full" : "workspace",
         approvalReviewer: isFull ? null : "user",
         permissionEscalation: isFull ? null : "ask",
+        ...restExtra,
         providerOptions: {
           acpDialect: "devin",
           acpLaunchSpec: {
@@ -154,6 +159,7 @@ class BridgeTestHarness {
             args: [],
             env: {},
           },
+          ...providerOptions,
         },
       },
     });
@@ -1308,6 +1314,195 @@ rl.on("line", (line) => {
     assert.equal(calls.load, 0, "session/load must not be called (0 calls)");
     assert.equal(calls.resume, 0, "session/resume must not be called (0 calls)");
     assert.equal(calls.new, 1, "session/new must be called exactly once");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("18. mid-thread model change between turns triggers session rebuild", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "devin-test-18-"));
+  const callsFile = join(tmp, "calls.json");
+  writeFileSync(callsFile, JSON.stringify({ load: 0, new: 0, setModel: [] }));
+
+  const fakeScript = `#!/usr/bin/env node
+import readline from "node:readline";
+import fs from "node:fs";
+
+const callsFile = "${callsFile}";
+function record(fn) {
+  const calls = JSON.parse(fs.readFileSync(callsFile, "utf8"));
+  fn(calls);
+  fs.writeFileSync(callsFile, JSON.stringify(calls));
+}
+
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+function send(obj) { process.stdout.write(JSON.stringify(obj) + "\\n"); }
+
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+  } else if (msg.method === "session/new") {
+    record((c) => c.new++);
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: "sess-18",
+        configOptions: [
+          { id: "mode", category: "mode", type: "select", options: [{ value: "accept-edits" }], currentValue: "accept-edits" },
+          { id: "model", category: "model", type: "select", options: [{ value: "swe-2-high" }, { value: "swe-2-flash-medium" }], currentValue: "swe-2-high" }
+        ]
+      }
+    });
+  } else if (msg.method === "session/load") {
+    record((c) => c.load++);
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        configOptions: [
+          { id: "mode", category: "mode", type: "select", options: [{ value: "accept-edits" }], currentValue: "accept-edits" },
+          { id: "model", category: "model", type: "select", options: [{ value: "swe-2-high" }, { value: "swe-2-flash-medium" }], currentValue: "swe-2-high" }
+        ]
+      }
+    });
+  } else if (msg.method === "session/set_config_option") {
+    if (msg.params?.configId === "model") {
+      record((c) => c.setModel.push(msg.params.value));
+    }
+    send({ jsonrpc: "2.0", id: msg.id, result: null });
+  } else if (msg.method === "session/prompt") {
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: msg.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } } }
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`;
+
+  const harness = new BridgeTestHarness(tmp, fakeScript);
+  try {
+    await harness.startThread("thr_test18", "accept-edits", harness.fakeAgentPath, undefined, {
+      model: "swe-2-high",
+    });
+    await harness.startTurn("thr_test18", "turn 1", "creq_23456789ab", "accept-edits", harness.fakeAgentPath, {
+      model: "swe-2-high",
+    });
+    await harness.waitForDelta((d) => d.kind === "turn.boundary" && d.status === "completed");
+
+    // Clear received deltas before turn 2
+    harness.receivedDeltas.length = 0;
+
+    // Turn 2 changes model to swe-2-flash-medium
+    await harness.startTurn("thr_test18", "turn 2", "creq_3456789abc", "accept-edits", harness.fakeAgentPath, {
+      model: "swe-2-flash-medium",
+    });
+    await harness.waitForDelta((d) => d.kind === "turn.boundary" && d.status === "completed");
+
+    const calls = JSON.parse(readFileSync(callsFile, "utf8"));
+    assert.equal(calls.new, 1, "initial session/new called once");
+    assert.equal(calls.load, 1, "session/load called on mid-thread model rebuild");
+    assert.ok(calls.setModel.includes("swe-2-flash-medium"), "model switched to swe-2-flash-medium");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("19. quota exhausted error marks session wedged and kills connection, next turn gets fresh session", async () => {
+  const tmp = mkdtempSync(join(tmpdir(), "devin-test-19-"));
+  const stateDir = join(tmp, "state");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const counterFile = join(tmp, "counter.txt");
+  writeFileSync(counterFile, "0");
+
+  const fakeScript = `#!/usr/bin/env node
+import readline from "node:readline";
+import fs from "node:fs";
+
+const counterFile = "${counterFile}";
+function getNextSessionId() {
+  const count = parseInt(fs.readFileSync(counterFile, "utf8").trim(), 10) + 1;
+  fs.writeFileSync(counterFile, String(count));
+  return "sess-19-" + count;
+}
+
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+function send(obj) { process.stdout.write(JSON.stringify(obj) + "\\n"); }
+
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+  } else if (msg.method === "session/new") {
+    const sid = getNextSessionId();
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: sid,
+        configOptions: [
+          { id: "mode", category: "mode", type: "select", options: [{ value: "accept-edits" }], currentValue: "accept-edits" },
+          { id: "model", category: "model", type: "select", options: [{ value: "swe-2-high" }], currentValue: "swe-2-high" }
+        ]
+      }
+    });
+  } else if (msg.method === "session/set_config_option") {
+    send({ jsonrpc: "2.0", id: msg.id, result: null });
+  } else if (msg.method === "session/prompt") {
+    if (msg.params.sessionId === "sess-19-1") {
+      // Simulate quota exhaustion on first session
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: {
+          code: -32011,
+          message: "Your daily usage quota has been exhausted. Visit https://app.devin.ai/settings/usage",
+          data: { "cognition.ai/errorKind": "resource_exhausted" }
+        }
+      });
+    } else {
+      // Second session succeeds
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: msg.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "recovered!" } } }
+      });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    }
+  }
+});
+`;
+
+  const harness = new BridgeTestHarness(tmp, fakeScript, {
+    BB_DEVIN_STATE_DIR: stateDir,
+  });
+  try {
+    await harness.startThread("thr_test19");
+    await harness.startTurn("thr_test19", "turn 1 fail", "creq_456789abcd");
+
+    // Wait for provider.error that settles the turn
+    await harness.waitForDelta((d) => d.kind === "provider.error" && d.settlesTurn === true);
+
+    // Verify sess-19-1 was written to wedged-sessions.json
+    const wedgedFile = join(stateDir, "wedged-sessions.json");
+    assert.ok(existsSync(wedgedFile), "wedged-sessions.json must exist");
+    const wedgedList = JSON.parse(readFileSync(wedgedFile, "utf8"));
+    assert.ok(wedgedList.includes("sess-19-1"), "sess-19-1 must be in wedged-sessions.json");
+
+    // Clear received deltas before turn 2
+    harness.receivedDeltas.length = 0;
+
+    // Start turn 2 on the same thread: should recover on fresh session
+    await harness.startTurn("thr_test19", "turn 2 recover", "creq_56789abcde");
+    await harness.waitForDelta((d) => d.kind === "turn.boundary" && d.status === "completed");
+
+    // Verify recovery output was emitted
+    assert.ok(harness.receivedDeltas.some((d) => d.kind === "item.textDelta" && d.text === "recovered!"), "turn 2 received output on fresh session");
   } finally {
     await harness.cleanup();
   }
