@@ -118,7 +118,8 @@ function modelWindows(response: Json, taken: Set<string>, now: number): UsageWin
     const resetsAt = reset && Number.isFinite(Date.parse(reset)) ? reset : null;
     const seen = families.get(family);
     if (!seen || fraction < seen.fraction ||
-        (fraction === seen.fraction && (resetsAt ?? "") < (seen.resetsAt ?? ""))) {
+        (fraction === seen.fraction && resetsAt !== null &&
+         (seen.resetsAt === null || resetsAt < seen.resetsAt))) {
       families.set(family, { fraction, resetsAt });
     }
   }
