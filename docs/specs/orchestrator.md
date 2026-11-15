@@ -842,7 +842,7 @@ SDK: часть нужного (`environment: {type: "reuse", environmentId}`, �
 
 ### 20.4 Настройка у владельца (после выкладки кода, делает координатор)
 
-- Пресет `argon-pro-review`: провайдер `acp-argon`, модель `pro`, рассуждение `high`, инструкции аудитора без строк про git и запуск команд.
+- Пресет `argon-pro-review`: провайдер `acp-argon`, модель `argon` (Gemini 4; `pro` — старая 3.1, не использовать), рассуждение `high`, инструкции аудитора без строк про git и запуск команд.
 - Маршрут `review-argon`: `preset argon-pro-review`, `provider acp-argon`, `quotaGroup argon`, `tools false`, `maxActive 1`, `firstResponseSeconds 600` (предел проверки политики 30–600).
 - Цепочки: `review` → `review-argon, review-opus, review, review-gemini, review-aistudio`; `review-medium` → `review-argon, review-gemini, review, review-aistudio`; `review-simple` → `review-argon, review, review-gemini, review-aistudio`. `release-audit` не меняется.
 
