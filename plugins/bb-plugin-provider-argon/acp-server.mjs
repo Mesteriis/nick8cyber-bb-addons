@@ -986,7 +986,7 @@ async function cleanShutdown() {
     if (activeAttempt) {
       await Promise.race([
         activeAttempt.catch(() => {}),
-        sleep(2_000),
+        sleep(12_000),
       ]);
     }
     if (activeBackendId) {

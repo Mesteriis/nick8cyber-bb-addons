@@ -414,6 +414,44 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
 
   const targetSuccess = findTurnTarget(mockDocWithResp, 1, testPrefix);
   assert.equal(targetSuccess, nodeResp1, "Turn 1 target must correctly resolve to nodeResp1 when it appears");
+
+  // Multiline prompt test with multiple spaces, tabs, and newlines
+  const nodeQueryMultiline = {
+    id: "query-multi",
+    innerText: "   First line of query \n\n  second line   with   spaces\nthird line   ",
+    compareDocumentPosition(other) {
+      if (other.id === "resp-multi") return NODE_FOLLOWING;
+      return NODE_PRECEDING;
+    },
+  };
+
+  const nodeRespMultiline = {
+    id: "resp-multi",
+    innerText: "Multiline model answer",
+    compareDocumentPosition(other) {
+      if (other.id === "query-multi") return NODE_PRECEDING;
+      return 0;
+    },
+  };
+
+  const mockDocMultiline = {
+    querySelectorAll(sel) {
+      if (sel === "user-query") return [nodeQueryMultiline];
+      if (sel === "model-response") return [nodeRespMultiline];
+      return [];
+    },
+  };
+
+  const multilinePrompt = "\n\n   First   line of query\n\tsecond   line with spaces\nthird line and more details...";
+  const targetMultiline = findTurnTarget(mockDocMultiline, 0, multilinePrompt);
+  assert.equal(
+    targetMultiline,
+    nodeRespMultiline,
+    "findTurnTarget must correctly match when query and prompt contain newlines and multiple spaces"
+  );
+
+  const targetMismatch = findTurnTarget(mockDocMultiline, 0, "Different \n\n prompt   content");
+  assert.equal(targetMismatch, null, "findTurnTarget must return null for non-matching multiline prompt");
 });
 
 test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease retention and selective cancel", async () => {

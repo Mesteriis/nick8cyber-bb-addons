@@ -588,13 +588,14 @@ async function stopGeneration(page) {
 function findTurnTarget(doc, idx, promptPrefix) {
   const responses = doc.querySelectorAll('model-response');
   const target = responses[idx];
+  const last = responses[idx];
   if (!target) return null;
   const queries = doc.querySelectorAll('user-query');
   if (queries.length === 0) return null;
   const lastQuery = queries[queries.length - 1];
   if (!lastQuery) return null;
-  const queryText = (lastQuery.innerText || '').trim();
-  if (promptPrefix && !queryText.includes(promptPrefix)) {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  if (promptPrefix && !norm(lastQuery.innerText).includes(norm(promptPrefix).slice(0, 40))) {
     return null;
   }
   const NodeObj = typeof Node !== 'undefined' ? Node : { DOCUMENT_POSITION_FOLLOWING: 4 };
@@ -658,7 +659,7 @@ async function sendPrompt({
   shouldCancel = null
 }) {
   const isStrict = Boolean(strict || strictModel);
-  const promptPrefix = prompt.trim().slice(0, 40);
+  const promptPrefix = prompt;
   // Port-local: never read the module-global CDP_PORT here. A cancelled send
   // finishing after the queue moved on must still only touch its own backend.
   const port = cdpPort != null ? String(cdpPort) : CDP_PORT;
@@ -794,23 +795,21 @@ async function sendPrompt({
     const genDeadline = Date.now() + 120000;
     for (;;) {
       await throwIfCancelled();
-      const started = await page.evaluate(({ idx, promptPrefix }) => {
-        const responses = document.querySelectorAll('model-response');
-        const target = responses[idx];
-        if (!target) return false;
-        const queries = document.querySelectorAll('user-query');
-        if (queries.length === 0) return false;
-        const lastQuery = queries[queries.length - 1];
-        if (!lastQuery) return false;
-        const queryText = (lastQuery.innerText || '').trim();
-        if (promptPrefix && !queryText.includes(promptPrefix)) {
-          return false;
-        }
-        if (!(lastQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-          return false;
-        }
-        return true;
-      }, { idx: initialCount, promptPrefix });
+      const started = await page.evaluate(
+        ({ idx, promptPrefix, fnSrc }) => {
+          const stopBtn = document.querySelector(
+            'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]'
+          );
+          if (stopBtn !== null) return true;
+          if (!window.__argonFindTurnTarget && fnSrc) {
+            // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
+            window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+          }
+          const fn = window.__argonFindTurnTarget;
+          return fn(document, idx, promptPrefix) !== null;
+        },
+        { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
+      );
       if (started) break;
       if (Date.now() >= genDeadline) {
         throw new Error('generation did not start within 120s (no model-response, no stop button)');
@@ -830,29 +829,25 @@ async function sendPrompt({
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
 
-      const currentText = await page.evaluate(({ idx, promptPrefix }) => {
-        const responses = document.querySelectorAll('model-response');
-        const target = responses[idx];
-        if (!target) return null;
-        const queries = document.querySelectorAll('user-query');
-        if (queries.length === 0) return null;
-        const lastQuery = queries[queries.length - 1];
-        if (!lastQuery) return null;
-        const queryText = (lastQuery.innerText || '').trim();
-        if (promptPrefix && !queryText.includes(promptPrefix)) {
-          return null;
-        }
-        if (!(lastQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-          return null;
-        }
-        const mc = target.querySelector('message-content');
-        // Track which source produced the text: before message-content exists
-        // the whole model-response (incl. "Show thinking" chrome) is read —
-        // when mc appears the text shrinks, so a length-slice would skip the
-        // answer's start. Reset on source switch or non-prefix text.
-        const src = mc ? 'mc' : 'raw';
-        return { src, text: ((mc || target).innerText || '') };
-      }, { idx: initialCount, promptPrefix });
+      const currentText = await page.evaluate(
+        ({ idx, promptPrefix, fnSrc }) => {
+          if (!window.__argonFindTurnTarget && fnSrc) {
+            // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
+            window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+          }
+          const fn = window.__argonFindTurnTarget;
+          const target = fn(document, idx, promptPrefix);
+          if (!target) return null;
+          const mc = target.querySelector('message-content');
+          // Track which source produced the text: before message-content exists
+          // the whole model-response (incl. "Show thinking" chrome) is read —
+          // when mc appears the text shrinks, so a length-slice would skip the
+          // answer's start. Reset on source switch or non-prefix text.
+          const src = mc ? 'mc' : 'raw';
+          return { src, text: ((mc || target).innerText || '') };
+        },
+        { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
+      );
 
       if (currentText !== null && currentText.text.length) {
         if (currentText.src !== lastSrc || !currentText.text.startsWith(lastText)) {
@@ -873,25 +868,21 @@ async function sendPrompt({
 
       const stopButton = await page.$('button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
 
-      const hasFinishedContent = await page.evaluate(({ idx, promptPrefix }) => {
-        const responses = document.querySelectorAll('model-response');
-        const last = responses[idx];
-        if (!last) return false;
-        const queries = document.querySelectorAll('user-query');
-        if (queries.length === 0) return false;
-        const lastQuery = queries[queries.length - 1];
-        if (!lastQuery) return false;
-        const queryText = (lastQuery.innerText || '').trim();
-        if (promptPrefix && !queryText.includes(promptPrefix)) {
-          return false;
-        }
-        if (!(lastQuery.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-          return false;
-        }
-        const hasText = (last.querySelector('message-content')?.innerText || '').trim().length > 0;
-        const hasImg = last.querySelector('img, generated-image, .image-container') !== null;
-        return hasText || hasImg;
-      }, { idx: initialCount, promptPrefix });
+      const hasFinishedContent = await page.evaluate(
+        ({ idx, promptPrefix, fnSrc }) => {
+          if (!window.__argonFindTurnTarget && fnSrc) {
+            // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
+            window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+          }
+          const fn = window.__argonFindTurnTarget;
+          const last = fn(document, idx, promptPrefix);
+          if (!last) return false;
+          const hasText = (last.querySelector('message-content')?.innerText || '').trim().length > 0;
+          const hasImg = last.querySelector('img, generated-image, .image-container') !== null;
+          return hasText || hasImg;
+        },
+        { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
+      );
 
       if (!stopButton) {
         if (hasFinishedContent) {
