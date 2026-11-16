@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 6
+revision: 7
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -105,7 +105,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     2. `$STATE_DIR/accounts/<label>/backend.json`;
     3. `~/.config/argon-acp/accounts/*/backend.json` (legacy fallback, только если пул пуст);
     4. `ARGON_BACKENDS` (JSON-массив бэкендов из переменной окружения);
-    5. Одиночный профиль по умолчанию (`profile: "Default"`, `cdpPort: 9222`, `profileDir: ~/.gemini-cli-profile`).
+    5. Одиночный профиль по умолчанию: id: "default", profile: "default", profileDir из GEMINI_PROFILE_DIR / GEMINI_PROFILE или ~/.gemini-cli-profile; порт CDP из GEMINI_CDP_PORT или 9222.
   - Утилита `scripts/pool-add.mjs` актуализируется: при добавлении аккаунта она обновляет и `pool.json`, и подкаталог аккаунта.
   - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()`. Аккаунты с `priority === 0` исключаются из автоматического выбора.
 - Состояние хранится в `ARGON_STATE_DIR/accounts-state.json` (по умолчанию `~/.bb/plugins/provider-argon/accounts-state.json`).

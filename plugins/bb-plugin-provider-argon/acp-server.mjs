@@ -159,7 +159,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
     }
   } catch {}
 
-  // 4. Default fallback single profile
+  // 5. Default fallback single profile
   if (byId.size === 0) {
     const envCdp = process.env.GEMINI_CDP_PORT || "9222";
     const envProfile =
