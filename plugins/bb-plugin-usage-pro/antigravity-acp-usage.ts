@@ -63,9 +63,8 @@ function quotaWindows(response: Json): UsageWindow[] {
     if (!Array.isArray(group.buckets)) continue;
     for (const rawBucket of group.buckets) {
       const bucket = object(rawBucket);
-      // A disabled bucket is a frozen counter (its family is capped by the
-      // longer window) — reporting it would paint a live window that is dead.
-      if (bucket.disabled === true) continue;
+      // Disabled buckets are frozen counters while the longer window governs;
+      // the pool card emits them verbatim, so the native card does too.
       const fraction = bucket.remainingFraction;
       if (typeof fraction !== "number" || !Number.isFinite(fraction) ||
           fraction < 0 || fraction > 1) {

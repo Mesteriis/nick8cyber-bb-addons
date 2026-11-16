@@ -1312,14 +1312,15 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(card.accountLabel).toBe("user-a@example.com");
     expect(card.usage.status).toBe("ok");
     expect(card.usage.planLabel).toBe("Antigravity");
-    // Only the windows Google actually reports: no fabricated 5h line.
-    expect(card.usage.windows).toHaveLength(2);
-    expect(card.usage.windows[0].label).toBe("Claude Weekly");
-    expect(card.usage.windows[0].usedPercent).toBe(100);
-    expect(card.usage.windows[0].resetsAt).toBe("2026-11-18T05:18:41Z");
-    expect(card.usage.windows[1].label).toBe("Gemini Weekly");
-    expect(card.usage.windows[1].usedPercent).toBe(96);
-    expect(card.usage.windows[1].resetsAt).toBe("2026-11-20T23:08:16Z");
+    // The disabled 5h bucket is emitted verbatim, matching the pool card.
+    expect(card.usage.windows).toHaveLength(3);
+    const byLabel = Object.fromEntries(card.usage.windows.map((w: any) => [w.label, w]));
+    expect(byLabel["Claude Weekly"].usedPercent).toBe(100);
+    expect(byLabel["Claude Weekly"].resetsAt).toBe("2026-11-18T05:18:41Z");
+    expect(byLabel["Claude 5h"].usedPercent).toBe(0);
+    expect(byLabel["Claude 5h"].resetsAt).toBe("2026-11-16T03:18:12Z");
+    expect(byLabel["Gemini Weekly"].usedPercent).toBe(96);
+    expect(byLabel["Gemini Weekly"].resetsAt).toBe("2026-11-20T23:08:16Z");
 
     // The native card must not leak onto other hosts.
     const remote = snap.machines.find((m: any) => m.id === "host-remote");
