@@ -57,13 +57,15 @@ export type RoleId =
   | "orchestrator"
   | "executor"
   | "auditor"
-  | "release-auditor";
+  | "release-auditor"
+  | "helper";
 
 export const ROLE_IDS: readonly RoleId[] = [
   "orchestrator",
   "executor",
   "auditor",
   "release-auditor",
+  "helper",
 ];
 
 /** §13.1 rev 20: `release-auditor` is never offered in the new-chat
@@ -73,6 +75,15 @@ export const PICKABLE_ROLE_IDS = [
   "orchestrator",
   "executor",
   "auditor",
+] as const;
+
+/** §19.3 (r33): the new-chat window's full option list — `none`
+ * («Без плагина» / "No plugin") FIRST. `PICKABLE_ROLE_IDS` stays the
+ * `roleTexts`-customizable subset; `none`, `helper` and
+ * `release-auditor` are never offered or customizable. */
+export const WINDOW_ROLE_IDS = [
+  "none",
+  ...PICKABLE_ROLE_IDS,
 ] as const;
 
 export const DEFAULT_ROLE: RoleId = "orchestrator";
@@ -99,12 +110,14 @@ const ROLE_BODY_KEYS: Record<RoleId, string> = {
   executor: "role.body.executor",
   auditor: "role.body.auditor",
   "release-auditor": "role.body.releaseAuditor",
+  helper: "role.body.helper",
 };
 
 const ROLE_MANDATORY_KEYS: Partial<Record<RoleId, string>> = {
   orchestrator: "role.mand.orchestrator",
   executor: "role.mand.executor",
   auditor: "role.mand.auditor",
+  helper: "role.mand.helper",
 };
 
 /**
@@ -272,6 +285,7 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
       "orchestrator_status",
       "orchestrator_cancel",
       "orchestrator_merge",
+      "orchestrator_helper",
     ],
     skills: ["orchestrator-coordinator", "orchestrator-setup"],
   },
@@ -279,7 +293,10 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
     id: "executor",
     delegates: false,
     instructions: roleInstructions("executor"),
-    tools: [],
+    // §19.1: helpers are the executor's only fan-out — every other
+    // spawn/dispatch path is forbidden by the role text and the §19.5
+    // hook gate.
+    tools: ["orchestrator_helper"],
     skills: [],
   },
   auditor: {
@@ -293,6 +310,15 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
     id: "release-auditor",
     delegates: false,
     instructions: roleInstructions("release-auditor"),
+    tools: [],
+    skills: [],
+  },
+  // §19.1-19.2: helpers are created by the plugin only — no tools, no
+  // skills, never in the role window.
+  helper: {
+    id: "helper",
+    delegates: false,
+    instructions: roleInstructions("helper"),
     tools: [],
     skills: [],
   },
@@ -317,6 +343,12 @@ export const roleForLevel = (
     : levelRole(policy, level) === "auditor"
       ? "auditor"
       : "executor";
+
+/** §19.1: helper spawns carry `helper#<id> · <title>` from birth. */
+const HELPER_TITLE_RE = /^helper#(\d+) · /;
+
+export const helperIdFromTitle = (title: string | null): number | null =>
+  title ? Number(HELPER_TITLE_RE.exec(title)?.[1]) || null : null;
 
 /** Dispatch titles carry the task key from birth: `<KEY> · <title>`. */
 const TASK_KEY_TITLE_RE = /^([A-Z][A-Z0-9]+-\d+) · /;
@@ -364,6 +396,22 @@ export interface RoleDecisionProbes {
    * `["handoff", "external-compact"]`.
    */
   userThreadPlugins?(): readonly string[];
+  /** §19.3: the configurable default role (the `defaultRole` setting),
+   * `none` included. An absent probe means the r33 default —
+   * `executor`; a returned `undefined` means the setting is INVALID —
+   * a `needs-configuration` state, no role is written. */
+  defaultRole?(): RoleId | typeof NO_ROLE | undefined;
+  /** §19.1: a `helper#<id>` spawn title is verified against the helpers
+   * table before the helper role is written (a faked title alone does
+   * not get it). */
+  helperById?(id: number): { status: string } | undefined;
+  /** §19.5: manual children of role threads pass only for the operator
+   * allowlist of `originPluginId`s (the `allowForeignChildren`
+   * setting). Absent probe / no match = refused. */
+  allowForeignChildren?(originPluginId: string | null): boolean;
+  /** §19.3.6: the hook records every seen thread's `createdAt` so the
+   * synchronous `configure` can tell pre-r33 threads from new ones. */
+  noteThreadSeen?(threadId: string, createdAt: number): void;
 }
 
 /** §17.1: the recorded "no orchestrator role" verdict for plugin-/sdk-
@@ -390,86 +438,144 @@ export function decideRole(
   if (facts.status !== "pending") return null;
   if (probes.threadRole(facts.threadId)) return null;
 
-  // §16.7: while the policy is invalid a root chat gets no role.
-  const policyOk =
-    probes.policy === undefined || probes.policy() !== null;
   // §17.1 r26 (PLUG-211 Б2): plugins that continue a human chat.
   const userPlugins =
     probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
+  // §19.3: the hook records the selected role ALWAYS — an invalid
+  // policy no longer drops the decision (§16.7 r33); the `defaultRole`
+  // setting picks the fallback — `executor` by default, `none`
+  // allowed, an invalid value = needs-configuration (no role written).
+  const defaultRole: RoleId | typeof NO_ROLE | undefined =
+    probes.defaultRole === undefined ? "executor" : probes.defaultRole();
 
   // 1. A thread created by `bb tasks dispatch` — or spawned by this
-  //    plugin itself (§4 r30 д: `originPluginId = "orchestrator"`) — is an
-  //    executor; its level decides auditor vs executor.
+  //    plugin itself (§4 r30 д: `originPluginId = "orchestrator"`) — is
+  //    an executor; its level decides auditor vs executor. §19.1: an
+  //    own spawn titled `helper#<id> · …` backed by a helpers row is a
+  //    helper.
   if (
     facts.originPluginId === "tasks" ||
     facts.originPluginId === "orchestrator"
   ) {
+    const helperId = helperIdFromTitle(facts.title);
+    if (helperId !== null && probes.helperById?.(helperId)) {
+      return "helper";
+    }
     const key = taskKeyFromTitle(facts.title);
     const row = key ? probes.activeDelegationByTaskKey(key) : undefined;
     return row ? roleForLevel(row.level, probes.policy?.()) : "executor";
   }
-  // 2. A side chat / session handoff inherits the source thread's role;
-  //    no recorded source role — keep walking the rule.
+  // 2. A side chat / session handoff inherits the source thread's role —
+  //    §19.3: including `none` (a none source stays none; strict mode
+  //    never falls back to a plugin role).
   if (facts.sourceThreadId) {
     const source = probes.threadRole(facts.sourceThreadId);
-    if (source && isRoleId(source.role)) return source.role;
+    if (source) {
+      if (source.role === NO_ROLE) return NO_ROLE;
+      if (isRoleId(source.role)) return source.role;
+    }
   }
-  // 3. Any other child thread executes. §17.1 r26 (PLUG-215 С2): the
-  //    parent rule beats userThreadPlugins — a user-continuation
-  //    plugin's thread WITH a parent is a handed-off worker, not a
-  //    human chat.
-  if (facts.parentThreadId) return "executor";
+  // 3. Any other child thread executes — except §19.4: a `none`
+  //    parent's children are `none` too. (The §19.5 gate in
+  //    `handleMessageDispatch` refuses manual children of role parents
+  //    before this rule is reached; only plugin children and opt-ins
+  //    arrive here.)
+  if (facts.parentThreadId) {
+    const parent = probes.threadRole(facts.parentThreadId);
+    if (parent?.role === NO_ROLE) return NO_ROLE;
+    return "executor";
+  }
   // §17.1 r26 (PLUG-211 Б2): a user-continuation plugin's thread IS a
   //    human chat — the source's role already applied when decidable;
-  //    without it the thread gets the orchestrator default, like a chat
-  //    opened from the window (`policyOk` gates it the same way).
+  //    without it the thread gets the configured default.
   if (facts.originPluginId && userPlugins.includes(facts.originPluginId)) {
-    return policyOk ? DEFAULT_ROLE : null;
+    return defaultRole ?? null;
   }
-  // 4. A chat from the new-thread window takes the project's current pick.
-  //    §16.7: while the policy is invalid the DEFAULT is no role — an
-  //    explicit pick still applies, the setup skill alone is issued.
+  // 4. A chat from the new-thread window takes the project's current
+  //    pick; §19.3: `none` («Без плагина») is a real pick now.
   if (facts.origin === "app") {
     const pending = probes.pendingRole(facts.projectId);
-    // §16.7 (PLUG-182): the new-chat window writes `orchestrator` itself
-    // on open — while the policy is invalid that pick is the default, not
-    // a choice, so the thread stays role-less (setup skill only). Other
-    // picks are real choices and still apply.
+    if (pending === NO_ROLE) return NO_ROLE;
     if (
       pending !== undefined &&
       isRoleId(pending) &&
-      (policyOk || pending !== DEFAULT_ROLE)
+      pending !== "helper" &&
+      pending !== "release-auditor"
     ) {
       return pending;
     }
-    return policyOk ? DEFAULT_ROLE : null;
+    return defaultRole ?? null;
   }
-  // 5. §17.1 (аудит Б3): the default orchestrator role is for threads a
-  //    human or an agent opened — `app` above (the new-chat window) and
-  //    `cli` (`bb thread spawn`) here. Plugin-, sdk- and automation-born
-  //    threads (advisor, live-call, perspectives, …) get NO role: no
-  //    dispatch tools, no coordinator instructions. The recorded `none`
-  //    row is what stops the §3 fallback criterion from handing them the
-  //    coordinator issuance at `configure`.
-  if (facts.origin === "cli") return policyOk ? DEFAULT_ROLE : null;
+  // 5. §19.4 (r33): a CLI thread without a parent gets NO role — bb
+  //    cannot tell an agent from a human. Plugin-, sdk- and
+  //    automation-born threads keep `none` as before.
   return NO_ROLE;
 }
 
 /**
- * The `message.dispatch` hook itself (§13.2 п.2). Fail-closed by the SDK —
- * a throw or a >10 s answer fails the attempt, and the pass runs under one
- * server lock — so the handler answers "proceed" on every path and touches
- * only synchronous SQLite: no CLI, no network, no `await`. `record` writes
- * the decided row (`source = hook`); display metadata is not written here —
- * it rides on the next `configure` (§13.2 п.4).
+ * The `message.dispatch` hook itself (§13.2 п.2 + §19.5). Fail-closed by
+ * the SDK — a throw or a >10 s answer fails the attempt, and the pass
+ * runs under one server lock — so the handler touches only synchronous
+ * SQLite: no CLI, no network, no `await`.
+ *
+ * §19.5 (r33): the FIRST message of a manually spawned child whose
+ * parent has a plugin role is REJECTED — a bare `bb thread spawn` from
+ * a role thread is exactly the unsupervised-helper pattern r33 removes.
+ * The child passes only when the plugin created it
+ * (`originPluginId === "orchestrator"`), its spawning plugin is in
+ * `userThreadPlugins`, or the operator enabled `allowForeignChildren`.
+ * `onRejectedChild` runs the follow-up (background archival) outside the
+ * hook's sync budget.
  */
 export function handleMessageDispatch(
   context: MessageDispatchHookContext,
   probes: RoleDecisionProbes,
   record: (threadId: string, role: RoleId | typeof NO_ROLE) => void,
   warn?: (message: string) => void,
+  opts?: {
+    onRejectedChild?: (threadId: string) => void;
+    rejectMessage?: string;
+  },
 ): MessageDispatchHookDecision {
   try {
+    // §19.3.6: every seen thread's createdAt goes to `thread_facts` —
+    // the synchronous configure reads it for the old/new cutoff.
+    if (context.thread.createdAt !== undefined) {
+      probes.noteThreadSeen?.(
+        context.thread.id,
+        context.thread.createdAt,
+      );
+    }
+    if (
+      context.attempt === "start-turn" &&
+      context.thread.status === "pending" &&
+      context.thread.parentThreadId &&
+      !probes.threadRole(context.thread.id)
+    ) {
+      const parentRole = probes.threadRole(
+        context.thread.parentThreadId,
+      )?.role;
+      const pluginId = context.thread.originPluginId;
+      const userPlugins =
+        probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
+      if (
+        parentRole !== undefined &&
+        isRoleId(parentRole) &&
+        pluginId !== "orchestrator" &&
+        !(pluginId !== null && userPlugins.includes(pluginId)) &&
+        !(probes.allowForeignChildren?.(pluginId) ?? false)
+      ) {
+        opts?.onRejectedChild?.(context.thread.id);
+        return {
+          action: "reject",
+          message:
+            opts?.rejectMessage ??
+            "a child of an orchestrator role thread is created by the " +
+              "plugin only — use orchestrator_helper instead of " +
+              "`bb thread spawn`/`bb tasks dispatch`",
+        };
+      }
+    }
     const role = decideRole(
       {
         threadId: context.thread.id,

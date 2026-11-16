@@ -2375,6 +2375,18 @@ export function createWatchdog(deps: WatchdogDeps) {
       return; // queue holds the resume message — give it time to deliver
     }
     if (queue.length === 0) {
+      // §19.1 (r33): active helpers keep the delegation `running` — the
+      // executor's turn end is NOT an outcome while its helpers work.
+      // The `helpers-pending` mark is "waiting" while helpers run;
+      // `checkTimers` stamps the moment they ALL finish and counts the
+      // post-helper first-response window from THERE (not from the
+      // executor's idle) — one mark per step, no duplicates.
+      if (store.activeHelpersByDelegation(row.id).length > 0) {
+        if (!store.findSetupError(row, "helpers-pending")) {
+          store.addSetupError(row.id, "helpers-pending", "waiting");
+        }
+        return;
+      }
       // §5.3 r23 `errored`: the turn may have ended with an error while
       // the thread went idle — the journal tail decides between a resume
       // nudge (→ `failed` on repeat) and `done`.
@@ -2741,6 +2753,44 @@ export function createWatchdog(deps: WatchdogDeps) {
     for (const row of store.listActive()) {
       if (row.status !== "running") continue;
       const firstMs = firstMsOf(row);
+      // §19.1 (r33): the helpers wait — while helpers are active the
+      // executor's finished turn is not silence; once they finish the
+      // executor gets the first-response window to resume, then the
+      // normal outcome calculation continues (evaluateIdle).
+      const helpersPending = store.findSetupError(row, "helpers-pending");
+      if (helpersPending) {
+        if (store.activeHelpersByDelegation(row.id).length > 0) {
+          // Helpers still work — or came back after a zero moment:
+          // keep (or reset) the plain "waiting" mark, no window yet.
+          if (helpersPending.message !== "waiting") {
+            store.removeSetupErrors(row.id, "helpers-pending");
+            store.addSetupError(row.id, "helpers-pending", "waiting");
+          }
+          continue;
+        }
+        if (helpersPending.message === "waiting") {
+          // The helpers just reached zero — the post-helper window
+          // starts NOW.
+          store.removeSetupErrors(row.id, "helpers-pending");
+          store.addSetupError(row.id, "helpers-pending", String(nowMs));
+          continue;
+        }
+        const markedAt = Number(helpersPending.message) || nowMs;
+        const resumed =
+          row.turn_started_at != null && row.turn_started_at > markedAt;
+        if (resumed || nowMs - markedAt <= firstMs) {
+          if (resumed) store.removeSetupErrors(row.id, "helpers-pending");
+          continue;
+        }
+        store.removeSetupErrors(row.id, "helpers-pending");
+        const streamRead = await processStream(row);
+        const fresh = store.get(row.id);
+        const thread = await getThread(row.thread_id);
+        if (fresh && fresh.status === "running" && thread) {
+          await evaluateIdle(fresh, thread, streamRead);
+        }
+        continue;
+      }
       if (
         row.turn_started_at != null &&
         row.first_response_at == null &&

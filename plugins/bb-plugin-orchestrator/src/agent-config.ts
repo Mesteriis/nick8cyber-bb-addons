@@ -31,6 +31,7 @@ export const COORDINATOR_TOOLS = [
   "orchestrator_status",
   "orchestrator_cancel",
   "orchestrator_merge",
+  "orchestrator_helper",
 ] as const;
 
 /**
@@ -105,6 +106,29 @@ export interface ExecutorProbes {
    * the default `["handoff", "external-compact"]`.
    */
   userThreadPlugins?(): readonly string[];
+  /** §19.3.6: the thread's `createdAt` as the hook recorded it in
+   * `thread_facts` — undefined when the hook never saw the thread. */
+  threadCreatedAt?(threadId: string): number | undefined;
+  /** §19.3.6: the r33 migration stamp (`plugin_meta['migration-r33']`);
+   * threads older than it keep the §3 fallback criterion. */
+  r33Mark?(): number | undefined;
+}
+
+/** §19.3.6: a thread younger than the r33 mark is «new» — the hook was
+ * obliged to write its role, so a missing row means `none`, never the
+ * §3 coordinator fallback. `undefined` facts read as OLD (pre-r33
+ * installs have no `thread_facts` rows at all). */
+export function isR33NewThread(
+  facts: ThreadFacts,
+  probes: ExecutorProbes,
+): boolean {
+  const mark = probes.r33Mark?.();
+  const createdAt = probes.threadCreatedAt?.(facts.threadId);
+  return (
+    mark !== undefined &&
+    createdAt !== undefined &&
+    createdAt >= mark
+  );
 }
 
 /**
@@ -168,16 +192,9 @@ export function effectiveRoleId(
     probes.writeRole?.(facts.threadId, NO_ROLE);
     return NO_ROLE;
   }
-  if (
-    roleId === NO_ROLE &&
-    pluginBorn &&
-    (facts.parentThreadId === null ||
-      facts.parentThreadId === undefined) &&
-    userPlugins.includes(facts.originPluginId!)
-  ) {
-    probes.writeRole?.(facts.threadId, "orchestrator");
-    return "orchestrator";
-  }
+  // r33 (§19.3): a recorded `none` is a REAL verdict — the window pick,
+  // `role set … none`, or a CLI thread's own decision — and is never
+  // rewritten. The r26 none→orchestrator rewrite is gone with it.
   return roleId;
 }
 
@@ -190,6 +207,10 @@ export function isCoordinator(
   // `thread_roles` row fall back to the executor markers.
   const roleId = effectiveRoleId(facts, probes);
   if (roleId !== undefined) return roleDelegates(roleId);
+  // §19.3.6 (r33): the §3 fallback criterion below applies ONLY to
+  // threads older than the r33 migration — a new thread without a role
+  // row (the hook failed) is `none`, not a coordinator.
+  if (isR33NewThread(facts, probes)) return false;
   if (
     !isCoordinatorByStaticFacts(
       facts,
@@ -231,6 +252,9 @@ export interface AgentConfigDeps {
   /** §18.1 (PLUG-247a): the skill ids to declare — default the English
    * set (tests and bare calls keep the historical names). */
   skills?: SkillSet;
+  /** §19.3.6: journal warning when a new thread has no role row (the
+   * hook should have written one — its failure surfaces here). */
+  warn?(message: string): void;
 }
 
 export function buildAgentConfiguration(
@@ -249,6 +273,37 @@ export function buildAgentConfiguration(
   // correction, not a decision). No row → the §3 fallback criterion.
   const roleId = effectiveRoleId(facts, deps.probes);
   const role = roleId !== undefined ? ROLES[roleId as RoleId] : undefined;
+  // §19.3 (r33): `none` — a recorded pick or a NEW thread without a row
+  // (the hook failed) — gets NOTHING from the plugin, whatever the
+  // policy state. The missing row on a new thread is also the §19.3.6
+  // journal warning: the hook should have written it.
+  if (roleId === NO_ROLE) return { tools: [], skills: [] };
+  const skills = deps.skills ?? SKILLS_EN;
+  const newThreadRoleless =
+    roleId === undefined && isR33NewThread(facts, deps.probes);
+  if (newThreadRoleless) {
+    deps.warn?.(
+      `orchestrator: role hook did not record a role for new thread ` +
+        `${facts.threadId} — treating as none`,
+    );
+  }
+  // §19.3.5 + §19.3.8 (r33): an invalid policy gives a CHILD thread
+  // nothing at all; a root orchestrator or an undecided root gets ONLY
+  // the setup skill; a recorded executor/auditor ROOT keeps its normal
+  // issuance — it does not need the policy to work.
+  if (deps.policyOk === false) {
+    if (
+      facts.parentThreadId !== null &&
+      facts.parentThreadId !== undefined
+    ) {
+      return { tools: [], skills: [] };
+    }
+    if (roleId === undefined || roleId === "orchestrator") {
+      return { tools: [], skills: [skills.setup] };
+    }
+  } else if (newThreadRoleless) {
+    return { tools: [], skills: [] };
+  }
   const coordinator =
     roleId !== undefined
       ? role?.delegates === true
@@ -270,13 +325,6 @@ export function buildAgentConfiguration(
     return config;
   }
 
-  // §16.7 r25 (PLUG-182): policy invalid + a coordinator (a role-less
-  // root thread OR a recorded `orchestrator` role — the new-chat window
-  // writes that pick itself) → setup skill only, no tools or texts.
-  const skills = deps.skills ?? SKILLS_EN;
-  if (deps.policyOk === false) {
-    return { tools: [], skills: [skills.setup] };
-  }
 
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],

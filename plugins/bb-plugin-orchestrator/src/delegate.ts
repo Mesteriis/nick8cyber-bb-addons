@@ -33,8 +33,13 @@ import {
   type PolicyRoute,
 } from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
-import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
-import { roleForLevel } from "./roles.js";
+import {
+  isCoordinator,
+  isR33NewThread,
+  type ExecutorProbes,
+  type ThreadFacts,
+} from "./agent-config.js";
+import { NO_ROLE, roleForLevel } from "./roles.js";
 import {
   presetModelMap,
   runChecked,
@@ -246,8 +251,22 @@ export async function runDelegate(
   const { store, bbCli } = deps;
 
   // Caller gate (§4): only a coordinator may delegate, even from a CLI shell
-  // running inside an executor thread.
+  // running inside an executor thread. §19.3: a thread with the explicit
+  // `none` role — or a NEW thread the r33 hook saw but could not assign —
+  // gets the stable `no-role` code instead of `not-a-coordinator`.
   if (!isCoordinator(params.caller, deps.probes)) {
+    const recorded = deps.probes.roleByThreadId?.(params.caller.threadId);
+    if (
+      recorded === NO_ROLE ||
+      (recorded === undefined &&
+        isR33NewThread(params.caller, deps.probes))
+    ) {
+      throw new OrchestratorError(
+        "no-role",
+        `thread ${params.caller.threadId} has no orchestrator role`,
+        "a role is assigned on the thread's first message — or pick one in the new-chat window",
+      );
+    }
     throw new OrchestratorError(
       "not-a-coordinator",
       t("del.notCoordinator", { threadId: params.caller.threadId }),
@@ -420,9 +439,11 @@ export async function runDelegate(
   }
 
   // Limits (§4 step 1) — over the limit is a refusal, not a queue (§10).
+  // §19.1 (r33): helpers occupy the same `limits.maxActive` pool —
+  // active helpers count together with delegations.
   const maxActive = policy.limits?.maxActive;
   if (maxActive !== undefined) {
-    const count = store.activeCount();
+    const count = store.activeCount() + store.helperActiveCount();
     if (count >= maxActive) {
       throw new OrchestratorError(
         "limit-exceeded",

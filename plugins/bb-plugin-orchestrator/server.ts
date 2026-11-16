@@ -9,6 +9,7 @@
 import { z } from "zod";
 import { join as joinPath } from "node:path";
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -37,6 +38,7 @@ import {
 import {
   buildAgentConfiguration,
   fallbackAgentConfiguration,
+  isCoordinator,
   migratePluginThreadRoles,
   skillSet,
   type ExecutorProbes,
@@ -65,14 +67,27 @@ import {
   type WatchdogThreads,
 } from "./src/watchdog.js";
 import {
+  cancelHelper,
+  createHelperWatchdog,
+  DEFAULT_HELPERS,
+  parseHelpersSettings,
+  runHelper,
+  runRoleSet,
+  type HelperCallerFacts,
+  type HelpersSettings,
+  type HelperThreads,
+} from "./src/helper.js";
+import {
   DEFAULT_HANDOFF_PATH,
   DEFAULT_USER_THREAD_PLUGINS,
   HANDOFF_PATH_MAX,
   handleMessageDispatch,
   handoffPathError,
   isRoleId,
+  NO_ROLE,
   parseRoleTexts,
   PICKABLE_ROLE_IDS,
+  WINDOW_ROLE_IDS,
   reviewLevelName,
   ROLE_INSTRUCTIONS_MAX,
   roleForLevel,
@@ -122,39 +137,61 @@ export const rpcContract = defineRpcContract({
   setPendingRole: {
     input: z.object({
       projectId: z.string().nullable(),
-      role: z.enum(["orchestrator", "executor", "auditor"]),
+      role: z.enum(["none", "orchestrator", "executor", "auditor"]),
     }),
     output: z.object({ ok: z.literal(true) }),
   },
   pendingRole: {
     input: z.object({ projectId: z.string().nullable() }),
     output: z.object({
-      role: z.enum(["orchestrator", "executor", "auditor"]).nullable(),
+      role: z
+        .enum(["none", "orchestrator", "executor", "auditor"])
+        .nullable(),
     }),
   },
 });
 
 /** The `pending_roles` RPC handlers; `projectId = null` (projectless
- * compose) stores nothing and reads back the default. */
-export function pendingRoleRpc(store: DelegationStore) {
+ * compose) stores nothing and reads back the default. §19.3.2 (r33):
+ * with no remembered pick the window shows the CONFIGURED
+ * `defaultRole` — `none` («Без плагина») included — never a hardcoded
+ * executor; an invalid setting reports `null`. */
+export function pendingRoleRpc(
+  store: DelegationStore,
+  defaultRole?: () => "none" | RoleId | undefined,
+) {
   return {
     setPendingRole({
       projectId,
       role,
     }: {
       projectId: string | null;
-      role: RoleId;
+      role: RoleId | "none";
     }) {
       if (projectId !== null) store.setPendingRole(projectId, role);
       return { ok: true as const };
     },
     pendingRole({ projectId }: { projectId: string | null }) {
-      const role =
+      const remembered =
         projectId === null ? undefined : store.pendingRole(projectId);
+      const picked =
+        remembered === "none" ||
+        (remembered !== undefined &&
+          isRoleId(remembered) &&
+          remembered !== "release-auditor" &&
+          remembered !== "helper")
+          ? (remembered as "none" | "orchestrator" | "executor" | "auditor")
+          : undefined;
+      if (picked !== undefined) return { role: picked };
+      const fallback = defaultRole?.();
       return {
         role:
-          role !== undefined && isRoleId(role) && role !== "release-auditor"
-            ? role
+          fallback === "none" ||
+          (fallback !== undefined &&
+            isRoleId(fallback) &&
+            fallback !== "release-auditor" &&
+            fallback !== "helper")
+            ? (fallback as "none" | "orchestrator" | "executor" | "auditor")
             : null,
       };
     },
@@ -336,6 +373,33 @@ export async function createPlugin(
       experimental_multiline: true,
       default: '{"enabled": false}',
     },
+    // §19.3 (r33): the role a root chat gets when the window never
+    // picked — executor by default, `none` allowed, never orchestrator
+    // silently.
+    defaultRole: {
+      type: "string",
+      label: "Default role",
+      description:
+        "§19.3: the role applied to a new-chat/app thread without a remembered pick — `executor` (default), `orchestrator`, `auditor` or `none`. Anything else is a needs-configuration state (no role assigned).",
+      default: "executor",
+    },
+    // §19.1 (r33): the per-caller helper cap and the default level.
+    helpers: {
+      type: "string",
+      label: "Helpers",
+      description:
+        "§19.1: helpers JSON {maxActive?, defaultLevel?} — maxActive is the PER-CALLER cap (default 3); helpers also count inside the policy limits.maxActive. An invalid document warns in the journal and uses defaults.",
+      default: "",
+    },
+    // §19.5 (r33): manual children of role threads pass only for the
+    // listed origin plugin ids.
+    allowForeignChildren: {
+      type: "string",
+      label: "Allow foreign children",
+      description:
+        "§19.5: comma-separated originPluginId allowlist whose threads may run as children of orchestrator-role threads (empty — the message.dispatch hook refuses their first message and archives the thread). `true` accepts a legacy boolean as allow-all.",
+      default: "",
+    },
   });
 
   let currentSettings = await settings.get();
@@ -434,6 +498,21 @@ export async function createPlugin(
       store.setThreadRole(threadId, role, "hook"),
     // §17.1 r26 (PLUG-211 Б2): plugins continuing a human chat.
     userThreadPlugins: () => userPlugins(),
+    // §19.3.6 (r33): the old/new cutoff for the §3 fallback criterion.
+    threadCreatedAt: (threadId) => store.threadCreatedAt(threadId),
+    r33Mark: () => Number(store.metaGet("migration-r33")) || undefined,
+  };
+
+  // §19.3 (r33): the configurable default — `executor` when unset,
+  // `none` allowed; an INVALID value is `undefined` — the
+  // needs-configuration state (no role is written, the journal warns).
+  const defaultRole = (): RoleId | "none" | undefined => {
+    const v = currentSettings.defaultRole;
+    if (v === undefined || v === "") return "executor";
+    if (v === NO_ROLE) return NO_ROLE;
+    return isRoleId(v) && v !== "helper" && v !== "release-auditor"
+      ? v
+      : undefined;
   };
 
   // §13.2 п.1-2: the role decision's read side — synchronous SQLite only,
@@ -447,6 +526,23 @@ export async function createPlugin(
     policy: () => policyLoad.policy,
     // §17.1 r26 (PLUG-211 Б2): plugins continuing a human chat.
     userThreadPlugins: () => userPlugins(),
+    // §19.3-19.5 (r33): configured default, helper titles, the foreign
+    // children opt-in, and the configure-time age probe.
+    defaultRole,
+    helperById: (id) => store.helper(id),
+    // §19.5: the allowlist of origin plugin ids; a legacy boolean
+    // `true` keeps working as allow-all.
+    allowForeignChildren: (pluginId) => {
+      const v = currentSettings.allowForeignChildren;
+      if ((v as unknown) === true) return true;
+      if (pluginId === null) return false;
+      const list = String(v ?? "")
+        .split(/[\s,]+/)
+        .filter(Boolean);
+      return list.includes(pluginId) || list.includes("*");
+    },
+    noteThreadSeen: (threadId, createdAt) =>
+      store.noteThreadSeen(threadId, createdAt),
   };
 
   // §17.1 r26 (PLUG-211 Б1): one-time rewrite — hook-decided
@@ -564,7 +660,9 @@ export async function createPlugin(
       reviewLevel: reviewLevelName(policyLoad.policy),
     };
     const extra =
-      id === "release-auditor" ? undefined : roleTextsLoad.texts[id];
+      id === "release-auditor" || id === "helper"
+        ? undefined
+        : roleTextsLoad.texts[id];
     const text = roleInstructions(id, { extra, ...opts, t });
     // Подстановки могли вырасти уже после разбора (смена политики,
     // handoffPath) — текст за пределом 2500 теряет дополнение, чтобы
@@ -752,6 +850,22 @@ export async function createPlugin(
     for (const e of roleTextsLoad.errors) {
       bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
     }
+    helpersLoad = parseHelpersSettings(currentSettings.helpers ?? "", t);
+    for (const e of helpersLoad.errors) {
+      bb.log.warn(`orchestrator helpers: ${e.path}: ${e.message}`);
+    }
+    // §19.3: an unnameable defaultRole is a needs-configuration state —
+    // no role is assigned while it stands.
+    if (
+      currentSettings.defaultRole !== undefined &&
+      currentSettings.defaultRole !== "" &&
+      defaultRole() !== currentSettings.defaultRole
+    ) {
+      bb.log.warn(
+        `orchestrator defaultRole: "${currentSettings.defaultRole}" ` +
+          `is not a pickable role — needs-configuration (no role assigned)`,
+      );
+    }
     void execSettingsCheck();
     for (const e of janitorConfig().errors) {
       bb.log.warn(`orchestrator janitor: ${e.path}: ${e.message}`);
@@ -774,9 +888,14 @@ export async function createPlugin(
         injectInstructions: currentSettings.injectInstructions ?? true,
         instructionsText: instructionsText(),
         probes,
-        policyOk: policyLoad.policy !== null,
+        // §19.3.5/§19.3.8 (r33): an INVALID defaultRole is also a
+        // needs-configuration state — it narrows configure like an
+        // invalid policy.
+        policyOk:
+          policyLoad.policy !== null && defaultRole() !== undefined,
         roleInstructions: roleTextFor,
         skills: skillSet(lang),
+        warn: (m) => bb.log.warn(m),
       });
       // §13.2 п.4: reflect the decided role into display metadata. The
       // hook itself may not touch the network, so the write rides on the
@@ -808,7 +927,7 @@ export async function createPlugin(
         context,
         currentSettings.injectInstructions ?? true,
         instructionsText(),
-        policyLoad.policy !== null,
+        policyLoad.policy !== null && defaultRole() !== undefined,
         userPlugins(),
         roleTextFor("orchestrator"),
         skillSet(lang),
@@ -824,6 +943,22 @@ export async function createPlugin(
       roleProbes,
       (threadId, role) => store.setThreadRole(threadId, role, "hook"),
       (m) => bb.log.warn(`orchestrator: role hook skipped: ${m}`),
+      {
+        // §19.5: the refused manual child is archived in the background —
+        // deferred so the hook's own decision lands before the archival.
+        onRejectedChild: (threadId) => {
+          setTimeout(() => {
+            void bb.sdk.threads
+              .archive({ threadId })
+              .catch((e) =>
+                bb.log.warn(
+                  `orchestrator: rejected child archive: ${describeError(e)}`,
+                ),
+              );
+          }, 0);
+        },
+        rejectMessage: t("role.foreignChild"),
+      },
     ),
   );
 
@@ -837,6 +972,113 @@ export async function createPlugin(
       originPluginId: thread.originPluginId,
       projectId: thread.projectId,
     };
+  };
+
+  /** §19.1: the helper gate's caller facts — additionally the fork
+   * source and the reuse environment target. */
+  const helperCallerFacts = async (
+    threadId: string,
+  ): Promise<HelperCallerFacts> => {
+    const thread = await bb.sdk.threads.get({ threadId });
+    return {
+      threadId,
+      parentThreadId: thread.parentThreadId,
+      sourceThreadId: thread.sourceThreadId,
+      originPluginId: thread.originPluginId,
+      projectId: thread.projectId,
+      environmentId: thread.environmentId ?? null,
+      status: thread.status ?? null,
+      title: thread.title ?? thread.titleFallback ?? null,
+    };
+  };
+
+  const helperThreads: HelperThreads = {
+    get: (a) => bb.sdk.threads.get(a),
+    spawn: (a) =>
+      bb.sdk.threads.spawn(a as never) as never,
+    send: (a) => bb.sdk.threads.send(a as never),
+    stop: (a) => bb.sdk.threads.stop(a),
+    list: (a) => bb.sdk.threads.list(a) as never,
+    getPluginMetadata: (a) => bb.sdk.threads.getPluginMetadata(a),
+    updatePluginMetadata: (a) =>
+      bb.sdk.threads.updatePluginMetadata(a as never),
+    archive: (a) => bb.sdk.threads.archive(a),
+    events: {
+      list: (a) => bb.sdk.threads.events.list(a as never) as never,
+    },
+  };
+  let helpersLoad = parseHelpersSettings(
+    currentSettings.helpers ?? "",
+    t,
+  );
+  for (const e of helpersLoad.errors) {
+    bb.log.warn(`orchestrator helpers: ${e.path}: ${e.message}`);
+  }
+  const helperDeps = {
+    store,
+    threads: helperThreads,
+    enqueue,
+    loadPolicy: () => loadPolicy(true),
+    helpers: (): HelpersSettings => helpersLoad.config,
+    callerFacts: helperCallerFacts,
+    // §19.1: the route's preset resolves into the spawn's provider/model
+    // fields through `bb tasks preset show` — the spawn schema carries
+    // no `preset` field.
+    presetShow: async (preset: string) => {
+      const shown = await runJson<{
+        preset?: {
+          providerId?: string;
+          modelId?: string | null;
+          reasoningLevel?: string | null;
+          serviceTier?: string | null;
+          permissionMode?: string;
+          instructions?: string;
+        };
+      }>(bbCli, ["tasks", "preset", "show", preset, "--json"]);
+      return shown.preset;
+    },
+    // §19.1 pre-r33 compatibility: a row-less thread that the §3
+    // criterion still recognizes as a coordinator keeps the helper.
+    isCoordinatorFallback: (c: HelperCallerFacts) =>
+      isCoordinator(
+        {
+          threadId: c.threadId,
+          parentThreadId: c.parentThreadId ?? null,
+          title: c.title ?? null,
+          originPluginId: c.originPluginId,
+          projectId: c.projectId,
+        },
+        probes,
+      ),
+    t,
+  };
+  const helper = (input: Parameters<typeof runHelper>[0]) =>
+    runHelper(input, helperDeps);
+  const helperCancel = (ref: string, callerThreadId?: string) =>
+    cancelHelper(ref, helperDeps, callerThreadId);
+  const roleSet = (input: Parameters<typeof runRoleSet>[0]) =>
+    runRoleSet(input, helperDeps);
+  const helperWatchdog = createHelperWatchdog({
+    ...helperDeps,
+    callerSend: async (threadId, text) =>
+      bb.sdk.threads.send({
+        threadId,
+        mode: "queue-if-active",
+        input: [
+          { type: "text", text: `[orchestrator] ${text}`, mentions: [] },
+        ],
+      }),
+  });
+  // §19.1 cascade: a delegation leaving the active statuses cancels its
+  // helpers — every terminal outcome, reissues included.
+  store.onDelegationFinished = (id) => {
+    void helperWatchdog
+      .cancelHelpersOfDelegation(id)
+      .catch((e) =>
+        bb.log.warn(
+          `orchestrator: delegation#${id} helper cascade: ${describeError(e)}`,
+        ),
+      );
   };
 
   const delegate = (input: {
@@ -1196,6 +1438,36 @@ export async function createPlugin(
         bb.events.on("thread.deleted", ({ thread }) =>
           run(live(() => watchdog.onThreadGone(thread, "deleted"))),
         );
+        // §19.1 (r33): the helper watchdog rides the same events — its
+        // rows live in `helpers`, disjoint from `delegations`.
+        bb.events.on("thread.active", ({ thread }) =>
+          run(live(() => helperWatchdog.onThreadActive(thread))),
+        );
+        bb.events.on("thread.idle", ({ thread }) =>
+          run(live(() => helperWatchdog.onThreadIdle(thread))),
+        );
+        bb.events.on("thread.failed", ({ thread, error }) =>
+          run(
+            live(() =>
+              helperWatchdog.onThreadFailed(
+                thread,
+                error === null ? undefined : { message: error },
+              ),
+            ),
+          ),
+        );
+        bb.events.on("turn.failed", (e) =>
+          run(live(() => helperWatchdog.onTurnFailed(e))),
+        );
+        bb.events.on("interaction.pending", ({ thread }) =>
+          run(live(() => helperWatchdog.onInteractionPending(thread))),
+        );
+        bb.events.on("thread.archived", ({ thread }) =>
+          run(live(() => helperWatchdog.onThreadGone(thread, "archived"))),
+        );
+        bb.events.on("thread.deleted", ({ thread }) =>
+          run(live(() => helperWatchdog.onThreadGone(thread, "deleted"))),
+        );
       }
       // §7: a reconcile pass at start, then every 60 s; the §5.1/§5.3
       // timers run on a shorter beat. Busy guards keep a slow pass from
@@ -1215,12 +1487,14 @@ export async function createPlugin(
       };
       beat(async () => {
         await watchdog.reconcile();
+        await helperWatchdog.reconcile();
         await pumpRelease();
       });
       maybeCheckPresets();
       const reconcileTimer = setInterval(() => {
         beat(async () => {
           await watchdog.reconcile();
+          await helperWatchdog.reconcile();
           await pumpRelease();
         });
         maybeCheckPresets();
@@ -1229,6 +1503,7 @@ export async function createPlugin(
         () =>
           beat(async () => {
             await watchdog.checkTimers();
+            await helperWatchdog.checkTimers();
             await pumpRelease();
           }),
         5_000,
@@ -1351,7 +1626,7 @@ export async function createPlugin(
   // ── RPC (§13.2 п.1): the composer's «Роль» picker. ─────────────────
   // `projectId = null` is a projectless compose — the default role
   // applies and nothing is stored.
-  bb.rpc.register(rpcContract, pendingRoleRpc(store));
+  bb.rpc.register(rpcContract, pendingRoleRpc(store, defaultRole));
 
   // ── Agent tools (§6): coordinators only, via configure. ──────────────
 
@@ -1433,13 +1708,64 @@ export async function createPlugin(
     parameters: z.object({
       target: z
         .string()
-        .min(1)
+        .optional()
         .describe(t("tool.cancelTarget")),
+      helperId: z
+        .number()
+        .int()
+        .optional()
+        .describe(t("tool.cancelHelperId")),
     }),
     async execute(params, _ctx) {
       try {
+        if (params.helperId !== undefined) {
+          return JSON.stringify(
+            await helperCancel(String(params.helperId), _ctx.threadId),
+          );
+        }
+        if (params.target === undefined) {
+          throw new OrchestratorError(
+            "invalid-arguments",
+            t("cli.cancelUsage"),
+          );
+        }
         return JSON.stringify(
           await cancelDelegation(params.target, _ctx.threadId),
+        );
+      } catch (e) {
+        return JSON.stringify(errorJson(e));
+      }
+    },
+  });
+
+  // §19.1: the plugin-owned helper spawn — hidden child in the caller's
+  // OWN environment, no task, role `helper` fixed.
+  bb.agents.registerTool({
+    name: "orchestrator_helper",
+    description: t("tool.helper"),
+    instructions: t("tool.helperInstr"),
+    parameters: z.object({
+      prompt: z
+        .string()
+        .min(1)
+        .describe(t("tool.helperPrompt")),
+      title: z
+        .string()
+        .optional()
+        .describe(t("tool.helperTitle")),
+      level: z
+        .string()
+        .optional()
+        .describe(t("tool.helperLevel")),
+      preset: z
+        .string()
+        .optional()
+        .describe(t("tool.helperPreset")),
+    }),
+    async execute(params, ctx) {
+      try {
+        return JSON.stringify(
+          await helper({ ...params, threadId: ctx.threadId, via: "tool" }),
         );
       } catch (e) {
         return JSON.stringify(errorJson(e));
@@ -1486,10 +1812,19 @@ export async function createPlugin(
     const delegations = store.list(filter);
     const counts = store.countsByStatus();
     return {
-      active: store.activeCount(),
+      // §19.1 (r33): helpers occupy the same limits.maxActive pool —
+      // the active figure counts them together with delegations.
+      active: store.activeCount() + store.helperActiveCount(),
       counts,
       limits: policyLoad.policy?.limits ?? null,
       delegations,
+      // §19.6 (r33): the separate helpers block — id, caller, preset,
+      // status, age.
+      helpers: store.listHelpers({
+        coordinatorThreadId: filter.coordinatorThreadId,
+        limit: 50,
+      }),
+      helpersErrors: helpersLoad.errors,
       // §18.4: изменённые исполняемые настройки — имена и хеши,
       // без значений.
       execSettingsChanges: execSettingsChanges(store),
@@ -1701,6 +2036,18 @@ export async function createPlugin(
         summary: t("cli.helpJanitorS"),
         usage: "bb orchestrator janitor [run|report] [--dry-run] [--json]",
       },
+      {
+        name: "helper",
+        summary: t("cli.helpHelperS"),
+        usage:
+          "bb orchestrator helper (--prompt <text>|--prompt-file <path>) [--title <t>] [--level <l>|--preset <id>] [--json]\n" +
+          "  bb orchestrator helper cancel <id> [--json]",
+      },
+      {
+        name: "role",
+        summary: t("cli.helpRoleS"),
+        usage: "bb orchestrator role set <thread> none [--json]",
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
@@ -1714,11 +2061,87 @@ export async function createPlugin(
           argv[i - 1] !== "--instructions" &&
           argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from" &&
           argv[i - 1] !== "--into" && argv[i - 1] !== "--no-docs" &&
-          argv[i - 1] !== "--kb" && argv[i - 1] !== "--no-kb",
+          argv[i - 1] !== "--kb" && argv[i - 1] !== "--no-kb" &&
+          argv[i - 1] !== "--prompt" && argv[i - 1] !== "--prompt-file" &&
+          argv[i - 1] !== "--title",
       );
       const cmd = positional[0];
 
       try {
+        if (cmd === "helper") {
+          if (positional[1] === "cancel") {
+            const ref = positional[2];
+            if (!ref) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.helperCancelUsage"),
+              );
+            }
+            const res = await helperCancel(ref, ctx.threadId);
+            return json
+              ? jsonOk(res)
+              : {
+                  exitCode: 0,
+                  stdout:
+                    t("cli.helperCancelled", { id: res.helperId }) + "\n",
+                };
+          }
+          const promptFile = flag("--prompt-file");
+          let prompt = flag("--prompt");
+          if (prompt === undefined && promptFile !== undefined) {
+            try {
+              prompt = readFileSync(promptFile, "utf8");
+            } catch (e) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                `cannot read --prompt-file ${promptFile}: ${describeError(e)}`,
+              );
+            }
+          }
+          if (prompt === undefined || !prompt.trim()) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.helperUsage"),
+            );
+          }
+          const res = await helper({
+            prompt,
+            title: flag("--title"),
+            level: flag("--level"),
+            preset: flag("--preset"),
+            threadId: ctx.threadId,
+            via: "cli",
+          });
+          return json
+            ? jsonOk(res)
+            : { exitCode: 0, stdout: res.message + "\n" };
+        }
+
+        if (cmd === "role") {
+          if (positional[1] !== "set" || !positional[2] || !positional[3]) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.roleUsage"),
+            );
+          }
+          const res = await roleSet({
+            threadId: positional[2],
+            role: positional[3],
+            actor: ctx.threadId ?? "cli",
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout:
+                  t("cli.roleSet", {
+                    thread: res.threadId,
+                    role: res.role,
+                    previous: res.previous ?? "—",
+                  }) + "\n",
+              };
+        }
+
         if (cmd === "delegate") {
           const taskKey = positional[1];
           const level = flag("--level");
@@ -1797,6 +2220,19 @@ export async function createPlugin(
           for (const d of res.delegations) out += renderDelegation(d) + "\n";
           if (!res.delegations.length)
             out += t("status.noDelegations") + "\n";
+          // §19.6: the helpers block — id, caller, preset, status, age.
+          if (res.helpers.length) {
+            out += t("status.helpersHeader") + "\n";
+            const nowMs = Date.now();
+            for (const h of res.helpers) {
+              out +=
+                `  helper#${h.id} caller=${h.caller_thread_id} ` +
+                `preset=${h.preset} status=${h.status} ` +
+                `age=${Math.round((nowMs - h.created_at) / 1000)}s` +
+                (h.thread_id ? ` thread=${h.thread_id}` : "") +
+                "\n";
+            }
+          }
           return { exitCode: 0, stdout: out };
         }
 

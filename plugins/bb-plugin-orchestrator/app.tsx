@@ -16,13 +16,17 @@ import { createT, resolveLang } from "./src/i18n/index.js";
 
 type Contract = typeof rpcContract;
 
+// §19.3 (r33): «Без плагина» / "No plugin" — FIRST in the list; the
+// stored pick or the server default role fills the select, nothing is
+// written until the user actually changes it.
 const ROLE_OPTIONS = [
+  { id: "none", labelKey: "app.roleNone" },
   { id: "orchestrator", labelKey: "app.roleOrchestrator" },
   { id: "executor", labelKey: "app.roleExecutor" },
   { id: "auditor", labelKey: "app.roleAuditor" },
 ] as const;
 type RoleId = (typeof ROLE_OPTIONS)[number]["id"];
-const DEFAULT_ROLE: RoleId = "orchestrator";
+const DEFAULT_ROLE: RoleId = "executor";
 
 function RoleSelect() {
   const view = useComposerView();
@@ -39,18 +43,15 @@ function RoleSelect() {
       .catch(() => undefined);
   };
 
-  // §13.2 п.1: report the selection on mount and on every change. A
-  // reopened window restores the project's remembered pick first, then
-  // reports it — the stored row always mirrors what the list shows. A
-  // transient read failure must not clobber the stored pick: retry the
-  // read once after a second, and only then fall back to the default so
-  // the shown value is the one that will actually apply.
+  // §19.3 (r33): the select READS the remembered pick (or shows the
+  // server default) and writes ONLY on a user change — the window's own
+  // open used to write `orchestrator`, which is exactly the default
+  // r33 removed. A transient read failure retries once after a second.
   useEffect(() => {
     let alive = true;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     const apply = (next: RoleId) => {
       if (alive) setRole(next);
-      report(next);
     };
     const load = () =>
       rpc

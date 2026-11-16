@@ -188,7 +188,7 @@ test("decideRole: source role inherits; no source row → next branch", () => {
   );
 });
 
-test("decideRole: parent → executor; app → pending pick; else orchestrator", () => {
+test("decideRole: parent → executor; app → pending pick; else the r33 default", () => {
   assert.equal(
     decideRole(facts({ parentThreadId: "thr_p" }), noProbes),
     "executor",
@@ -201,10 +201,25 @@ test("decideRole: parent → executor; app → pending pick; else orchestrator",
     }),
     "auditor",
   );
-  // app + no pick → orchestrator
+  // §19.3: app + no pick → the configured default (executor absent a
+  // defaultRole probe); `none` is a real pick.
   assert.equal(
     decideRole(facts({ origin: "app" }), noProbes),
+    "executor",
+  );
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...noProbes,
+      defaultRole: () => "orchestrator",
+    }),
     "orchestrator",
+  );
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...noProbes,
+      pendingRole: (p) => (p === "proj_a" ? "none" : undefined),
+    }),
+    "none",
   );
   // a pick for ANOTHER project does not leak
   assert.equal(
@@ -212,11 +227,11 @@ test("decideRole: parent → executor; app → pending pick; else orchestrator",
       ...noProbes,
       pendingRole: (p) => (p === "proj_b" ? "executor" : undefined),
     }),
-    "orchestrator",
+    "executor",
   );
-  // §17.1 (аудит Б3): cli → orchestrator; plugin/sdk/automation-born →
-  // no role at all (the `none` row blocks the configure-time fallback).
-  assert.equal(decideRole(facts({ origin: "cli" }), noProbes), "orchestrator");
+  // §19.4 (r33): a CLI thread without a parent gets NO role; plugin/,
+  // sdk- and automation-born threads keep `none`.
+  assert.equal(decideRole(facts({ origin: "cli" }), noProbes), "none");
   for (const origin of ["plugin", "sdk", null]) {
     assert.equal(
       decideRole(facts({ origin }), noProbes),
@@ -468,14 +483,15 @@ test("injectInstructions=false: no texts for any role, tools stay", () => {
     probes: probes("orchestrator"),
   });
   assert.equal(orch.instructions, undefined);
-  assert.equal(orch.tools.length, 4);
+  assert.equal(orch.tools.length, 5);
   assert.deepEqual(orch.skills, ["orchestrator-setup"]);
   const exec = buildAgentConfiguration(ctxFor("thr_e"), {
     ...deps,
     probes: probes("executor"),
   });
   assert.equal(exec.instructions, undefined);
-  assert.deepEqual(exec.tools, []);
+  // §19.1: the executor's only tool — helpers through the plugin.
+  assert.deepEqual(exec.tools, ["orchestrator_helper"]);
   assert.deepEqual(exec.skills, []);
 });
 
@@ -495,7 +511,7 @@ test("a role row beats the fallback markers in both directions", () => {
       probes: { ...base, roleByThreadId: () => "executor" },
     },
   );
-  assert.deepEqual(exec.tools, []);
+  assert.deepEqual(exec.tools, ["orchestrator_helper"]);
   assert.equal(exec.instructions, ROLES.executor.instructions);
   // orchestrator role + executor-looking facts (a parent) → coordinator
   const orch = buildAgentConfiguration(
@@ -508,7 +524,7 @@ test("a role row beats the fallback markers in both directions", () => {
       probes: { ...base, roleByThreadId: () => "orchestrator" },
     },
   );
-  assert.equal(orch.tools.length, 4);
+  assert.equal(orch.tools.length, 5);
   assert.ok(orch.instructions!.includes("RULE"));
 });
 
@@ -545,11 +561,13 @@ test("§2.3 roleForLevel: policy-aware — auditor levels map to auditor", () =>
   assert.equal(roleForLevel("review-mid"), "executor");
 });
 
-test("§16.7: invalid policy → root chat default is no role; pick still applies", () => {
+test("§19.3 (r33): invalid policy — the hook still records the role", () => {
+  // r33 removed the §16.7 gating: an invalid policy no longer drops the
+  // decision — `configure` narrows the issuance to the setup skill.
   const badPolicy: RoleDecisionProbes = { ...noProbes, policy: () => null };
-  assert.equal(decideRole(facts({ origin: "app" }), badPolicy), null);
-  assert.equal(decideRole(facts({ origin: "cli" }), badPolicy), null);
-  // An explicit non-orchestrator pending pick still wins.
+  assert.equal(decideRole(facts({ origin: "app" }), badPolicy), "executor");
+  assert.equal(decideRole(facts({ origin: "cli" }), badPolicy), "none");
+  // An explicit pending pick still wins — orchestrator included.
   assert.equal(
     decideRole(facts({ origin: "app" }), {
       ...badPolicy,
@@ -557,16 +575,15 @@ test("§16.7: invalid policy → root chat default is no role; pick still applie
     }),
     "executor",
   );
-  // PLUG-182: the new-chat window writes `orchestrator` itself on open —
-  // under an invalid policy that pick is the default, not a choice.
   assert.equal(
     decideRole(facts({ origin: "app" }), {
       ...badPolicy,
       pendingRole: (p) => (p === "proj_a" ? "orchestrator" : undefined),
     }),
-    null,
+    "orchestrator",
   );
-  // Valid policy → defaults back to orchestrator.
+  // Valid policy → the configured default applies (executor without a
+  // defaultRole probe).
   const good = parsePolicy(
     JSON.stringify({
       version: 1,
@@ -576,7 +593,7 @@ test("§16.7: invalid policy → root chat default is no role; pick still applie
   ).policy;
   assert.equal(
     decideRole(facts({ origin: "app" }), { ...noProbes, policy: () => good }),
-    "orchestrator",
+    "executor",
   );
   // Valid policy → the window's orchestrator pick applies as before.
   assert.equal(
@@ -639,15 +656,24 @@ test("§17.1 r26 (Б2): a userThreadPlugins thread inherits the source role", ()
   );
 });
 
-test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestrator", () => {
+test("§19.3 (r33): a handoff thread without a decidable source → the configured default", () => {
   // §18.6: the DEFAULT list is empty — a listed plugin is configured
   // explicitly, like the author's install does.
   const userPlugins = () => ["handoff", "external-compact"];
   // no source thread — the continued human chat gets the default role
+  // (executor absent a defaultRole probe).
   assert.equal(
     decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
       ...noProbes,
       userThreadPlugins: userPlugins,
+    }),
+    "executor",
+  );
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
+      ...noProbes,
+      userThreadPlugins: userPlugins,
+      defaultRole: () => "orchestrator",
     }),
     "orchestrator",
   );
@@ -686,27 +712,28 @@ test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestr
     ),
     "none",
   );
-  // §16.7: an invalid policy leaves even a human-chat plugin role-less
+  // §19.3: an invalid policy no longer drops the decision — the hook
+  // records the configured default anyway.
   assert.equal(
     decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
       ...noProbes,
       userThreadPlugins: userPlugins,
       policy: () => null,
     }),
-    null,
+    "executor",
   );
 });
 
 test("§17.1 r26 (PLUG-215 Б1): a configured external-compact continues the human chat", () => {
   const userPlugins = () => ["handoff", "external-compact"];
   // `bb external-compact` continues the human chat in a new thread —
-  // without a decidable source it gets the orchestrator default.
+  // without a decidable source it gets the configured default.
   assert.equal(
     decideRole(
       facts({ origin: "plugin", originPluginId: "external-compact" }),
       { ...noProbes, userThreadPlugins: userPlugins },
     ),
-    "orchestrator",
+    "executor",
   );
   // …and inherits the source role when decidable.
   assert.equal(
@@ -759,7 +786,7 @@ test("§17.1 r26 (PLUG-215 С2): the parent rule beats userThreadPlugins", () =>
   }
 });
 
-test("§17.1 r26 (Б2): the hook records orchestrator for a handoff thread", () => {
+test("§19.3 (r33): the hook records the configured default for a handoff thread", () => {
   const { store, probes } = makeStore();
   const hook = (ctx: MessageDispatchHookContext) =>
     handleMessageDispatch(
@@ -779,7 +806,7 @@ test("§17.1 r26 (Б2): the hook records orchestrator for a handoff thread", () 
     }),
   );
   assert.deepEqual(decision, { action: "proceed" });
-  assert.equal(store.threadRole("thr_ho")!.role, "orchestrator");
+  assert.equal(store.threadRole("thr_ho")!.role, "executor");
 });
 
 test("§17.1 r26 (Б1): the one-time migration rewrites plugin orchestrator rows", async () => {

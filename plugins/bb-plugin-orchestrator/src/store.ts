@@ -274,6 +274,51 @@ export const MIGRATIONS: readonly string[] = [
   )`,
   `ALTER TABLE delegations ADD COLUMN verdict_event_at INTEGER`,
   `ALTER TABLE command_runs ADD COLUMN notify_on_fail INTEGER NOT NULL DEFAULT 0`,
+  // orchestrator §19.4 (r33, PLUG-267): helpers — plugin-created worker
+  // threads. The r33 migration also wipes `pending_roles` (the pre-r33
+  // window wrote `orchestrator` on open — indistinguishable from a user
+  // pick) and stamps `migration-r33`, the §19.3.6 fallback cutoff.
+  `CREATE TABLE IF NOT EXISTS helpers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    caller_thread_id TEXT NOT NULL,
+    caller_delegation_id INTEGER,
+    coordinator_thread_id TEXT NOT NULL,
+    thread_id TEXT,
+    project_id TEXT,
+    preset TEXT NOT NULL,
+    route TEXT,
+    level TEXT,
+    title TEXT,
+    status TEXT NOT NULL CHECK (status IN (
+      'dispatching','running','done','failed','stalled','quota','cancelled'
+    )),
+    resume_count INTEGER NOT NULL DEFAULT 0,
+    turn_started_at INTEGER,
+    last_seq INTEGER,
+    notified_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS helpers_thread_idx ON helpers(thread_id)`,
+  `CREATE INDEX IF NOT EXISTS helpers_caller_idx
+    ON helpers(caller_thread_id, status)`,
+  `CREATE INDEX IF NOT EXISTS helpers_delegation_idx
+    ON helpers(caller_delegation_id)`,
+  // §19.3.6: a configure-time age probe — the hook records every seen
+  // thread's `createdAt` (the configure context carries none), so a
+  // role-less thread is told "old" (pre-r33 → §3 fallback) from "new"
+  // (the hook should have written a role → `none` + a journal warning).
+  `CREATE TABLE IF NOT EXISTS thread_facts (
+    thread_id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+  )`,
+  `DELETE FROM pending_roles`,
+  `INSERT OR REPLACE INTO plugin_meta (key, value)
+   VALUES ('migration-r33',
+     CAST(CAST(strftime('%s','now') AS INTEGER) * 1000 AS TEXT))`,
+  // §19.6 (r33): the once-archived mark — the 24 h cleanup pass selects
+  // terminal helpers without it instead of re-archiving every minute.
+  `ALTER TABLE helpers ADD COLUMN archived_at INTEGER`,
 ];
 
 export type CommandRunStatus =
@@ -477,6 +522,46 @@ export interface ThreadRoleRow {
   source: ThreadRoleSource;
 }
 
+/** §19.1/§19.4: helper statuses — no `reissued` (helpers are never
+ * reissued) and no separate `unavailable` (a route failure is `failed`). */
+export type HelperStatus =
+  | "dispatching"
+  | "running"
+  | "done"
+  | "failed"
+  | "stalled"
+  | "quota"
+  | "cancelled";
+
+export const HELPER_ACTIVE_STATUSES: readonly HelperStatus[] = [
+  "dispatching",
+  "running",
+];
+
+/** §19.4: the helpers row — a plugin-created worker thread bound to its
+ * caller (and to the caller's delegation when the caller is an executor). */
+export interface HelperRow {
+  id: number;
+  caller_thread_id: string;
+  caller_delegation_id: number | null;
+  coordinator_thread_id: string;
+  thread_id: string | null;
+  project_id: string | null;
+  preset: string;
+  route: string | null;
+  level: string | null;
+  title: string | null;
+  status: HelperStatus;
+  resume_count: number;
+  turn_started_at: number | null;
+  last_seq: number | null;
+  notified_at: number | null;
+  /** §19.6: set once the janitor pass archived the terminal thread. */
+  archived_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
 interface SetupError {
   step: string;
   message: string;
@@ -496,6 +581,11 @@ export class DelegationStore {
   eventHooksProvider:
     | (() => { hooks: EventHookSetting[]; cwd: string } | null)
     | null = null;
+
+  /** §19.1 (r33): the server wires the helper cascade here — every
+   * delegation that leaves the active statuses cancels its helpers
+   * (`done`/`reissued` fire as no-ops when no helper is left). */
+  onDelegationFinished?: (id: number, status: DelegationStatus) => void;
 
   constructor(db: Database) {
     this.db = db;
@@ -655,6 +745,9 @@ export class DelegationStore {
       const row = this.get(id);
       if (row) this.emitDelegationTransition(row, status, at);
     })();
+    if (status !== "dispatching" && status !== "running") {
+      this.onDelegationFinished?.(id, status);
+    }
   }
 
   /**
@@ -670,7 +763,7 @@ export class DelegationStore {
      * события review.verdict в той же транзакции. */
     opts?: { reviewVerdict?: { verdict: string; blockers: number | null } },
   ): boolean {
-    return this.db.transaction(() => {
+    const moved = this.db.transaction(() => {
       const at = Date.now();
       const info = this.db
         .prepare(
@@ -683,6 +776,10 @@ export class DelegationStore {
       if (row) this.emitDelegationTransition(row, to, at, opts);
       return true;
     })();
+    if (moved && to !== "dispatching" && to !== "running") {
+      this.onDelegationFinished?.(id, to);
+    }
+    return moved;
   }
 
   addSetupError(id: number, step: string, message: string): void {
@@ -1039,6 +1136,27 @@ export class DelegationStore {
       .run(Date.now(), id);
   }
 
+  /** §19.1: drop every setup_errors entry of a step — the
+   * `helpers-pending` mark is consumed when the wait ends. */
+  removeSetupErrors(id: number, step: string): void {
+    const row = this.get(id);
+    if (!row) return;
+    let errors: SetupError[] = [];
+    try {
+      const parsed = JSON.parse(row.setup_errors) as unknown;
+      if (Array.isArray(parsed)) errors = parsed as SetupError[];
+    } catch {
+      return;
+    }
+    const next = errors.filter((e) => e?.step !== step);
+    if (next.length === errors.length) return;
+    this.db
+      .prepare(
+        `UPDATE delegations SET setup_errors = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(JSON.stringify(next), Date.now(), id);
+  }
+
   /** One setup_errors entry by step name, or undefined. */
   findSetupError(
     row: DelegationRow,
@@ -1157,7 +1275,7 @@ export class DelegationStore {
     id: number,
     next: { route: string; preset: string; provider: string },
   ): DelegationRow | undefined {
-    return this.db.transaction(() => {
+    const next_ = this.db.transaction(() => {
       const row = this.get(id);
       if (
         !row ||
@@ -1205,6 +1323,8 @@ export class DelegationStore {
         );
       return this.get(Number(info.lastInsertRowid));
     })();
+    if (next_ !== undefined) this.onDelegationFinished?.(id, "reissued");
+    return next_;
   }
 
   /**
@@ -1452,6 +1572,377 @@ export class DelegationStore {
            source = excluded.source`,
       )
       .run(threadId, role, Date.now(), source);
+  }
+
+  // ── Helpers (§19.1/§19.4, r33) ─────────────────────────────────
+
+  /**
+   * §19.1: the limit check and the row insert are ONE transaction —
+   * two parallel `helper` calls cannot both pass the cap. `perCaller`
+   * is `helpers.maxActive`; `maxActive` is the policy's
+   * `limits.maxActive`, shared with delegations.
+   */
+  insertHelperChecked(
+    input: {
+      callerThreadId: string;
+      callerDelegationId?: number | null;
+      coordinatorThreadId: string;
+      projectId?: string | null;
+      preset: string;
+      route?: string | null;
+      level?: string | null;
+      title?: string | null;
+    },
+    caps: {
+      /** `helpers.maxActive` — active helpers of THIS caller (§19.1:
+       * the helpers setting is a per-caller cap). */
+      perCaller: number;
+      /** `limits.maxActive` — helpers count together with delegations
+       * (ADR r33: «помощники в общем пределе политики»). */
+      sharedMax?: number;
+    },
+  ): HelperRow {
+    return this.db.transaction(() => {
+      const ownActive = this.activeHelpersByCaller(
+        input.callerThreadId,
+      ).length;
+      if (ownActive >= caps.perCaller) {
+        throw new OrchestratorError(
+          "helper-limit",
+          `active helpers ${ownActive}/${caps.perCaller}`,
+        );
+      }
+      const helpersActive = this.helperActiveCount();
+      if (caps.sharedMax !== undefined) {
+        const shared = this.activeCount() + helpersActive;
+        if (shared >= caps.sharedMax) {
+          throw new OrchestratorError(
+            "limit",
+            `active delegations and helpers ${shared}/${caps.sharedMax}`,
+          );
+        }
+      }
+      const now = Date.now();
+      const info = this.db
+        .prepare(
+          `INSERT INTO helpers (
+            caller_thread_id, caller_delegation_id, coordinator_thread_id,
+            project_id, preset, route, level, title, status,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
+        )
+        .run(
+          input.callerThreadId,
+          input.callerDelegationId ?? null,
+          input.coordinatorThreadId,
+          input.projectId ?? null,
+          input.preset,
+          input.route ?? null,
+          input.level ?? null,
+          input.title ?? null,
+          now,
+          now,
+        );
+      return this.helper(Number(info.lastInsertRowid))!;
+    })();
+  }
+
+  helper(id: number): HelperRow | undefined {
+    return this.db.prepare(`SELECT * FROM helpers WHERE id = ?`).get(id) as
+      | HelperRow
+      | undefined;
+  }
+
+  helperByThreadId(threadId: string): HelperRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM helpers WHERE thread_id = ?`)
+      .get(threadId) as HelperRow | undefined;
+  }
+
+  /** §19.6 status block + §19.1 merges/cancels — filtered listing. */
+  listHelpers(
+    filter: {
+      coordinatorThreadId?: string;
+      callerThreadId?: string;
+      limit?: number;
+    } = {},
+  ): HelperRow[] {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (filter.coordinatorThreadId) {
+      where.push("coordinator_thread_id = ?");
+      args.push(filter.coordinatorThreadId);
+    }
+    if (filter.callerThreadId) {
+      where.push("caller_thread_id = ?");
+      args.push(filter.callerThreadId);
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers` +
+          (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
+          ` ORDER BY id DESC LIMIT ?`,
+      )
+      .all(...args, filter.limit ?? 50) as HelperRow[];
+  }
+
+  listActiveHelpers(): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE status IN ('dispatching','running')
+         ORDER BY id`,
+      )
+      .all() as HelperRow[];
+  }
+
+  helperActiveCount(): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) n FROM helpers
+           WHERE status IN ('dispatching','running')`,
+        )
+        .get() as { n: number }
+    ).n;
+  }
+
+  /** The caller's active helpers — the §19.1 `helper-limit` input and
+   * the archive/delete cascade's target list. */
+  activeHelpersByCaller(callerThreadId: string): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE caller_thread_id = ?
+         AND status IN ('dispatching','running') ORDER BY id`,
+      )
+      .all(callerThreadId) as HelperRow[];
+  }
+
+  /** §19.1: active helpers of one delegation — the done/merge gate and
+   * the caller-delegation cascade. */
+  activeHelpersByDelegation(delegationId: number): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE caller_delegation_id = ?
+         AND status IN ('dispatching','running') ORDER BY id`,
+      )
+      .all(delegationId) as HelperRow[];
+  }
+
+  /** Active helpers whose CALLER is this thread — the caller archive /
+   * delete cascade (any caller: root chat or delegation executor). */
+  activeHelpersByThreadCaller(callerThreadId: string): HelperRow[] {
+    return this.activeHelpersByCaller(callerThreadId);
+  }
+
+  setHelperThread(id: number, threadId: string): void {
+    this.db
+      .prepare(
+        `UPDATE helpers SET thread_id = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(threadId, Date.now(), id);
+  }
+
+  setHelperStatus(id: number, status: HelperStatus): void {
+    this.db
+      .prepare(`UPDATE helpers SET status = ?, updated_at = ? WHERE id = ?`)
+      .run(status, Date.now(), id);
+  }
+
+  /** §5.3 ordering for helpers too — status first, `threads.stop` after:
+   * an own stop must never read as an external interrupt. */
+  setHelperStatusIf(
+    id: number,
+    from: HelperStatus,
+    to: HelperStatus,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE helpers SET status = ?, updated_at = ?
+           WHERE id = ? AND status = ?`,
+        )
+        .run(to, Date.now(), id, from).changes > 0
+    );
+  }
+
+  bumpHelperResume(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE helpers SET resume_count = resume_count + 1,
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  /** §19.1 (Argon): a running helper's silence clock follows its last
+   * journal event — a direct write, not `COALESCE`: a stale spawn-time
+   * stamp would mark a busy helper stalled. */
+  setHelperTurnStarted(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE helpers SET turn_started_at = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /** §19.1: the atomic terminal flip — a racing finish/cancel loses to
+   * whoever committed first. Returns true when the row moved. */
+  setHelperTerminal(id: number, to: HelperStatus): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE helpers SET status = ?, updated_at = ?
+           WHERE id = ? AND status IN ('dispatching','running')`,
+        )
+        .run(to, Date.now(), id).changes > 0
+    );
+  }
+
+  /** §19.1: the once-per-outcome line mark — atomic so a racing
+   * notification path cannot double-send. */
+  setHelperNotifiedIf(id: number, at: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE helpers SET notified_at = ?, updated_at = ?
+           WHERE id = ? AND notified_at IS NULL`,
+        )
+        .run(at, Date.now(), id).changes > 0
+    );
+  }
+
+  /** Dispatching and cancelled rows still lacking `thread_id` — the
+   * reconcile's relink scope: a cancelled row's surfaced child is
+   * still found and stopped (§19.1: «отмена до thread_id»). */
+  listUnlinkedHelpers(): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE thread_id IS NULL
+         AND status IN ('dispatching','cancelled') ORDER BY id`,
+      )
+      .all() as HelperRow[];
+  }
+
+  /** §19.6: terminal helpers past the archive age whose thread has not
+   * been archived yet — the marked `archived_at` keeps the janitor
+   * pass from re-archiving the same row every minute. */
+  listHelpersForArchive(olderThan: number): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE thread_id IS NOT NULL
+         AND status NOT IN ('dispatching','running')
+         AND archived_at IS NULL AND updated_at < ? ORDER BY id`,
+      )
+      .all(olderThan) as HelperRow[];
+  }
+
+  markHelperArchived(id: number): void {
+    this.db
+      .prepare(`UPDATE helpers SET archived_at = ? WHERE id = ?`)
+      .run(Date.now(), id);
+  }
+
+  clearHelperTurn(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE helpers SET turn_started_at = NULL, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  advanceHelperLastSeq(id: number, seq: number): void {
+    this.db
+      .prepare(
+        `UPDATE helpers SET last_seq = MAX(COALESCE(last_seq, -1), ?),
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(seq, Date.now(), id);
+  }
+
+  /** §19.1: `notified_at` doubles as the once-per-outcome line mark —
+   * a restart re-evaluates the outcome without duplicating the line. */
+  setHelperNotified(id: number, at: number): void {
+    this.db
+      .prepare(`UPDATE helpers SET notified_at = ?, updated_at = ? WHERE id = ?`)
+      .run(at, Date.now(), id);
+  }
+
+  // ── thread_facts (§19.3.6) ──────────────────────────────────────────
+
+  /** The hook records every thread it sees with its `createdAt` — the
+   * sync `configure` has no age fact of its own. */
+  noteThreadSeen(threadId: string, createdAt: number): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO thread_facts (thread_id, created_at)
+         VALUES (?, ?)`,
+      )
+      .run(threadId, createdAt);
+  }
+
+  threadCreatedAt(threadId: string): number | undefined {
+    return (
+      this.db
+        .prepare(`SELECT created_at FROM thread_facts WHERE thread_id = ?`)
+        .get(threadId) as { created_at: number } | undefined
+    )?.created_at;
+  }
+
+  // ── Manual role writes (§19.4) ──────────────────────────────────────
+
+  /** §19.4: `role set … none` — the manual write is distinguishable from
+   * a dispatch's: `thread_roles` keeps `source = delegate` and the §18.5
+   * events table gets `role.manual` (who, when, the replaced role). */
+  setRoleManual(threadId: string, role: string, actor: string): void {
+    const previous = this.threadRole(threadId)?.role ?? null;
+    const at = Date.now();
+    this.db.transaction(() => {
+      this.setThreadRole(threadId, role, "delegate");
+      this.emitEvent(
+        "role.manual",
+        { thread: threadId, role, previous, actor },
+        at,
+      );
+    })();
+  }
+
+  /** §19.4: the `role set … none` refusal input — every way this thread
+   * participates in an active delegation or helper. */
+  activeRoleParticipation(threadId: string): {
+    executorDelegation: number | null;
+    coordinatorDelegation: number | null;
+    helperThread: number | null;
+    helperCaller: number | null;
+    helperCoordinator: number | null;
+  } {
+    const one = (sql: string) =>
+      (
+        this.db.prepare(sql).get(threadId) as { id: number } | undefined
+      )?.id ?? null;
+    return {
+      executorDelegation: one(
+        `SELECT id FROM delegations WHERE thread_id = ?
+         AND status IN ('dispatching','running') LIMIT 1`,
+      ),
+      coordinatorDelegation: one(
+        `SELECT id FROM delegations WHERE coordinator_thread_id = ?
+         AND status IN ('dispatching','running') LIMIT 1`,
+      ),
+      helperThread: one(
+        `SELECT id FROM helpers WHERE thread_id = ?
+         AND status IN ('dispatching','running') LIMIT 1`,
+      ),
+      helperCaller: one(
+        `SELECT id FROM helpers WHERE caller_thread_id = ?
+         AND status IN ('dispatching','running') LIMIT 1`,
+      ),
+      helperCoordinator: one(
+        `SELECT id FROM helpers WHERE coordinator_thread_id = ?
+         AND status IN ('dispatching','running') LIMIT 1`,
+      ),
+    };
   }
 
   // ── Releases (orchestrator-release §2/§7) ─────────────────────────
