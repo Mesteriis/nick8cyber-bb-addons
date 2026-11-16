@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 2
+revision: 3
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -28,7 +28,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
    - Управляет пулом аккаунтов (`pool.json`), файлом состояния и аренд (`accounts-state.json`), классификацией ошибок, кулдаунами и автоматической ротацией аккаунтов при исчерпании лимита.
 3. **`src/gemini-driver.js`** — CDP-драйвер веб-интерфейса `gemini.google.com` на базе `playwright-core`:
    - Подключается к запущенному headless Chrome по `http://127.0.0.1:<cdpPort>` или поднимает новый процесс Chrome с изолированным `--user-data-dir=<profileDir>`.
-   - Выбирает режим мышления (`Fast`, `Thinking`, `Pro`), отправляет промпт, стримит дельты ответа через `MutationObserver`, отслеживает завершение генерации, извлекает `convId` беседы и паркует вкладку в простое.
+   - Выбирает режим мышления (`Fast`, `Thinking`, `Pro`), отправляет промпт, опрашивает текст ответа через `findTurnTarget`, отслеживает завершение генерации, извлекает `convId` беседы и паркует вкладку в простое.
 4. **`src/profile-manager.js`, `bin/gemini.js`, `scripts/glogin.mjs`, `scripts/pool-add.mjs`** — CLI и утилиты управления профилями и интерактивного входа в аккаунты пула.
 
 ---
@@ -37,7 +37,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 ### 2.1 Инициализация и сессии
 
-- **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "argon-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }`.
+- **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "argon-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }`.
 - **`session/new` и `session/load`**:
   - Создают или восстанавливают запись сессии `{ id, cwd, model, thinking, convId, backendId }`.
   - Возвращают список моделей `models.availableModels`:
@@ -64,7 +64,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   2. При `ARGON_FAKE=1` сервер отправляет нотификацию `session/update` (`sessionUpdate: "agent_message_chunk"`, `text: "FAKE_ARGON_ECHO: " + text.slice(0, 80)`). Если задана задержка `process.env.ARGON_FAKE_DELAY_MS`, генерация удерживает аренду в течение этой паузы для проверки отмены и корректного завершения. По завершении возвращает `{ stopReason: "end_turn" }`.
   3. В боевом режиме выбирается аккаунт из пула (§3), захватывается аренда (`tryAcquireLease`), и драйвер вызывает `sendPrompt(text, { onChunk, signal, isNewChat: !s.convId, convId: s.convId, model: s.model, thinking: mappedThinking, profile: backend.profileDir || backend.profile || backend.id, cdpPort: backend.cdp || backend.cdpPort, strict: true })`.
   4. Каждая дельта `onChunk(delta)` немедленно отправляется нотификацией `session/update` с `sessionUpdate: "agent_message_chunk"`.
-  5. После завершения генерации `s.convId` обновляется из возвращённого драйвером `res.convId` (или `driver.page.url()`), аренда освобождается (`releaseLease`), и возвращается `{ stopReason: "end_turn", usage }`.
+  5. После завершения генерации `s.convId` обновляется из возвращённого драйвером `res.convId` (или `driver.page.url()`), аренда освобождается (`releaseLease`), и возвращается `{ stopReason: "end_turn" }`.
 - При получении **`session/cancel`** (или при закрытии потока):
   - отмена инициируется только для сессии, чей `id === params.sessionId` (или общий активный ход при отсутствии фильтра по id);
   - вызывается `activePrompt.abort.abort()`;
@@ -146,7 +146,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 ### 4.2 Многоходовый стриминг без утечки предыдущего ответа
 
-- Перед отправкой промпта драйвер фиксирует число уже существующих в DOM узлов `<model-response>`. В новом чате (`!convId`) берётся текущее число `(await page.$$('model-response')).length`. В существующей беседе (`convId`) вызывается `waitForHistoryStabilization(page, convId)`: функция с интервалом 350 мс опрашивает число `<model-response>` и ждёт двух совпадающих замеров подряд (потолок 10 с), чтобы гарантировать, что история предыдущих ходов полностью отрисовалась в DOM перед вычислением `initialCount`.
+- Перед отправкой промпта драйвер фиксирует число уже существующих в DOM узлов `<model-response>`. В новом чате (`!convId`) берётся текущее число `(await page.$$('model-response')).length`. В существующей беседе (`convId`) вызывается `waitForHistoryStabilization(page, convId)`: функция с интервалом 350 мс опрашивает число `<model-response>` и ждёт двух повторов того же значения подряд (не менее двух интервалов, потолок 10 с), чтобы гарантировать, что история предыдущих ходов полностью отрисовалась в DOM перед вычислением `initialCount`.
 - Индекс нового ответа для текущего хода равен `idx = initialCount`.
 - Начало генерации проверяется в цикле до 120 с: генерация считается начавшейся (`started === true`), если в DOM появилась кнопка остановки (`button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]`) либо функция `findTurnTarget(document, idx, promptPrefix)` вернула узел ответа.
 - Контракт поиска целевого ответа хода (`findTurnTarget(doc, idx, promptPrefix)`):

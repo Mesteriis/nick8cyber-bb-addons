@@ -536,6 +536,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const r1 = await waitForResponse(1);
   assert.equal(r1.result.agentInfo.name, "argon-gemini");
   assert.equal(r1.result.agentInfo.version, "0.2.0");
+  assert.equal(r1.result.agentCapabilities.loadSession, false);
 
   // 2. session/new
   sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });

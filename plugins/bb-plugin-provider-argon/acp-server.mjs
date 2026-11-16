@@ -1026,7 +1026,7 @@ export function dispatch(msg) {
           protocolVersion: p.protocolVersion ?? 1,
           agentInfo: { name: "argon-gemini", version: "0.2.0" },
           agentCapabilities: {
-            loadSession: true,
+            loadSession: false,
             promptCapabilities: { image: false, audio: false, embeddedContext: true },
             sessionCapabilities: {},
           },
