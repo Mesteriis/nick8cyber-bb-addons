@@ -377,6 +377,9 @@ export function parseResetTimeMs(msg, nowMs = Date.now()) {
       const mIdx = monthNames.findIndex((m) => monthStr.toLowerCase().startsWith(m));
       if (mIdx >= 0) {
         d.setMonth(mIdx, parseInt(dayStr, 10));
+        if (d.getTime() < nowMs) {
+          d.setFullYear(d.getFullYear() + 1);
+        }
       }
     } else if (/tomorrow/i.test(enMatch[0])) {
       d.setDate(d.getDate() + 1);

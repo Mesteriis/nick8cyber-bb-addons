@@ -585,6 +585,38 @@ async function stopGeneration(page) {
   } catch {}
 }
 
+async function waitForHistoryStabilization(
+  page,
+  convId,
+  { intervalMs = 350, ceilingMs = 10000, throwIfCancelled = null } = {}
+) {
+  if (!convId) {
+    return (await page.$$('model-response')).length;
+  }
+  const deadline = Date.now() + ceilingMs;
+  let prevCount = (await page.$$('model-response')).length;
+  let stableMeasurements = 0;
+  while (Date.now() < deadline) {
+    if (page.waitForTimeout) {
+      await page.waitForTimeout(intervalMs);
+    } else {
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    if (throwIfCancelled) await throwIfCancelled();
+    const current = (await page.$$('model-response')).length;
+    if (current > 0 && current === prevCount) {
+      stableMeasurements++;
+      if (stableMeasurements >= 2) {
+        return current;
+      }
+    } else {
+      stableMeasurements = 0;
+      prevCount = current;
+    }
+  }
+  return (await page.$$('model-response')).length;
+}
+
 async function sendPrompt({
   prompt,
   model,
@@ -630,7 +662,7 @@ async function sendPrompt({
     page = await getGeminiPage(browser, { waitForVerification, port });
     await throwIfCancelled();
 
-    if (page.url() === 'about:blank') {
+    if (page.url() === 'about:blank' || (convId && !page.url().includes(convId))) {
       const targetUrl = convId ? `https://gemini.google.com/app/${convId}` : GEMINI_APP_URL;
       await page.goto(targetUrl, { timeout: 15000, waitUntil: 'domcontentloaded' });
     } else if (isNewChat) {
@@ -663,7 +695,7 @@ async function sendPrompt({
       }
     }
 
-    const initialCount = (await page.$$('model-response')).length;
+    const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled });
 
     // SPA re-creates the editor node on re-renders (model menu, bootstrap) —
     // resolve it fresh each attempt and verify the text actually landed.
@@ -745,7 +777,18 @@ async function sendPrompt({
       const started = await page.evaluate((count) => {
         const responses = document.querySelectorAll('model-response');
         const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
-        return responses.length > count || stopBtn !== null;
+        if (stopBtn !== null) return true;
+        if (responses.length > count) {
+          const queries = document.querySelectorAll('user-query');
+          if (queries.length > 0) {
+            const userQuery = queries[count];
+            if (!userQuery || !(userQuery.compareDocumentPosition(responses[count]) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        return false;
       }, initialCount);
       if (started) break;
       if (Date.now() >= genDeadline) {
@@ -770,6 +813,13 @@ async function sendPrompt({
         const responses = document.querySelectorAll('model-response');
         const target = responses[idx];
         if (!target) return null;
+        const queries = document.querySelectorAll('user-query');
+        if (queries.length > 0) {
+          const userQuery = queries[idx];
+          if (!userQuery || !(userQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+            return null;
+          }
+        }
         const mc = target.querySelector('message-content');
         // Track which source produced the text: before message-content exists
         // the whole model-response (incl. "Show thinking" chrome) is read —
@@ -802,6 +852,13 @@ async function sendPrompt({
         const responses = document.querySelectorAll('model-response');
         const last = responses[idx];
         if (!last) return false;
+        const queries = document.querySelectorAll('user-query');
+        if (queries.length > 0) {
+          const userQuery = queries[idx];
+          if (!userQuery || !(userQuery.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+            return false;
+          }
+        }
         const hasText = (last.querySelector('message-content')?.innerText || '').trim().length > 0;
         const hasImg = last.querySelector('img, generated-image, .image-container') !== null;
         return hasText || hasImg;
@@ -1402,6 +1459,7 @@ module.exports = {
   RESET_REGEX_EXTENDED,
   selectModelAndThinking,
   stopGeneration,
+  waitForHistoryStabilization,
   getGeminiPage,
   checkRobotVerification,
   dismissOverlays,

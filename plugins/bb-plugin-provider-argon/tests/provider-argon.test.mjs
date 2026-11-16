@@ -22,6 +22,7 @@ const {
   selectModelAndThinking,
   ModelUnavailable,
   RESET_REGEX_EXTENDED,
+  waitForHistoryStabilization,
 } = driver;
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -51,7 +52,7 @@ test("1. Syntax and hygiene checks across plugin files", () => {
   }
 
   // Check forbidden substrings in all files (dynamically constructed to avoid self-match)
-  const forbiddenSubstrings = ["/" + "home/", "t" + "hr_", "p" + "roj_", "e" + "nv_"];
+  const forbiddenSubstrings = ["/" + "home/", "/" + "opt/", "t" + "hr_", "p" + "roj_", "e" + "nv_"];
   for (const file of allFiles) {
     if (file === fileURLToPath(import.meta.url)) continue;
     const content = fs.readFileSync(file, "utf8");
@@ -115,6 +116,17 @@ test("2. parseResetTimeMs parses English and Russian quota reset formats", () =>
   assert.equal(d5.getHours(), 9);
   assert.equal(d5.getMinutes(), 15);
 
+  // Year rollover: base date in December, reset in January
+  const decNow = new Date("2026-12-25T10:00:00.000Z").getTime();
+  const tYear = parseResetTimeMs("Limit resets Jan 2, 2:19 AM", decNow);
+  assert.ok(tYear !== null);
+  const dYear = new Date(tYear - 2 * 60_000);
+  assert.equal(dYear.getFullYear(), 2027);
+  assert.equal(dYear.getMonth(), 0); // Jan is 0
+  assert.equal(dYear.getDate(), 2);
+  assert.equal(dYear.getHours(), 2);
+  assert.equal(dYear.getMinutes(), 19);
+
   // Unrelated string
   assert.equal(parseResetTimeMs("Everything is normal"), null);
 });
@@ -153,6 +165,22 @@ test("3. classifyFailure correctly classifies errors", () => {
   assert.equal(c5.category, "auth-dead");
   assert.equal(c5.rotatable, true);
   assert.equal(c5.cooldownMs, 7 * 24 * 3600_000);
+
+  // ModelUnavailable('thinking', ...) instances
+  const errThinkingRateLimited = new ModelUnavailable(
+    "thinking",
+    "high thinking level is rate-limited (Limit resets 2:19 AM)"
+  );
+  const cThinkingRL = classifyFailure(errThinkingRateLimited);
+  assert.equal(cThinkingRL.category, "rate-limit");
+  assert.equal(cThinkingRL.rotatable, true);
+  assert.ok(cThinkingRL.cooldownMs > 0);
+
+  const errThinkingNotFound = new ModelUnavailable("thinking", "not found in model menu");
+  const cThinkingNF = classifyFailure(errThinkingNotFound);
+  assert.equal(cThinkingNF.category, "model-unavailable");
+  assert.equal(cThinkingNF.rotatable, true);
+  assert.equal(cThinkingNF.cooldownMs, 6 * 3600_000);
 });
 
 test("4. gemini-driver strict selectModelAndThinking and no fallback", async () => {
@@ -212,6 +240,56 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
       return true;
     }
   );
+
+  // Verification that responses[idx] is validated after corresponding user-query
+  assert.ok(
+    driverSrc.includes("queries[idx]"),
+    "gemini-driver.js must check user-query[idx]"
+  );
+  assert.ok(
+    driverSrc.includes("DOCUMENT_POSITION_FOLLOWING"),
+    "gemini-driver.js must verify responses[idx] follows user-query"
+  );
+
+  // Mock page for waitForHistoryStabilization with asynchronous progressive history loading
+  let historyCalls = 0;
+  const mockPageAsync = {
+    $$: async (sel) => {
+      if (sel === "model-response") {
+        historyCalls++;
+        // Simulate async DOM loading:
+        // call 1: []
+        // call 2: [{}]
+        // call 3: [{}, {}]
+        // call 4: [{}, {}] -> 1st match with previous
+        // call 5: [{}, {}] -> 2nd match with previous -> stable!
+        if (historyCalls === 1) return [];
+        if (historyCalls === 2) return [{}];
+        return [{}, {}];
+      }
+      return [];
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const stabilizedCount = await waitForHistoryStabilization(mockPageAsync, "conv-12345678", {
+    intervalMs: 5,
+  });
+  assert.equal(stabilizedCount, 2, "Must stabilize at 2 model-responses");
+  assert.ok(historyCalls >= 5, "Must take multiple measurements to confirm stability");
+
+  // For a new chat (no convId), it must return immediately on the first query
+  let newChatCalls = 0;
+  const mockNewChatPage = {
+    $$: async () => {
+      newChatCalls++;
+      return [{}, {}, {}];
+    },
+    waitForTimeout: async () => {},
+  };
+  const newChatCount = await waitForHistoryStabilization(mockNewChatPage, null);
+  assert.equal(newChatCount, 3);
+  assert.equal(newChatCalls, 1, "Must return immediately without waiting when convId is null");
 });
 
 test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease retention and selective cancel", async () => {
@@ -402,13 +480,34 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const stCancel = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(stCancel.leases || {}, {}, "Leases must be empty after cancel");
 
-  // 8. Close stdin and verify clean exit
+  // 8. Close stdin during active prompt execution with ARGON_FAKE_DELAY_MS
+  sendReq({
+    jsonrpc: "2.0",
+    id: 10,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "Prompt while closing stdin" }],
+    },
+  });
+  await waitForNotification("session/update");
+
+  // Verify lease is actively held before stdin close
+  assert.ok(fs.existsSync(statePath));
+  const stBeforeStdinClose = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(
+    stBeforeStdinClose.leases && stBeforeStdinClose.leases["fake-acc-1"],
+    "Lease must be held during prompt execution before stdin close"
+  );
+  assert.equal(stBeforeStdinClose.leases["fake-acc-1"].pid, serverProc.pid);
+
+  // Close stdin while turn is active
   serverProc.stdin.end();
   await new Promise((resolve) => serverProc.on("exit", resolve));
 
   if (fs.existsSync(statePath)) {
     const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    assert.deepEqual(st.leases || {}, {}, "Leases must be empty after server exit");
+    assert.deepEqual(st.leases || {}, {}, "Leases must be empty after closing stdin during active turn");
   }
 
   // Cleanup tmpDir
