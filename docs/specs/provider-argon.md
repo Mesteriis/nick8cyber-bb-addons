@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 5
+revision: 6
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -41,11 +41,11 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 - **`session/new` и `session/load`**:
   - `session/new` создаёт новую запись сессии `{ id, cwd, model, thinking, convId, account, backend }`.
   - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
-  - Возвращают список моделей `models.availableModels`:
-    - `argon` — «Gemini (Argon)» (модель по умолчанию для Gemini 4)
-    - `fast` — «Gemini 3 Flash (Fast)»
-    - `thinking` — «Gemini 3 Flash (Thinking)»
-    - `pro` — «Gemini 3.1 Pro (старая 3.1, не рекомендуется)»
+  - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
+    - `'argon'` — «Gemini (Argon)» (модель по умолчанию для Gemini 4)
+    - `'fast'` — «Gemini 3 Flash (Fast)»
+    - `'thinking'` — «Gemini 3 Flash (Thinking)»
+    - `'pro'` — «Gemini 3.1 Pro (старая 3.1, не рекомендуется)»
   - Возвращают конфигурационные опции `configOptions`:
     - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `fast`, `thinking`, `pro`);
     - `thinking` (категория `"thought_level"`): значения `fast` / `thinking` / `pro`;
@@ -100,12 +100,14 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     ]
   }
   ```
-  - Резервные источники и обратная совместимость:
-    1. `$STATE_DIR/pool.json`;
-    2. каталоги `$STATE_DIR/accounts/<label>/backend.json`;
-    3. миграционный fallback: если в новом каталоге нет записей, читаются аккаунты старого стенда `~/.config/argon-acp/accounts/*/backend.json`.
+  - Источники конфигурации пула перечисляются функцией `loadBackends` строго в порядке их чтения:
+    1. `ARGON_POOL_FILE` (по умолчанию `$STATE_DIR/pool.json`);
+    2. `$STATE_DIR/accounts/<label>/backend.json`;
+    3. `~/.config/argon-acp/accounts/*/backend.json` (legacy fallback, только если пул пуст);
+    4. `ARGON_BACKENDS` (JSON-массив бэкендов из переменной окружения);
+    5. Одиночный профиль по умолчанию (`profile: "Default"`, `cdpPort: 9222`, `profileDir: ~/.gemini-cli-profile`).
   - Утилита `scripts/pool-add.mjs` актуализируется: при добавлении аккаунта она обновляет и `pool.json`, и подкаталог аккаунта.
-  - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()`. Если пул пуст, используется одиночный профиль `default` (`GEMINI_PROFILE_DIR` или `~/.gemini-cli-profile`, порт `GEMINI_CDP_PORT` или `9222`). Аккаунты с `priority === 0` исключаются из автоматического выбора.
+  - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()`. Аккаунты с `priority === 0` исключаются из автоматического выбора.
 - Состояние хранится в `ARGON_STATE_DIR/accounts-state.json` (по умолчанию `~/.bb/plugins/provider-argon/accounts-state.json`).
 - Любая модификация `accounts-state.json` выполняется через `withStateLock(fn)`:
   - захват эксклюзивного файла-замка `accounts-state.json.lock` (`O_CREAT | O_EXCL`);

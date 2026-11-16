@@ -1052,7 +1052,10 @@ export function dispatch(msg) {
         id: msg.id,
         result: {
           sessionId,
-          models: { availableModels: MODELS.map((m) => m.value), currentModelId: s.model },
+          models: {
+            availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
+            currentModelId: s.model,
+          },
           configOptions: configOptionsFor(s, BACKENDS),
           modes,
         },
@@ -1080,7 +1083,10 @@ export function dispatch(msg) {
         id: msg.id,
         result: {
           sessionId,
-          models: { availableModels: MODELS.map((m) => m.value), currentModelId: s.model },
+          models: {
+            availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
+            currentModelId: s.model,
+          },
           configOptions: configOptionsFor(s, BACKENDS),
           modes,
         },

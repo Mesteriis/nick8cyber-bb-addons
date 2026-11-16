@@ -96,7 +96,7 @@ Details in
 
 Runs bb threads on Google Gemini's web interface (`gemini.google.com`) without
 API keys as an `acp-argon` ACP provider over Chrome DevTools Protocol
-(`playwright` или `playwright-core`). Used by orchestrator presets (`argon-review`, `argon-research`).
+(`playwright` or `playwright-core`). Used by orchestrator presets (`argon-review`, `argon-research`).
 
 - **Account pool and state.** Multiple Google accounts in `pool.json` with
   exclusive per-turn leases (`accounts-state.json`), quotas, and automatic
@@ -109,7 +109,7 @@ API keys as an `acp-argon` ACP provider over Chrome DevTools Protocol
   stop-button cancel handling, and automatic idle tab parking to `about:blank`
   for 0% background CPU usage.
 
-Requirements: Google Chrome, `playwright` или `playwright-core` (драйвер пробует сначала `playwright`, затем `playwright-core`), and an account pool (`pool.json`) with authenticated profiles.
+Requirements: Google Chrome, `playwright` or `playwright-core` (the driver tries `playwright` first, then `playwright-core`), and an account pool (`pool.json`) with authenticated profiles.
 
 ```bash
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-argon

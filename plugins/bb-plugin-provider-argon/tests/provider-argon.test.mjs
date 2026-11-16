@@ -543,12 +543,42 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const r2 = await waitForResponse(2);
   const sessionId = r2.result.sessionId;
   assert.ok(sessionId.startsWith("argon-"));
-  assert.ok(r2.result.models.availableModels.includes("argon"));
-  assert.ok(r2.result.models.availableModels.includes("pro"));
+  assert.ok(Array.isArray(r2.result.models.availableModels));
+  assert.ok(r2.result.models.availableModels.length > 0);
+  for (const m of r2.result.models.availableModels) {
+    assert.equal(typeof m, "object");
+    assert.ok(m !== null);
+    assert.equal(typeof m.modelId, "string");
+    assert.ok(m.modelId.length > 0);
+    assert.equal(typeof m.name, "string");
+    assert.ok(m.name.length > 0);
+  }
+  const modelIds = r2.result.models.availableModels.map((m) => m.modelId);
+  assert.ok(modelIds.includes("argon"));
+  assert.ok(modelIds.includes("pro"));
+  const proModel = r2.result.models.availableModels.find((m) => m.modelId === "pro");
+  assert.equal(proModel?.name, "Gemini 3.1 Pro (старая 3.1, не рекомендуется)");
   assert.equal(
     MODELS.find((m) => m.value === "pro")?.name,
     "Gemini 3.1 Pro (старая 3.1, не рекомендуется)"
   );
+
+  // 2b. session/load also returns availableModels as { modelId, name } objects
+  sendReq({ jsonrpc: "2.0", id: 21, method: "session/load", params: { sessionId } });
+  const r21 = await waitForResponse(21);
+  assert.equal(r21.result.sessionId, sessionId);
+  assert.ok(Array.isArray(r21.result.models.availableModels));
+  for (const m of r21.result.models.availableModels) {
+    assert.equal(typeof m, "object");
+    assert.ok(m !== null);
+    assert.equal(typeof m.modelId, "string");
+    assert.ok(m.modelId.length > 0);
+    assert.equal(typeof m.name, "string");
+    assert.ok(m.name.length > 0);
+  }
+  const loadModelIds = r21.result.models.availableModels.map((m) => m.modelId);
+  assert.ok(loadModelIds.includes("argon"));
+  assert.ok(loadModelIds.includes("pro"));
 
   // 3. session/set_model
   sendReq({
