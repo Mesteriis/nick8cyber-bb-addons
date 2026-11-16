@@ -150,28 +150,75 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   reissues.
   `bb orchestrator reconcile` runs a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy show|validate`,
-  `instructions`, `reconcile`, `release`, `janitor`, `hooks-dir`.
+  `instructions`, `reconcile`, `release`, `janitor`, `hooks-dir`, `helper`,
+  `role set`.
 
 ## Roles
 
-Three built-in roles (§13.1): `orchestrator` (the default, the only one
-with `delegates: true`), `executor`, `auditor`. A role is its instruction
-text plus the plugin tools and skills the thread may use.
+Built-in roles (§13.1, r33 §19): `orchestrator` (the only one with
+`delegates: true`), `executor`, `auditor`, `release-auditor`, `helper`
+(the worker a plugin launch creates — never pickable), and `none` — an
+explicit "no plugin" verdict: no tools, no skills, no instructions, no
+coordinator fallback. A role is its instruction text plus the plugin
+tools and skills the thread may use.
 
 - **Picker**: the new-chat window gets a "Role" dropdown
-  (`composer.customize`, new-thread area); the current pick is stored per
+  (`composer.customize`, new-thread area) with `none` ("No plugin") first;
+  the window only READS the stored pick — it writes nothing on open, so
+  an explicit selection is distinguishable. The pick is stored per
   project in `pending_roles`.
 - **Decision**: the `message.dispatch` hook decides the role once, on the
   thread's first message, and writes it to `thread_roles` — the source of
-  truth (`pluginMetadata.role` is display-only). Threads the hook never
-  saw fall back to the §3 criterion: no parent and no executor markers →
-  coordinator.
+  truth (`pluginMetadata.role` is display-only). A CLI thread without a
+  parent gets `none`; children and forks of a `none` thread inherit it.
+  Threads older than the r33 migration fall back to the §3 criterion:
+  no parent and no executor markers → coordinator; newer threads without
+  a recorded role are `none` (a journal warning names the hole).
+- **Manual role**: `bb orchestrator role set <thread> <none|orchestrator|
+  executor|auditor>` rewrites a role outside active work (`role-active`
+  refusal); `helper` is never settable, `orchestrator` only on a root
+  human thread. Writes record a `role.manual` event.
 - **Limitations** (§13.2 item 5, §13.3): the plugin grants and withholds only
   its own tools — provider built-ins (file edits, shell) stay governed by
   the preset's permission mode. The role's instruction reaches the agent
   only if the provider delivers BB instructions; on a provider that does
   not, the role carries no text (agy on the ACP bridge delivers it; `acp-devin`
   restores instructions after compaction via `provider-devin`).
+
+## Helpers (§19)
+
+`orchestrator_helper` (agent tool) and `bb orchestrator helper` create a
+plugin-owned worker thread for the calling orchestrator or executor:
+a hidden child linked to the caller with `parentNotifications: auto`,
+running inside the caller's own environment (`{type: "reuse"}`), titled
+`helper#<id> · <title>`. Helpers get the `helper` role — no plugin tools
+or skills; the result reaches the caller through BB's own parent
+notification, the plugin sends only the launch notice and outcome lines.
+
+- `bb orchestrator helper --prompt <text>|--prompt-file <path>
+  [--title <t>] [--level <l>|--preset <id>]` — a level goes through the
+  policy chain (`helpers.defaultLevel` when omitted); a preset names one
+  policy route directly (`preset-not-allowed` for foreign presets).
+- `bb orchestrator helper cancel <id>` — idempotent cancellation; the
+  caller or its delegation's coordinator may cancel. `orchestrator_cancel`
+  accepts `helperId` too.
+- **Supervision**: the watchdog records outcomes (`done`, `failed`,
+  `quota`, `stalled`, `cancelled`), issues at most one continuation on an
+  interrupted turn, sends exactly one caller line per terminal outcome
+  (`notified_at` survives restarts), relinks dispatch rows by
+  `pluginMetadata.helperId`, and cascades — an archived/deleted caller or
+  a finished delegation cancels its helpers; a helper thread removed by
+  hand is `cancelled` + one «removed manually» line.
+- **Limits**: `helpers.maxPerCaller` (default 3), `helpers.maxActive`
+  (global), and the policy's shared `limits.maxActive` — checked
+  atomically with the row insert inside the dispatch queue.
+- **Delegation interplay**: active helpers keep their delegation
+  `running` (`helpers-pending` mark — the timer re-evaluates after they
+  finish), and `merge` refuses with `helpers-active` until they end.
+- **Foreign children**: a manual `bb thread spawn`/`bb tasks dispatch`
+  child of a role thread is rejected on its first message — children of
+  role threads are plugin-created only. `allowForeignChildren` (default
+  off) opts out.
 
 ## Setup
 
@@ -238,6 +285,14 @@ map presets onto levels and fallback chains, write the policy, validate.
 - `mergeAutofix` (default off, §14/§16.6) — on a merge conflict,
   delegate a fix round to the same task and level; off — only report
   the conflict to the coordinator.
+- `defaultRole` (§19.3, default `executor`) — the role an undecided
+  human/app thread gets: `orchestrator`, `executor`, `auditor` or `none`.
+- `helpers` (§19.1, JSON) — `{maxActive?, maxPerCaller?, defaultLevel?}`;
+  `maxPerCaller` defaults to 3, helpers also count inside the policy's
+  `limits.maxActive`.
+- `allowForeignChildren` (§19.5, default off) — permit manually created
+  child threads under role threads; off — the first message of such a
+  child is rejected and the thread archived.
 - `maxConcurrentCommands` (§18.2, default 4) — cap on simultaneously
   running journaled commands (postPublish and event hooks).
 - `retentionDays` (§18.2, default 30) — `command_runs` and `events`

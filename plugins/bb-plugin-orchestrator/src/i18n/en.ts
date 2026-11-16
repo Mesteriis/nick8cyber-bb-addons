@@ -839,11 +839,12 @@ export const EN: Record<string, string> = {
   "cli.unknownSub": "unknown subcommand \"{cmd}\"",
   "cli.commandsHint": "commands: delegate, status, show, cancel, merge, policy, instructions, reconcile, janitor",
   "app.role": "Role",
+  "app.roleNone": "No plugin",
   "app.roleOrchestrator": "Orchestrator",
   "app.roleExecutor": "Executor",
   "app.roleAuditor": "Auditor",
-  "role.body.orchestrator": "You are the orchestrator. Your role is to hand work out to executors, not to do it yourself.\n\n- Do not do a composite task yourself: decompose it into bb tasks with specs and delegate to executors via orchestrator_delegate (bb orchestrator delegate <KEY> --level <level>).\n- Pick the level by complexity; when in doubt go higher, never downgrade a complex task.\n- End your turn after delegating: the executor's result arrives on its own — a [bb system] … completed message from BB or an [orchestrator] line (outcome, branch, sha7, copy, report); foreground waiting is not allowed.\n- Check the executor's result yourself before consolidating and reporting.\n- Review of specs before delegating and of the result afterwards is at level {review} (role auditor).\n- Consolidating and releasing the result is your zone only: executors hand their work to you.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next; with links to the executor threads and their tasks. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.\n- Hand rework out as a new delegate of the same task: the plugin continues from the previous round's commit itself (--from <sha|branch> — a custom point, --fresh — from scratch).\n- Do not open the executor's branch and working copy in other copies: the plugin collects the round result.\n- Do not put your own pollers on top of the watchdog: outcomes (stall, quota, crash, reissue) arrive as [orchestrator] messages.\n- Never dispatch manually (bb tasks dispatch, bb thread spawn) — delegate only.",
-  "role.body.executor": "You are the executor. Your role is to complete the assigned task yourself.\n\n- You do the task: do not spawn subagents and do not re-delegate the work.\n- Work strictly to the task's spec; a divergence from the spec is a question to the coordinator, not improvisation.\n- The git rules are the \"Working with git\" section of the task instructions.\n- Report per the contract in the task description.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.",
+  "role.body.orchestrator": "You are the orchestrator. Your role is to hand work out to executors, not to do it yourself.\n\n- Do not do a composite task yourself: decompose it into bb tasks with specs and delegate to executors via orchestrator_delegate (bb orchestrator delegate <KEY> --level <level>).\n- Pick the level by complexity; when in doubt go higher, never downgrade a complex task.\n- End your turn after delegating: the executor's result arrives on its own — a [bb system] … completed message from BB or an [orchestrator] line (outcome, branch, sha7, copy, report); foreground waiting is not allowed.\n- Check the executor's result yourself before consolidating and reporting.\n- Review of specs before delegating and of the result afterwards is at level {review} (role auditor).\n- Consolidating and releasing the result is your zone only: executors hand their work to you.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next; with links to the executor threads and their tasks. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.\n- Hand rework out as a new delegate of the same task: the plugin continues from the previous round's commit itself (--from <sha|branch> — a custom point, --fresh — from scratch).\n- Do not open the executor's branch and working copy in other copies: the plugin collects the round result.\n- Do not put your own pollers on top of the watchdog: outcomes (stall, quota, crash, reissue) arrive as [orchestrator] messages.\n- Never dispatch manually (bb tasks dispatch, bb thread spawn) — delegate only; a helper without a task goes through orchestrator_helper (`bb orchestrator helper`) — hidden, in your own copy, its result arrives as a message.",
+  "role.body.executor": "You are the executor. Your role is to complete the assigned task yourself.\n\n- You do the task: do not re-delegate the work. Helpers — only through the orchestrator_helper tool (or `bb orchestrator helper`); a bare `bb thread spawn`/`bb tasks dispatch` is forbidden.\n- Work strictly to the task's spec; a divergence from the spec is a question to the coordinator, not improvisation.\n- The git rules are the \"Working with git\" section of the task instructions.\n- Report per the contract in the task description.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.",
   "role.body.auditor": "You are the auditor. Your role is to only read and check, changing nothing.\n\n- Do not edit files, do not commit, do not dispatch or spawn subagents.\n- Check by the contract: the project documentation is the source of truth, verify the code against it.\n- Finding format: location (file:lines) → problem → fix. With no findings — an explicit \"no findings\" verdict.\n- Separate facts from judgements; mark the doubtful instead of presenting it as fact.\n- The report is a list of findings or \"no findings\"; the repository must stay unchanged.",
   // Examples below stay \u-escaped (\u002f, \u0061): the §4 scan
   // rules (vless-uri, github-token) match the bare literal in source —
@@ -853,5 +854,45 @@ export const EN: Record<string, string> = {
   "role.mand.orchestrator": "- Do not modify the machine outside the working copies: no sudo, no package installs, no host settings — if something is missing, tell the user (they are this chat's coordinator).",
   "role.mand.executor": "- Do not modify the machine outside your own working copy: no sudo, no package installs — if something is missing, tell the coordinator instead of doing it yourself.",
   "role.mand.auditor": "End the report with the JSON line {\"verdict\":\"OK\"|\"CHANGES\",\"blockers\":<number of blocking findings>} — the release pipeline reads it.",
+  "role.body.helper": "You are the helper. Your role is to do exactly the assigned task and report back.\n\n- Do only the assigned task — nothing beyond it.\n- Do not launch subagents or helpers — a helper never fans out.\n- Do not commit, do not push, do not create branches or PRs — leave all changes in the working tree for the caller.\n- Report a short result in your final response — the caller reads it from the child notification.",
+  "role.mand.helper": "- Do not modify the machine outside your own working copy: no sudo, no package installs — if something is missing, tell the coordinator instead of doing it yourself.",
+  "role.foreignChild": "children of an orchestrator role thread are created by the plugin only — use orchestrator_helper instead of `bb thread spawn`/`bb tasks dispatch`",
   "pp.reviewSweepError": "orchestrator release: review pass for {task}: {error}",
+
+  // ── helper.ts / §19.1–19.6 (r33) — CLI, tool, status, watchdog ─────
+  "cli.helpHelperS": "run a helper — hidden child thread in your environment",
+  "cli.helperUsage":
+    "usage: bb orchestrator helper (--prompt <text>|--prompt-file <path>) [--title <t>] [--level <l>|--preset <id>]",
+  "cli.helperCancelUsage": "usage: bb orchestrator helper cancel <id>",
+  "cli.helperStarted":
+    "helper#{id} launched (thread {thread}, preset {preset})",
+  "cli.helperCancelled": "helper#{id} cancelled",
+  "cli.noHelper": "no helper {ref}",
+  "cli.helpRoleS": "manual role change for a thread",
+  "cli.roleUsage":
+    "usage: bb orchestrator role set <thread> <none|orchestrator|executor|auditor>",
+  "cli.roleSet": "role of {thread}: {role} (was {previous})",
+  "tool.helper":
+    "Launch a helper — a hidden child thread in YOUR environment that does one bounded task and reports back. No tracker task is created; the helper may not commit, push, branch or launch subagents.",
+  "tool.helperInstr":
+    "Use for bounded subwork you would otherwise spawn manually — bare `bb thread spawn`/`bb tasks dispatch` children are refused. The helper's result arrives as a BB message; do not wait for it in the foreground.",
+  "tool.helperPrompt": "The helper's task — full instructions",
+  "tool.helperTitle": "Short title (default: first prompt words)",
+  "tool.helperLevel": "Policy level for the route chain (default: helpers.defaultLevel)",
+  "tool.helperPreset": "One-off policy preset instead of --level",
+  "tool.cancelHelperId": "Cancel a helper by its id (helper#<id>)",
+  "status.helpersHeader": "helpers:",
+  "set.helpersNotObject": "helpers settings must be a JSON object",
+  "set.helpersBadInt": "must be a non-negative integer",
+  "set.helpersBadLevel": "must be a non-empty string",
+  "wd.helperStarted": "helper#{id} «{title}» launched (thread {thread})",
+  "wd.helperFailed": "helper#{id} failed: {detail}",
+  "wd.helperQuota": "helper#{id} hit a quota: {detail}",
+  "wd.helperStalled": "helper#{id} stalled — cancelled, not reissued",
+  "wd.helperRemoved": "helper#{id} was removed manually ({kind})",
+  "wd.helperDispatchLost":
+    "helper#{id}: the spawned thread was never found — failed",
+  "wd.helperGone": "helper#{id}: the thread vanished — failed",
+  "wd.helperApproval": "helper#{id} is waiting for an approval",
+  "wd.helperResume": "Continue your assigned task.",
 };

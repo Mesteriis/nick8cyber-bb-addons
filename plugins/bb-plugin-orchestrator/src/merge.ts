@@ -317,6 +317,17 @@ export async function runMerge(
       "only the delegating coordinator may merge its result",
     );
   }
+  // §19.1 (r33): a delegation's merge refuses while its helpers are
+  // still active — their unmerged work would be left behind.
+  const activeHelpers = store.activeHelpersByDelegation(row.id);
+  if (activeHelpers.length) {
+    throw new OrchestratorError(
+      "helpers-active",
+      `delegation ${row.id} has active helpers: ` +
+        activeHelpers.map((h) => `helper#${h.id}`).join(", "),
+      "wait for the helpers to finish or cancel them with `bb orchestrator helper cancel <id>`",
+    );
+  }
   const resultSha = assertMergeableRow(row, t);
 
   const env = await deps
