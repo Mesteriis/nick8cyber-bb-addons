@@ -278,23 +278,36 @@ export function buildAgentConfiguration(
   // policy state. The missing row on a new thread is also the §19.3.6
   // journal warning: the hook should have written it.
   if (roleId === NO_ROLE) return { tools: [], skills: [] };
-  if (roleId === undefined && isR33NewThread(facts, deps.probes)) {
+  const skills = deps.skills ?? SKILLS_EN;
+  const newThreadRoleless =
+    roleId === undefined && isR33NewThread(facts, deps.probes);
+  if (newThreadRoleless) {
     deps.warn?.(
       `orchestrator: role hook did not record a role for new thread ` +
         `${facts.threadId} — treating as none`,
     );
+  }
+  // §19.3.5 + §19.3.8 (r33): an invalid policy gives a CHILD thread
+  // nothing at all; a root orchestrator or an undecided root gets ONLY
+  // the setup skill; a recorded executor/auditor ROOT keeps its normal
+  // issuance — it does not need the policy to work.
+  if (deps.policyOk === false) {
+    if (
+      facts.parentThreadId !== null &&
+      facts.parentThreadId !== undefined
+    ) {
+      return { tools: [], skills: [] };
+    }
+    if (roleId === undefined || roleId === "orchestrator") {
+      return { tools: [], skills: [skills.setup] };
+    }
+  } else if (newThreadRoleless) {
     return { tools: [], skills: [] };
   }
   const coordinator =
     roleId !== undefined
       ? role?.delegates === true
       : isCoordinator(facts, deps.probes, deps.now ? deps.now() : Date.now());
-  // §19.3.8 (r33): an invalid policy narrows EVERY recorded non-none
-  // role — and the §3 fallback coordinator — to the setup skill alone.
-  const skills = deps.skills ?? SKILLS_EN;
-  if (deps.policyOk === false) {
-    return { tools: [], skills: [skills.setup] };
-  }
 
   if (!coordinator) {
     // §3: other roles get their own instruction (when texts are on) and

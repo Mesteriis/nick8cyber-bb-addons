@@ -38,6 +38,7 @@ import {
 import {
   buildAgentConfiguration,
   fallbackAgentConfiguration,
+  isCoordinator,
   migratePluginThreadRoles,
   skillSet,
   type ExecutorProbes,
@@ -83,6 +84,7 @@ import {
   handleMessageDispatch,
   handoffPathError,
   isRoleId,
+  NO_ROLE,
   parseRoleTexts,
   PICKABLE_ROLE_IDS,
   WINDOW_ROLE_IDS,
@@ -150,8 +152,14 @@ export const rpcContract = defineRpcContract({
 });
 
 /** The `pending_roles` RPC handlers; `projectId = null` (projectless
- * compose) stores nothing and reads back the default. */
-export function pendingRoleRpc(store: DelegationStore) {
+ * compose) stores nothing and reads back the default. §19.3.2 (r33):
+ * with no remembered pick the window shows the CONFIGURED
+ * `defaultRole` — `none` («Без плагина») included — never a hardcoded
+ * executor; an invalid setting reports `null`. */
+export function pendingRoleRpc(
+  store: DelegationStore,
+  defaultRole?: () => "none" | RoleId | undefined,
+) {
   return {
     setPendingRole({
       projectId,
@@ -164,16 +172,26 @@ export function pendingRoleRpc(store: DelegationStore) {
       return { ok: true as const };
     },
     pendingRole({ projectId }: { projectId: string | null }) {
-      const role =
+      const remembered =
         projectId === null ? undefined : store.pendingRole(projectId);
+      const picked =
+        remembered === "none" ||
+        (remembered !== undefined &&
+          isRoleId(remembered) &&
+          remembered !== "release-auditor" &&
+          remembered !== "helper")
+          ? (remembered as "none" | "orchestrator" | "executor" | "auditor")
+          : undefined;
+      if (picked !== undefined) return { role: picked };
+      const fallback = defaultRole?.();
       return {
         role:
-          role === "none" ||
-          (role !== undefined &&
-            isRoleId(role) &&
-            role !== "release-auditor" &&
-            role !== "helper")
-            ? (role as "none" | "orchestrator" | "executor" | "auditor")
+          fallback === "none" ||
+          (fallback !== undefined &&
+            isRoleId(fallback) &&
+            fallback !== "release-auditor" &&
+            fallback !== "helper")
+            ? (fallback as "none" | "orchestrator" | "executor" | "auditor")
             : null,
       };
     },
@@ -356,30 +374,31 @@ export async function createPlugin(
       default: '{"enabled": false}',
     },
     // §19.3 (r33): the role a root chat gets when the window never
-    // picked — executor by default, never orchestrator silently.
+    // picked — executor by default, `none` allowed, never orchestrator
+    // silently.
     defaultRole: {
       type: "string",
       label: "Default role",
       description:
-        "§19.3: the role applied to a new-chat/app thread without a remembered pick — `executor` (default), `orchestrator` or `auditor`. Anything else reads as executor with a journal warning.",
+        "§19.3: the role applied to a new-chat/app thread without a remembered pick — `executor` (default), `orchestrator`, `auditor` or `none`. Anything else is a needs-configuration state (no role assigned).",
       default: "executor",
     },
-    // §19.1 (r33): helper caps and default level.
+    // §19.1 (r33): the per-caller helper cap and the default level.
     helpers: {
       type: "string",
       label: "Helpers",
       description:
-        "§19.1: helpers JSON {maxActive?, maxPerCaller?, defaultLevel?} — maxPerCaller default 3; helpers also count inside the policy limits.maxActive. An invalid document warns in the journal and uses defaults.",
+        "§19.1: helpers JSON {maxActive?, defaultLevel?} — maxActive is the PER-CALLER cap (default 3); helpers also count inside the policy limits.maxActive. An invalid document warns in the journal and uses defaults.",
       default: "",
     },
-    // §19.5 (r33): manual children of role threads are refused unless
-    // the operator opts in.
+    // §19.5 (r33): manual children of role threads pass only for the
+    // listed origin plugin ids.
     allowForeignChildren: {
-      type: "boolean",
+      type: "string",
       label: "Allow foreign children",
       description:
-        "§19.5: let threads spawned outside the plugin (bb thread spawn / bb tasks dispatch / other plugins) run as children of orchestrator-role threads. Off — the message.dispatch hook refuses their first message and archives the thread.",
-      default: false,
+        "§19.5: comma-separated originPluginId allowlist whose threads may run as children of orchestrator-role threads (empty — the message.dispatch hook refuses their first message and archives the thread). `true` accepts a legacy boolean as allow-all.",
+      default: "",
     },
   });
 
@@ -484,13 +503,16 @@ export async function createPlugin(
     r33Mark: () => Number(store.metaGet("migration-r33")) || undefined,
   };
 
-  // §19.3 (r33): the configurable default — invalid values read as
-  // `executor` with a journal warning on the settings check.
-  const defaultRole = (): RoleId => {
+  // §19.3 (r33): the configurable default — `executor` when unset,
+  // `none` allowed; an INVALID value is `undefined` — the
+  // needs-configuration state (no role is written, the journal warns).
+  const defaultRole = (): RoleId | "none" | undefined => {
     const v = currentSettings.defaultRole;
+    if (v === undefined || v === "") return "executor";
+    if (v === NO_ROLE) return NO_ROLE;
     return isRoleId(v) && v !== "helper" && v !== "release-auditor"
       ? v
-      : "executor";
+      : undefined;
   };
 
   // §13.2 п.1-2: the role decision's read side — synchronous SQLite only,
@@ -508,7 +530,17 @@ export async function createPlugin(
     // children opt-in, and the configure-time age probe.
     defaultRole,
     helperById: (id) => store.helper(id),
-    allowForeignChildren: () => currentSettings.allowForeignChildren === true,
+    // §19.5: the allowlist of origin plugin ids; a legacy boolean
+    // `true` keeps working as allow-all.
+    allowForeignChildren: (pluginId) => {
+      const v = currentSettings.allowForeignChildren;
+      if ((v as unknown) === true) return true;
+      if (pluginId === null) return false;
+      const list = String(v ?? "")
+        .split(/[\s,]+/)
+        .filter(Boolean);
+      return list.includes(pluginId) || list.includes("*");
+    },
     noteThreadSeen: (threadId, createdAt) =>
       store.noteThreadSeen(threadId, createdAt),
   };
@@ -822,7 +854,8 @@ export async function createPlugin(
     for (const e of helpersLoad.errors) {
       bb.log.warn(`orchestrator helpers: ${e.path}: ${e.message}`);
     }
-    // §19.3: an unnameable defaultRole reads as `executor` — surface it.
+    // §19.3: an unnameable defaultRole is a needs-configuration state —
+    // no role is assigned while it stands.
     if (
       currentSettings.defaultRole !== undefined &&
       currentSettings.defaultRole !== "" &&
@@ -830,7 +863,7 @@ export async function createPlugin(
     ) {
       bb.log.warn(
         `orchestrator defaultRole: "${currentSettings.defaultRole}" ` +
-          `is not a pickable role — using executor`,
+          `is not a pickable role — needs-configuration (no role assigned)`,
       );
     }
     void execSettingsCheck();
@@ -855,7 +888,11 @@ export async function createPlugin(
         injectInstructions: currentSettings.injectInstructions ?? true,
         instructionsText: instructionsText(),
         probes,
-        policyOk: policyLoad.policy !== null,
+        // §19.3.5/§19.3.8 (r33): an INVALID defaultRole is also a
+        // needs-configuration state — it narrows configure like an
+        // invalid policy.
+        policyOk:
+          policyLoad.policy !== null && defaultRole() !== undefined,
         roleInstructions: roleTextFor,
         skills: skillSet(lang),
         warn: (m) => bb.log.warn(m),
@@ -890,7 +927,7 @@ export async function createPlugin(
         context,
         currentSettings.injectInstructions ?? true,
         instructionsText(),
-        policyLoad.policy !== null,
+        policyLoad.policy !== null && defaultRole() !== undefined,
         userPlugins(),
         roleTextFor("orchestrator"),
         skillSet(lang),
@@ -908,15 +945,17 @@ export async function createPlugin(
       (m) => bb.log.warn(`orchestrator: role hook skipped: ${m}`),
       {
         // §19.5: the refused manual child is archived in the background —
-        // outside the hook's synchronous budget.
+        // deferred so the hook's own decision lands before the archival.
         onRejectedChild: (threadId) => {
-          void bb.sdk.threads
-            .archive({ threadId })
-            .catch((e) =>
-              bb.log.warn(
-                `orchestrator: rejected child archive: ${describeError(e)}`,
-              ),
-            );
+          setTimeout(() => {
+            void bb.sdk.threads
+              .archive({ threadId })
+              .catch((e) =>
+                bb.log.warn(
+                  `orchestrator: rejected child archive: ${describeError(e)}`,
+                ),
+              );
+          }, 0);
         },
         rejectMessage: t("role.foreignChild"),
       },
@@ -948,6 +987,8 @@ export async function createPlugin(
       originPluginId: thread.originPluginId,
       projectId: thread.projectId,
       environmentId: thread.environmentId ?? null,
+      status: thread.status ?? null,
+      title: thread.title ?? thread.titleFallback ?? null,
     };
   };
 
@@ -959,6 +1000,8 @@ export async function createPlugin(
     stop: (a) => bb.sdk.threads.stop(a),
     list: (a) => bb.sdk.threads.list(a) as never,
     getPluginMetadata: (a) => bb.sdk.threads.getPluginMetadata(a),
+    updatePluginMetadata: (a) =>
+      bb.sdk.threads.updatePluginMetadata(a as never),
     archive: (a) => bb.sdk.threads.archive(a),
     events: {
       list: (a) => bb.sdk.threads.events.list(a as never) as never,
@@ -978,6 +1021,35 @@ export async function createPlugin(
     loadPolicy: () => loadPolicy(true),
     helpers: (): HelpersSettings => helpersLoad.config,
     callerFacts: helperCallerFacts,
+    // §19.1: the route's preset resolves into the spawn's provider/model
+    // fields through `bb tasks preset show` — the spawn schema carries
+    // no `preset` field.
+    presetShow: async (preset: string) => {
+      const shown = await runJson<{
+        preset?: {
+          providerId?: string;
+          modelId?: string | null;
+          reasoningLevel?: string | null;
+          serviceTier?: string | null;
+          permissionMode?: string;
+          instructions?: string;
+        };
+      }>(bbCli, ["tasks", "preset", "show", preset, "--json"]);
+      return shown.preset;
+    },
+    // §19.1 pre-r33 compatibility: a row-less thread that the §3
+    // criterion still recognizes as a coordinator keeps the helper.
+    isCoordinatorFallback: (c: HelperCallerFacts) =>
+      isCoordinator(
+        {
+          threadId: c.threadId,
+          parentThreadId: c.parentThreadId ?? null,
+          title: c.title ?? null,
+          originPluginId: c.originPluginId,
+          projectId: c.projectId,
+        },
+        probes,
+      ),
     t,
   };
   const helper = (input: Parameters<typeof runHelper>[0]) =>
@@ -997,6 +1069,17 @@ export async function createPlugin(
         ],
       }),
   });
+  // §19.1 cascade: a delegation leaving the active statuses cancels its
+  // helpers — every terminal outcome, reissues included.
+  store.onDelegationFinished = (id) => {
+    void helperWatchdog
+      .cancelHelpersOfDelegation(id)
+      .catch((e) =>
+        bb.log.warn(
+          `orchestrator: delegation#${id} helper cascade: ${describeError(e)}`,
+        ),
+      );
+  };
 
   const delegate = (input: {
     taskKey: string;
@@ -1543,7 +1626,7 @@ export async function createPlugin(
   // ── RPC (§13.2 п.1): the composer's «Роль» picker. ─────────────────
   // `projectId = null` is a projectless compose — the default role
   // applies and nothing is stored.
-  bb.rpc.register(rpcContract, pendingRoleRpc(store));
+  bb.rpc.register(rpcContract, pendingRoleRpc(store, defaultRole));
 
   // ── Agent tools (§6): coordinators only, via configure. ──────────────
 
@@ -1682,7 +1765,7 @@ export async function createPlugin(
     async execute(params, ctx) {
       try {
         return JSON.stringify(
-          await helper({ ...params, threadId: ctx.threadId }),
+          await helper({ ...params, threadId: ctx.threadId, via: "tool" }),
         );
       } catch (e) {
         return JSON.stringify(errorJson(e));
@@ -1729,7 +1812,9 @@ export async function createPlugin(
     const delegations = store.list(filter);
     const counts = store.countsByStatus();
     return {
-      active: store.activeCount(),
+      // §19.1 (r33): helpers occupy the same limits.maxActive pool —
+      // the active figure counts them together with delegations.
+      active: store.activeCount() + store.helperActiveCount(),
       counts,
       limits: policyLoad.policy?.limits ?? null,
       delegations,
@@ -1961,8 +2046,7 @@ export async function createPlugin(
       {
         name: "role",
         summary: t("cli.helpRoleS"),
-        usage:
-          "bb orchestrator role set <thread> <none|orchestrator|executor|auditor> [--json]",
+        usage: "bb orchestrator role set <thread> none [--json]",
       },
     ],
     async run(argv, ctx: PluginCliContext) {
@@ -2026,18 +2110,11 @@ export async function createPlugin(
             level: flag("--level"),
             preset: flag("--preset"),
             threadId: ctx.threadId,
+            via: "cli",
           });
           return json
             ? jsonOk(res)
-            : {
-                exitCode: 0,
-                stdout:
-                  t("cli.helperStarted", {
-                    id: res.helperId,
-                    thread: res.threadId ?? "—",
-                    preset: res.preset,
-                  }) + "\n",
-              };
+            : { exitCode: 0, stdout: res.message + "\n" };
         }
 
         if (cmd === "role") {

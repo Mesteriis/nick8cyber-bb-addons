@@ -396,16 +396,19 @@ export interface RoleDecisionProbes {
    * `["handoff", "external-compact"]`.
    */
   userThreadPlugins?(): readonly string[];
-  /** §19.3: the configurable default role (the `defaultRole` setting);
-   * an absent probe means the r33 default — `executor`. */
-  defaultRole?(): RoleId;
+  /** §19.3: the configurable default role (the `defaultRole` setting),
+   * `none` included. An absent probe means the r33 default —
+   * `executor`; a returned `undefined` means the setting is INVALID —
+   * a `needs-configuration` state, no role is written. */
+  defaultRole?(): RoleId | typeof NO_ROLE | undefined;
   /** §19.1: a `helper#<id>` spawn title is verified against the helpers
    * table before the helper role is written (a faked title alone does
    * not get it). */
   helperById?(id: number): { status: string } | undefined;
-  /** §19.5: manual children of role threads pass only with this
-   * operator opt-in. Absent = refused. */
-  allowForeignChildren?(): boolean;
+  /** §19.5: manual children of role threads pass only for the operator
+   * allowlist of `originPluginId`s (the `allowForeignChildren`
+   * setting). Absent probe / no match = refused. */
+  allowForeignChildren?(originPluginId: string | null): boolean;
   /** §19.3.6: the hook records every seen thread's `createdAt` so the
    * synchronous `configure` can tell pre-r33 threads from new ones. */
   noteThreadSeen?(threadId: string, createdAt: number): void;
@@ -440,8 +443,10 @@ export function decideRole(
     probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
   // §19.3: the hook records the selected role ALWAYS — an invalid
   // policy no longer drops the decision (§16.7 r33); the `defaultRole`
-  // setting picks the fallback, executor by default.
-  const defaultRole = probes.defaultRole?.() ?? "executor";
+  // setting picks the fallback — `executor` by default, `none`
+  // allowed, an invalid value = needs-configuration (no role written).
+  const defaultRole: RoleId | typeof NO_ROLE | undefined =
+    probes.defaultRole === undefined ? "executor" : probes.defaultRole();
 
   // 1. A thread created by `bb tasks dispatch` — or spawned by this
   //    plugin itself (§4 r30 д: `originPluginId = "orchestrator"`) — is
@@ -484,7 +489,7 @@ export function decideRole(
   //    human chat — the source's role already applied when decidable;
   //    without it the thread gets the configured default.
   if (facts.originPluginId && userPlugins.includes(facts.originPluginId)) {
-    return defaultRole;
+    return defaultRole ?? null;
   }
   // 4. A chat from the new-thread window takes the project's current
   //    pick; §19.3: `none` («Без плагина») is a real pick now.
@@ -499,7 +504,7 @@ export function decideRole(
     ) {
       return pending;
     }
-    return defaultRole;
+    return defaultRole ?? null;
   }
   // 5. §19.4 (r33): a CLI thread without a parent gets NO role — bb
   //    cannot tell an agent from a human. Plugin-, sdk- and
@@ -558,7 +563,7 @@ export function handleMessageDispatch(
         isRoleId(parentRole) &&
         pluginId !== "orchestrator" &&
         !(pluginId !== null && userPlugins.includes(pluginId)) &&
-        !(probes.allowForeignChildren?.() ?? false)
+        !(probes.allowForeignChildren?.(pluginId) ?? false)
       ) {
         opts?.onRejectedChild?.(context.thread.id);
         return {

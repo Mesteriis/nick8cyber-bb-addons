@@ -316,6 +316,9 @@ export const MIGRATIONS: readonly string[] = [
   `INSERT OR REPLACE INTO plugin_meta (key, value)
    VALUES ('migration-r33',
      CAST(CAST(strftime('%s','now') AS INTEGER) * 1000 AS TEXT))`,
+  // §19.6 (r33): the once-archived mark — the 24 h cleanup pass selects
+  // terminal helpers without it instead of re-archiving every minute.
+  `ALTER TABLE helpers ADD COLUMN archived_at INTEGER`,
 ];
 
 export type CommandRunStatus =
@@ -553,6 +556,8 @@ export interface HelperRow {
   turn_started_at: number | null;
   last_seq: number | null;
   notified_at: number | null;
+  /** §19.6: set once the janitor pass archived the terminal thread. */
+  archived_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -576,6 +581,11 @@ export class DelegationStore {
   eventHooksProvider:
     | (() => { hooks: EventHookSetting[]; cwd: string } | null)
     | null = null;
+
+  /** §19.1 (r33): the server wires the helper cascade here — every
+   * delegation that leaves the active statuses cancels its helpers
+   * (`done`/`reissued` fire as no-ops when no helper is left). */
+  onDelegationFinished?: (id: number, status: DelegationStatus) => void;
 
   constructor(db: Database) {
     this.db = db;
@@ -735,6 +745,9 @@ export class DelegationStore {
       const row = this.get(id);
       if (row) this.emitDelegationTransition(row, status, at);
     })();
+    if (status !== "dispatching" && status !== "running") {
+      this.onDelegationFinished?.(id, status);
+    }
   }
 
   /**
@@ -750,7 +763,7 @@ export class DelegationStore {
      * события review.verdict в той же транзакции. */
     opts?: { reviewVerdict?: { verdict: string; blockers: number | null } },
   ): boolean {
-    return this.db.transaction(() => {
+    const moved = this.db.transaction(() => {
       const at = Date.now();
       const info = this.db
         .prepare(
@@ -763,6 +776,10 @@ export class DelegationStore {
       if (row) this.emitDelegationTransition(row, to, at, opts);
       return true;
     })();
+    if (moved && to !== "dispatching" && to !== "running") {
+      this.onDelegationFinished?.(id, to);
+    }
+    return moved;
   }
 
   addSetupError(id: number, step: string, message: string): void {
@@ -1258,7 +1275,7 @@ export class DelegationStore {
     id: number,
     next: { route: string; preset: string; provider: string },
   ): DelegationRow | undefined {
-    return this.db.transaction(() => {
+    const next_ = this.db.transaction(() => {
       const row = this.get(id);
       if (
         !row ||
@@ -1306,6 +1323,8 @@ export class DelegationStore {
         );
       return this.get(Number(info.lastInsertRowid));
     })();
+    if (next_ !== undefined) this.onDelegationFinished?.(id, "reissued");
+    return next_;
   }
 
   /**
@@ -1575,9 +1594,9 @@ export class DelegationStore {
       title?: string | null;
     },
     caps: {
+      /** `helpers.maxActive` — active helpers of THIS caller (§19.1:
+       * the helpers setting is a per-caller cap). */
       perCaller: number;
-      /** `helpers.maxActive` — active helpers overall. */
-      helpersMax?: number;
       /** `limits.maxActive` — helpers count together with delegations
        * (ADR r33: «помощники в общем пределе политики»). */
       sharedMax?: number;
@@ -1594,15 +1613,6 @@ export class DelegationStore {
         );
       }
       const helpersActive = this.helperActiveCount();
-      if (
-        caps.helpersMax !== undefined &&
-        helpersActive >= caps.helpersMax
-      ) {
-        throw new OrchestratorError(
-          "limit",
-          `active helpers ${helpersActive}/${caps.helpersMax}`,
-        );
-      }
       if (caps.sharedMax !== undefined) {
         const shared = this.activeCount() + helpersActive;
         if (shared >= caps.sharedMax) {
@@ -1764,13 +1774,73 @@ export class DelegationStore {
       .run(Date.now(), id);
   }
 
+  /** §19.1 (Argon): a running helper's silence clock follows its last
+   * journal event — a direct write, not `COALESCE`: a stale spawn-time
+   * stamp would mark a busy helper stalled. */
   setHelperTurnStarted(id: number, at: number): void {
     this.db
       .prepare(
-        `UPDATE helpers SET turn_started_at = COALESCE(turn_started_at, ?),
-         updated_at = ? WHERE id = ?`,
+        `UPDATE helpers SET turn_started_at = ?, updated_at = ?
+         WHERE id = ?`,
       )
       .run(at, Date.now(), id);
+  }
+
+  /** §19.1: the atomic terminal flip — a racing finish/cancel loses to
+   * whoever committed first. Returns true when the row moved. */
+  setHelperTerminal(id: number, to: HelperStatus): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE helpers SET status = ?, updated_at = ?
+           WHERE id = ? AND status IN ('dispatching','running')`,
+        )
+        .run(to, Date.now(), id).changes > 0
+    );
+  }
+
+  /** §19.1: the once-per-outcome line mark — atomic so a racing
+   * notification path cannot double-send. */
+  setHelperNotifiedIf(id: number, at: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE helpers SET notified_at = ?, updated_at = ?
+           WHERE id = ? AND notified_at IS NULL`,
+        )
+        .run(at, Date.now(), id).changes > 0
+    );
+  }
+
+  /** Dispatching and cancelled rows still lacking `thread_id` — the
+   * reconcile's relink scope: a cancelled row's surfaced child is
+   * still found and stopped (§19.1: «отмена до thread_id»). */
+  listUnlinkedHelpers(): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE thread_id IS NULL
+         AND status IN ('dispatching','cancelled') ORDER BY id`,
+      )
+      .all() as HelperRow[];
+  }
+
+  /** §19.6: terminal helpers past the archive age whose thread has not
+   * been archived yet — the marked `archived_at` keeps the janitor
+   * pass from re-archiving the same row every minute. */
+  listHelpersForArchive(olderThan: number): HelperRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM helpers WHERE thread_id IS NOT NULL
+         AND status NOT IN ('dispatching','running')
+         AND archived_at IS NULL AND updated_at < ? ORDER BY id`,
+      )
+      .all(olderThan) as HelperRow[];
+  }
+
+  markHelperArchived(id: number): void {
+    this.db
+      .prepare(`UPDATE helpers SET archived_at = ? WHERE id = ?`)
+      .run(Date.now(), id);
   }
 
   clearHelperTurn(id: number): void {

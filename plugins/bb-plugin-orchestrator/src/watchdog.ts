@@ -2377,12 +2377,14 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (queue.length === 0) {
       // §19.1 (r33): active helpers keep the delegation `running` — the
       // executor's turn end is NOT an outcome while its helpers work.
-      // The `helpers-pending` mark remembers when the wait began:
-      // `checkTimers` lifts it when the helpers finish, and after the
-      // level's first-response window without an executor resume the
-      // normal outcome path below continues.
+      // The `helpers-pending` mark is "waiting" while helpers run;
+      // `checkTimers` stamps the moment they ALL finish and counts the
+      // post-helper first-response window from THERE (not from the
+      // executor's idle) — one mark per step, no duplicates.
       if (store.activeHelpersByDelegation(row.id).length > 0) {
-        store.addSetupError(row.id, "helpers-pending", String(now()));
+        if (!store.findSetupError(row, "helpers-pending")) {
+          store.addSetupError(row.id, "helpers-pending", "waiting");
+        }
         return;
       }
       // §5.3 r23 `errored`: the turn may have ended with an error while
@@ -2757,10 +2759,23 @@ export function createWatchdog(deps: WatchdogDeps) {
       // normal outcome calculation continues (evaluateIdle).
       const helpersPending = store.findSetupError(row, "helpers-pending");
       if (helpersPending) {
-        const markedAt = Number(helpersPending.message) || nowMs;
         if (store.activeHelpersByDelegation(row.id).length > 0) {
+          // Helpers still work — or came back after a zero moment:
+          // keep (or reset) the plain "waiting" mark, no window yet.
+          if (helpersPending.message !== "waiting") {
+            store.removeSetupErrors(row.id, "helpers-pending");
+            store.addSetupError(row.id, "helpers-pending", "waiting");
+          }
           continue;
         }
+        if (helpersPending.message === "waiting") {
+          // The helpers just reached zero — the post-helper window
+          // starts NOW.
+          store.removeSetupErrors(row.id, "helpers-pending");
+          store.addSetupError(row.id, "helpers-pending", String(nowMs));
+          continue;
+        }
+        const markedAt = Number(helpersPending.message) || nowMs;
         const resumed =
           row.turn_started_at != null && row.turn_started_at > markedAt;
         if (resumed || nowMs - markedAt <= firstMs) {

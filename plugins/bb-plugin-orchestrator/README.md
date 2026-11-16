@@ -174,10 +174,11 @@ tools and skills the thread may use.
   Threads older than the r33 migration fall back to the §3 criterion:
   no parent and no executor markers → coordinator; newer threads without
   a recorded role are `none` (a journal warning names the hole).
-- **Manual role**: `bb orchestrator role set <thread> <none|orchestrator|
-  executor|auditor>` rewrites a role outside active work (`role-active`
-  refusal); `helper` is never settable, `orchestrator` only on a root
-  human thread. Writes record a `role.manual` event.
+- **Manual role**: `bb orchestrator role set <thread> none` is the ONLY
+  manual change (§19.4) — every other target refuses `role-not-allowed`;
+  promotion is hook/plugin-managed. A helper thread's role cannot be
+  touched, active work refuses `role-active`, and the demotion clears
+  the `pluginMetadata.role` badge. Writes record a `role.manual` event.
 - **Limitations** (§13.2 item 5, §13.3): the plugin grants and withholds only
   its own tools — provider built-ins (file edits, shell) stay governed by
   the preset's permission mode. The role's instruction reaches the agent
@@ -209,16 +210,18 @@ notification, the plugin sends only the launch notice and outcome lines.
   `pluginMetadata.helperId`, and cascades — an archived/deleted caller or
   a finished delegation cancels its helpers; a helper thread removed by
   hand is `cancelled` + one «removed manually» line.
-- **Limits**: `helpers.maxPerCaller` (default 3), `helpers.maxActive`
-  (global), and the policy's shared `limits.maxActive` — checked
-  atomically with the row insert inside the dispatch queue.
+- **Limits**: `helpers.maxActive` is the PER-CALLER cap (default 3;
+  `maxPerCaller` is accepted as a legacy alias), and helpers also count
+  inside the policy's shared `limits.maxActive` together with
+  delegations — both are checked atomically with the row insert inside
+  the dispatch queue.
 - **Delegation interplay**: active helpers keep their delegation
   `running` (`helpers-pending` mark — the timer re-evaluates after they
   finish), and `merge` refuses with `helpers-active` until they end.
 - **Foreign children**: a manual `bb thread spawn`/`bb tasks dispatch`
   child of a role thread is rejected on its first message — children of
-  role threads are plugin-created only. `allowForeignChildren` (default
-  off) opts out.
+  role threads are plugin-created only. `allowForeignChildren` is an
+  `originPluginId` allowlist (empty — refuse all).
 
 ## Setup
 
@@ -288,11 +291,12 @@ map presets onto levels and fallback chains, write the policy, validate.
 - `defaultRole` (§19.3, default `executor`) — the role an undecided
   human/app thread gets: `orchestrator`, `executor`, `auditor` or `none`.
 - `helpers` (§19.1, JSON) — `{maxActive?, maxPerCaller?, defaultLevel?}`;
-  `maxPerCaller` defaults to 3, helpers also count inside the policy's
-  `limits.maxActive`.
-- `allowForeignChildren` (§19.5, default off) — permit manually created
-  child threads under role threads; off — the first message of such a
-  child is rejected and the thread archived.
+  `maxActive` is the per-caller cap (default 3, `maxPerCaller` a legacy
+  alias), helpers also count inside the policy's `limits.maxActive`.
+- `allowForeignChildren` (§19.5, comma-separated) — an `originPluginId`
+  allowlist whose threads may run as children of role threads (`*`
+  allows all; a legacy boolean `true` reads as allow-all). Empty — such
+  a child's first message is rejected and the thread archived.
 - `maxConcurrentCommands` (§18.2, default 4) — cap on simultaneously
   running journaled commands (postPublish and event hooks).
 - `retentionDays` (§18.2, default 30) — `command_runs` and `events`
