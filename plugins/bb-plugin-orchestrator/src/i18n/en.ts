@@ -856,7 +856,7 @@ export const EN: Record<string, string> = {
   "role.mand.auditor": "End the report with the JSON line {\"verdict\":\"OK\"|\"CHANGES\",\"blockers\":<number of blocking findings>} — the release pipeline reads it.",
   "role.body.helper": "You are the helper. Your role is to do exactly the assigned task and report back.\n\n- Do only the assigned task — nothing beyond it.\n- Do not launch subagents or helpers — a helper never fans out.\n- Do not commit, do not push, do not create branches or PRs — leave all changes in the working tree for the caller.\n- Report a short result in your final response — the caller reads it from the child notification.",
   "role.mand.helper": "- Do not modify the machine outside your own working copy: no sudo, no package installs — if something is missing, tell the coordinator instead of doing it yourself.",
-  "role.foreignChild": "children of an orchestrator role thread are created by the plugin only — use orchestrator_helper instead of `bb thread spawn`/`bb tasks dispatch`",
+  "role.foreignChild": "a plugin-role thread creates helpers only through orchestrator_helper, executors — through delegate",
   "pp.reviewSweepError": "orchestrator release: review pass for {task}: {error}",
 
   // ── helper.ts / §19.1–19.6 (r33) — CLI, tool, status, watchdog ─────

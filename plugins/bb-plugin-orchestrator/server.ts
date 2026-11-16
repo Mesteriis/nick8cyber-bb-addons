@@ -397,7 +397,7 @@ export async function createPlugin(
       type: "string",
       label: "Allow foreign children",
       description:
-        "§19.5: comma-separated originPluginId allowlist whose threads may run as children of orchestrator-role threads (empty — the message.dispatch hook refuses their first message and archives the thread). `true` accepts a legacy boolean as allow-all.",
+        "§19.5: comma-separated originPluginId allowlist whose threads may run as children of threads with any plugin role except `none` (empty — the message.dispatch hook refuses their first message and archives the thread). `true` accepts a legacy boolean as allow-all.",
       default: "",
     },
   });

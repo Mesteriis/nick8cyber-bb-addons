@@ -274,12 +274,14 @@ map presets onto levels and fallback chains, write the policy, validate.
   needs-configuration line. The `~/.cache/bb-handoff/<thread>.md`
   fallback for providers without `$BB_THREAD_STORAGE` stays built-in.
 - `userThreadPlugins` (§17.1, comma/space-separated) — plugin ids whose
-  threads continue a human chat (session handoff, chat compaction) and
-  keep the coordinator role. Default EMPTY — a plugin-born thread gets
-  the `none` role unless its id is listed here. Only an explicitly
-  SAVED value is kept on upgrade — set it before updating (e.g.
-  `bb plugin config orchestrator set userThreadPlugins "handoff
-  external-compact"`), not rely on the previous schema default.
+  threads continue a human chat (session handoff, chat compaction):
+  their threads inherit the source thread's role (`none` included);
+  a root thread without a source gets `defaultRole` (`executor` by
+  default). Default EMPTY — a plugin-born thread gets the `none` role
+  unless its id is listed here. Only an explicitly SAVED value is kept
+  on upgrade — set it before updating (e.g. `bb plugin config
+  orchestrator set userThreadPlugins "handoff external-compact"`), not
+  rely on the previous schema default.
 - `release` (multiline JSON, orchestrator-release §6) — the release
   pipeline config: `commitIdentity`, `defaults` and per-project
   overrides (`target`, `sync`, `checks`, `public`, `docsMap`, `leaks`,

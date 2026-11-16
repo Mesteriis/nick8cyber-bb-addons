@@ -570,9 +570,8 @@ export function handleMessageDispatch(
           action: "reject",
           message:
             opts?.rejectMessage ??
-            "a child of an orchestrator role thread is created by the " +
-              "plugin only — use orchestrator_helper instead of " +
-              "`bb thread spawn`/`bb tasks dispatch`",
+            "a plugin-role thread creates helpers only through " +
+              "orchestrator_helper, executors — through delegate",
         };
       }
     }
