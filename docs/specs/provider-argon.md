@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 3
+revision: 4
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -39,17 +39,25 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 - **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "argon-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }`.
 - **`session/new` и `session/load`**:
-  - Создают или восстанавливают запись сессии `{ id, cwd, model, thinking, convId, backendId }`.
+  - `session/new` создаёт новую запись сессии `{ id, cwd, model, thinking, convId, account, backend }`.
+  - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
   - Возвращают список моделей `models.availableModels`:
     - `argon` — «Gemini (Argon)» (модель по умолчанию для Gemini 4)
     - `fast` — «Gemini 3 Flash (Fast)»
     - `thinking` — «Gemini 3 Flash (Thinking)»
     - `pro` — «Gemini 3.1 Pro (старая 3.1, не рекомендуется)»
-  - Возвращают конфигурационную опцию `configOptions` с `id: "thinking"`, `category: "thought_level"`, значениями `fast` / `thinking` / `pro`, а также опцию `thought_level` со значениями `low` / `medium` / `high`, синхронизированную с `capabilities.reasoningLevels` BB.
+  - Возвращают конфигурационные опции `configOptions`:
+    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `fast`, `thinking`, `pro`);
+    - `thinking` (категория `"thought_level"`): значения `fast` / `thinking` / `pro`;
+    - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB;
+    - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): выбор аккаунта (`"auto"` или конкретный `id` аккаунта).
+  Все опции принимаются и обрабатываются в `session/set_config_option`.
 - **`session/set_model`** — меняет `s.model` и синхронизирует `s.thinking`, если `modelId` входит в `{ "argon", "fast", "thinking", "pro" }`. Для модели `argon` режим рассуждения по умолчанию — `medium` (или `high` при запрошенном reasoning `high`).
 - **`session/set_config_option`**:
-  - при `configId === "thinking"` обновляет `s.thinking` (`fast` / `thinking` / `pro`) и соответствующий `s.model`;
-  - при `configId === "thought_level"` преобразует уровень: `"low"` → `thinking: "low"`, `"medium"` → `thinking: "medium"`, `"high"` → `thinking: "high"`, обеспечивая полную совместимость с пресетами оркестратора `argon-review` и `argon-research` (передающими `model: "argon"`, `reasoning: "high"` по §§20.4, 21.4).
+  - при `configId === "thought_level"` преобразует уровень: `"low"` → `thinking: "low"` (и `model = "fast"`, если `s.model !== "argon"`), `"medium"` → `thinking: "medium"` (и `model = "thinking"`), `"high"` → `thinking: "high"` (и `model = "pro"`), обеспечивая полную совместимость с пресетами оркестратора `argon-review` и `argon-research` (передающими `model: "argon"`, `reasoning: "high"` по §§20.4, 21.4);
+  - при `configId === "thinking"` обновляет `s.thinking` (`fast` / `low` → `"low"`, `thinking` / `medium` → `"medium"`, `pro` / `high` → `"high"`) и аналогично синхронизирует `s.model`;
+  - при `configId === "model"` обновляет `s.model` и уровень `s.thinking` по умолчанию;
+  - при `configId === "account"` обновляет `s.account` (`"auto"` или id аккаунта); при смене аккаунта сбрасывает `s.backend = null` и `s.convId = null`.
 - **Передача в веб-драйвер**:
   - В драйвер передаётся `model: s.model` (`"argon"` передаётся как есть, без подмены на `"thinking"`, чтобы селектор модели не искал несуществующую модель).
   - Уровни размышлений в UI и словаре драйвера — строго `low` / `medium` / `high` (и их русские аналоги «низкий» / «средний» / «высокий»). Сервер ACP нормализует значение `s.thinking` перед передачей в `sendPrompt`:
@@ -62,12 +70,11 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 - На каждый вызов `session/prompt`:
   1. Текстовые блоки из `params.prompt` склеиваются в строку `text`; при пустом тексте немедленно возвращается `{ stopReason: "end_turn" }`.
   2. При `ARGON_FAKE=1` сервер отправляет нотификацию `session/update` (`sessionUpdate: "agent_message_chunk"`, `text: "FAKE_ARGON_ECHO: " + text.slice(0, 80)`). Если задана задержка `process.env.ARGON_FAKE_DELAY_MS`, генерация удерживает аренду в течение этой паузы для проверки отмены и корректного завершения. По завершении возвращает `{ stopReason: "end_turn" }`.
-  3. В боевом режиме выбирается аккаунт из пула (§3), захватывается аренда (`tryAcquireLease`), и драйвер вызывает `sendPrompt(text, { onChunk, signal, isNewChat: !s.convId, convId: s.convId, model: s.model, thinking: mappedThinking, profile: backend.profileDir || backend.profile || backend.id, cdpPort: backend.cdp || backend.cdpPort, strict: true })`.
+  3. В боевом режиме выбирается аккаунт из пула (§3), захватывается аренда через `bindBackend` / `acquireInState`, и драйвер вызывает `sendPrompt(text, { onChunk, signal, isNewChat: !s.convId, convId: s.convId, model: s.model, thinking: mappedThinking, profile: backend.profileDir || backend.profile || backend.id, cdpPort: backend.cdp || backend.cdpPort, strict: true })`.
   4. Каждая дельта `onChunk(delta)` немедленно отправляется нотификацией `session/update` с `sessionUpdate: "agent_message_chunk"`.
   5. После завершения генерации `s.convId` обновляется из возвращённого драйвером `res.convId` (или `driver.page.url()`), аренда освобождается (`releaseLease`), и возвращается `{ stopReason: "end_turn" }`.
-- При получении **`session/cancel`** (или при закрытии потока):
-  - отмена инициируется только для сессии, чей `id === params.sessionId` (или общий активный ход при отсутствии фильтра по id);
-  - вызывается `activePrompt.abort.abort()`;
+- При получении **`session/cancel`** (как нотификации, так и запроса):
+  - отмена инициируется только для сессии, чей `id === params.sessionId`: если `activePromptSessionId === s.id`, вызывается `activePrompt.abort.abort()` (сессии с неизвестным `sessionId` или без него не прерывают чужой активный ход);
   - драйвер перед выходом из `sendPrompt` кликает по кнопке остановки генерации в веб-интерфейсе Gemini (`button[aria-label*="Stop" i], button[aria-label*="Остановить" i]`), чтобы браузерная вкладка немедленно прекратила генерацию;
   - `session/prompt` завершается со `{ stopReason: "cancelled" }` без пометки аккаунта кулдауном.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), ожидает завершения вызова драйвера (срабатывание Stop и парковка вкладки на `about:blank`) с таймаутом до 10–15 с, дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд и остановку генерации в браузере.
@@ -76,7 +83,6 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 - Внешний дедлайн хода в `acp-server.mjs`: `SEND_DEADLINE_MS = Number(process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000` (20 минут, предотвращает обрыв длинных глубоких ревью на `argon` high).
 - Внутренний потолок ожидания генерации в `src/gemini-driver.js`: `MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000` (15 минут).
-- Порог отсутствия прогресса при пустом ответе (`STALL_NO_PROGRESS_MS`): `90_000` мс (90 с).
 
 ---
 
@@ -125,10 +131,10 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   - английские форматы: `"Limit resets 2:19 AM"`, `"Limit resets at 14:30"`, `"Limit resets tomorrow at 11:00 AM"`, `"Limit resets Oct 15, 2:19 AM"`, `"Limit resets on Nov 16, 11:00 PM"`;
   - русские форматы: `"Лимит обновится в 14:30"`, `"Лимит сбросится завтра в 09:15"`.
   Правило переноса года: если дата в сообщении указана без года (например, `"Oct 15"`), то если вычисленная дата оказывается раньше текущей больше чем на 30 дней (`targetMs < nowMs - 30 * 86_400_000`), она переносится на следующий год, иначе остаётся в текущем году. К вычисленному времени добавляется буфер 2 минуты (`+ 2 * 60_000`).
-- **Строгий выбор уровня мышления (`strict: true`)**:
+- **Строгий выбор уровня мышления (`strict: true`) и ротация**:
   - Если в меню выбора режима мышления (`selectModelAndThinking`) запрошенный пункт (`Fast`, `Thinking` или `Pro`) имеет `isDisabled === true` (`aria-disabled="true"` / класс `disabled`), при `strict: true` драйвер обязан выбросить `new ModelUnavailable('thinking', '<thinking> thinking level is rate-limited (<reset text>)')` **до** общей проверки `if (strict) throw new ModelUnavailable('thinking', ... 'not found')`.
-  - Благодаря этому `acp-server.mjs` классифицирует отказ как `rate-limit` с точным временем сброса из текста меню (`Limit resets ...`) и прозрачно переключает запрос на следующий аккаунт пула, не блокируя аккаунт на 6 часов как `model-unavailable`.
-- Если при ротации в середине диалога (`s.convId` уже был задан) выбирается другой аккаунт (`b.id !== s.backendId`), `s.convId` сбрасывается в `null`, так как ID беседы привязан к аккаунту Google.
+  - Благодаря этому `acp-server.mjs` классифицирует отказ как `rate-limit` с точным временем сброса из текста меню (`Limit resets ...`). Для новых чатов (когда `!s.convId` и клиенту ещё не отправлен ни один чанк `!streamedAny`) сервер прозрачно переключает запрос на следующий свободный аккаунт пула, не блокируя аккаунт на 6 часов как `model-unavailable`.
+  - Ротация на следующий аккаунт пула при исчерпании лимита или временной ошибке выполняется **только** для новых чатов (до фиксации `s.convId` и до отправки первого чанка клиенту). Если беседа уже имеет зафиксированный `s.convId`, она остаётся строго привязана к своему аккаунту (`s.backend`), так как история и ID беседы принадлежат конкретному аккаунту Google; при кулдауне или занятости этого аккаунта запрос не переключается на другие аккаунты, а завершается ошибкой (`account "<id>" is in cooldown until ...; this conversation is pinned to it`).
 
 ---
 

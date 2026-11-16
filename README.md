@@ -8,6 +8,7 @@ Install any of them straight from this repository:
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin ru
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin favorite-models
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-agy
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-argon
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin pi-gateways
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin speak
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin compact-ui
@@ -90,6 +91,34 @@ the `devin` CLI and its hook set installed.
 
 Details in
 [plugins/bb-plugin-provider-devin/README.md](plugins/bb-plugin-provider-devin/README.md).
+
+### `provider-argon` — Gemini (Argon)
+
+Runs bb threads on Google Gemini's web interface (`gemini.google.com`) without
+API keys as an `acp-argon` ACP provider over Chrome DevTools Protocol
+(`playwright-core`). Used by orchestrator presets (`argon-review`, `argon-research`).
+
+- **Account pool and state.** Multiple Google accounts in `pool.json` with
+  exclusive per-turn leases (`accounts-state.json`), quotas, and automatic
+  rotation on rate-limits for new chats.
+- **Reasoning levels.** Maps `thought_level` (`low`, `medium`, `high`) to
+  Gemini thinking modes (`fast`, `thinking`, `pro`), with strict checks on
+  disabled/quota-limited levels and reset-time parsing.
+- **Resource hygiene.** Multi-turn streaming with DOM isolation
+  (`findTurnTarget`), prompt paste safety for large context (>500 chars),
+  stop-button cancel handling, and automatic idle tab parking to `about:blank`
+  for 0% background CPU usage.
+
+Requirements: Google Chrome, `playwright-core`, and an account pool (`pool.json`) with authenticated profiles.
+
+```bash
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-argon
+```
+
+Architecture and design contract:
+[spec](docs/specs/provider-argon.md),
+[ADR 0027](docs/adr/0027-provider-argon-acp.md),
+[plugins/bb-plugin-provider-argon/README.md](plugins/bb-plugin-provider-argon/README.md).
 
 ### `pi-gateways`
 
