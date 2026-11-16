@@ -215,8 +215,8 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     "gemini-driver.js must use responses[idx]"
   );
   assert.ok(
-    driverSrc.includes("const last = responses[idx];"),
-    "gemini-driver.js must check hasFinishedContent with responses[idx]"
+    driverSrc.includes("function findTurnTarget(doc, idx, promptPrefix)"),
+    "gemini-driver.js must define findTurnTarget"
   );
 
   // Mock page for selectModelAndThinking
@@ -452,6 +452,14 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
 
   const targetMismatch = findTurnTarget(mockDocMultiline, 0, "Different \n\n prompt   content");
   assert.equal(targetMismatch, null, "findTurnTarget must return null for non-matching multiline prompt");
+
+  const slicedPrefix = multilinePrompt.replace(/\s+/g, " ").trim().slice(0, 40);
+  const targetSliced = findTurnTarget(mockDocMultiline, 0, slicedPrefix);
+  assert.equal(
+    targetSliced,
+    nodeRespMultiline,
+    "findTurnTarget must correctly match when given 40-char sliced promptPrefix"
+  );
 });
 
 test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease retention and selective cancel", async () => {
@@ -536,6 +544,10 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   assert.ok(sessionId.startsWith("argon-"));
   assert.ok(r2.result.models.availableModels.includes("argon"));
   assert.ok(r2.result.models.availableModels.includes("pro"));
+  assert.equal(
+    MODELS.find((m) => m.value === "pro")?.name,
+    "Gemini 3.1 Pro (старая 3.1, не рекомендуется)"
+  );
 
   // 3. session/set_model
   sendReq({

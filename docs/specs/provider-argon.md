@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 1
+revision: 2
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -44,7 +44,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     - `argon` — «Gemini (Argon)» (модель по умолчанию для Gemini 4)
     - `fast` — «Gemini 3 Flash (Fast)»
     - `thinking` — «Gemini 3 Flash (Thinking)»
-    - `pro` — «Gemini 3 Pro»
+    - `pro` — «Gemini 3.1 Pro (старая 3.1, не рекомендуется)»
   - Возвращают конфигурационную опцию `configOptions` с `id: "thinking"`, `category: "thought_level"`, значениями `fast` / `thinking` / `pro`, а также опцию `thought_level` со значениями `low` / `medium` / `high`, синхронизированную с `capabilities.reasoningLevels` BB.
 - **`session/set_model`** — меняет `s.model` и синхронизирует `s.thinking`, если `modelId` входит в `{ "argon", "fast", "thinking", "pro" }`. Для модели `argon` режим рассуждения по умолчанию — `medium` (или `high` при запрошенном reasoning `high`).
 - **`session/set_config_option`**:
@@ -109,7 +109,8 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 ### 3.2 Аренда (`leases`) и защита от зависших замков
 
 - Один процесс Chrome (`cdpPort`) в один момент времени обслуживает не более одного активного хода (`leases[backendId] = { pid, acquiredMs }`).
-- При чтении состояния просроченные аренды (`now - acquiredMs >= LEASE_TTL_MS`, где `LEASE_TTL_MS = 10 * 60_000`) и аренды мёртвых процессов (`!isPidAlive(pid)`) автоматически очищаются.
+- Пока идёт ход, аренда удерживаемого бэкенда периодически продлевается каждые 60 секунд (периодический таймер обновляет `acquiredMs: Date.now()`), что предотвращает истечение аренды во время длинных ходов (вплоть до `SEND_DEADLINE_MS = 20` минут).
+- При чтении состояния просроченные аренды (`now - acquiredMs >= LEASE_TTL_MS`, где `LEASE_TTL_MS = 10 * 60_000`) и аренды мёртвых процессов (`!isPidAlive(pid)`) автоматически очищаются. Таймаут `LEASE_TTL_MS = 10` минут срабатывает только для зависших или аварийно завершившихся процессов.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд при перезапуске моста или отмене треда демоном BB.
 
 ### 3.3 Классификация отказов и ротация
@@ -119,10 +120,11 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   2. **`rate-limit`** (`CooldownMs = parsedResetMs || 30 * 60_000`): `"rate-limit"`, `"rate limit"`, `"quota"`, `"limit resets"`, `"thinking level unavailable"`, `"thinking level is rate-limited"`, `"try again later"`, `"too many requests"`, `"лимит"`, `"повторите попытку позже"`.
   3. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`): `"modelunavailable"`, `"model is unavailable"`, `"not available for this account"`, `"недоступна"`.
   4. **`transient`** (без кулдауна аккаунта, но с попыткой переключения на другой свободный аккаунт в рамках текущего хода): сетевые/CDP сбои, таймаут ожидания генерации.
+- Итоговый кулдаун ограничен потолком 7 суток: `Math.min(cooldownMs, 7 * 86_400_000)`.
 - Разбор времени сброса квоты `parseResetTimeMs(msg, nowMs)` поддерживает:
   - английские форматы: `"Limit resets 2:19 AM"`, `"Limit resets at 14:30"`, `"Limit resets tomorrow at 11:00 AM"`, `"Limit resets Oct 15, 2:19 AM"`, `"Limit resets on Nov 16, 11:00 PM"`;
   - русские форматы: `"Лимит обновится в 14:30"`, `"Лимит сбросится завтра в 09:15"`.
-  К вычисленному времени добавляется буфер 2 минуты (`+ 2 * 60_000`).
+  Правило переноса года: если дата в сообщении указана без года (например, `"Oct 15"`), то если вычисленная дата оказывается раньше текущей больше чем на 30 дней (`targetMs < nowMs - 30 * 86_400_000`), она переносится на следующий год, иначе остаётся в текущем году. К вычисленному времени добавляется буфер 2 минуты (`+ 2 * 60_000`).
 - **Строгий выбор уровня мышления (`strict: true`)**:
   - Если в меню выбора режима мышления (`selectModelAndThinking`) запрошенный пункт (`Fast`, `Thinking` или `Pro`) имеет `isDisabled === true` (`aria-disabled="true"` / класс `disabled`), при `strict: true` драйвер обязан выбросить `new ModelUnavailable('thinking', '<thinking> thinking level is rate-limited (<reset text>)')` **до** общей проверки `if (strict) throw new ModelUnavailable('thinking', ... 'not found')`.
   - Благодаря этому `acp-server.mjs` классифицирует отказ как `rate-limit` с точным временем сброса из текста меню (`Limit resets ...`) и прозрачно переключает запрос на следующий аккаунт пула, не блокируя аккаунт на 6 часов как `model-unavailable`.
@@ -144,11 +146,17 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 ### 4.2 Многоходовый стриминг без утечки предыдущего ответа
 
-- Перед отправкой промпта драйвер фиксирует число уже существующих в DOM узлов `<model-response>`: `initialCount = await page.locator('model-response').count()`.
-- Индекс нового ответа для текущего хода строго равен `idx = initialCount`.
-- Внутри `MutationObserver` (`extract()`) и в проверке завершения генерации (`hasFinishedContent`):
-  - разрешено обращаться **только** к `const target = responses[idx]; if (!target) return;` (и соответственно `const last = responses[idx]; if (!last) return false;`). В `page.evaluate` для `hasFinishedContent` аргумент `initialCount` обязательно передаётся явным параметром (`page.evaluate((idx) => ..., initialCount)`), чтобы `idx` внутри браузерного контекста не оказывался `undefined`;
-  - **запрещён** откат `responses[idx] || responses[responses.length - 1]`, так как на втором и последующих ходах (`isNewChat: false`, `initialCount >= 1`) до появления нового `<model-response>` последним элементом массива является ответ предыдущего хода, что приводит к мгновенному ложному завершению хода со старым текстом.
+- Перед отправкой промпта драйвер фиксирует число уже существующих в DOM узлов `<model-response>`. В новом чате (`!convId`) берётся текущее число `(await page.$$('model-response')).length`. В существующей беседе (`convId`) вызывается `waitForHistoryStabilization(page, convId)`: функция с интервалом 350 мс опрашивает число `<model-response>` и ждёт двух совпадающих замеров подряд (потолок 10 с), чтобы гарантировать, что история предыдущих ходов полностью отрисовалась в DOM перед вычислением `initialCount`.
+- Индекс нового ответа для текущего хода равен `idx = initialCount`.
+- Начало генерации проверяется в цикле до 120 с: генерация считается начавшейся (`started === true`), если в DOM появилась кнопка остановки (`button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]`) либо функция `findTurnTarget(document, idx, promptPrefix)` вернула узел ответа.
+- Контракт поиска целевого ответа хода (`findTurnTarget(doc, idx, promptPrefix)`):
+  - берётся элемент `target = responses[idx]`; если он отсутствует — возвращается `null`;
+  - проверяется список узлов `<user-query>`. Последний запрос `lastQuery` должен содержать нормализованный префикс промпта (первые 40 символов промпта с нормализацией повторяющихся пробельных символов `norm(lastQuery.innerText).includes(norm(promptPrefix).slice(0, 40))`);
+  - проверяется порядок в DOM: целевой ответ `target` должен следовать строго после `lastQuery` (`lastQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING`);
+  - при невыполнении любого условия возвращается `null`.
+- Для отслеживания текста и проверки завершения генерации (`currentText`, `hasFinishedContent`):
+  - обращения идут строго через `findTurnTarget(document, idx, promptPrefix)`;
+  - **запрещён** откат к `responses[responses.length - 1]`, так как на втором и последующих ходах (`isNewChat: false`, `initialCount >= 1`) до появления нового `<model-response>` последним элементом массива в DOM является ответ предыдущего хода, что приводило к мгновенному ложному завершению хода со старым текстом.
 
 ### 4.3 Захват `convId` и парковка вкладки (`about:blank`) в простое
 

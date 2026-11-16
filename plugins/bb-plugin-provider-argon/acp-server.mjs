@@ -547,7 +547,7 @@ export const MODELS = [
   { value: "argon", name: "Gemini (Argon)" },
   { value: "fast", name: "Gemini 3 Flash (Fast)" },
   { value: "thinking", name: "Gemini 3 Flash (Thinking)" },
-  { value: "pro", name: "Gemini 3 Pro" },
+  { value: "pro", name: "Gemini 3.1 Pro (старая 3.1, не рекомендуется)" },
 ];
 
 function configOptionsFor(s, backends = BACKENDS) {

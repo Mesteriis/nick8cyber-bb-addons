@@ -588,7 +588,6 @@ async function stopGeneration(page) {
 function findTurnTarget(doc, idx, promptPrefix) {
   const responses = doc.querySelectorAll('model-response');
   const target = responses[idx];
-  const last = responses[idx];
   if (!target) return null;
   const queries = doc.querySelectorAll('user-query');
   if (queries.length === 0) return null;
@@ -659,7 +658,7 @@ async function sendPrompt({
   shouldCancel = null
 }) {
   const isStrict = Boolean(strict || strictModel);
-  const promptPrefix = prompt;
+  const promptPrefix = prompt.replace(/\s+/g, ' ').trim().slice(0, 40);
   // Port-local: never read the module-global CDP_PORT here. A cancelled send
   // finishing after the queue moved on must still only touch its own backend.
   const port = cdpPort != null ? String(cdpPort) : CDP_PORT;
