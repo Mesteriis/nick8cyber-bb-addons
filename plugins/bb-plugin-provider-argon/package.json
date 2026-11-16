@@ -1,0 +1,24 @@
+{
+  "name": "bb-plugin-provider-argon",
+  "version": "0.2.0",
+  "description": "ACP provider for Google Gemini Web (Argon) with multi-account CDP pooling and rate-limit rotation.",
+  "main": "index.mjs",
+  "bin": {
+    "gemini": "./bin/gemini.js",
+    "gemini-cli": "./bin/gemini.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bb": {
+    "server": "index.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:live": "node tests/test-driver.js"
+  },
+  "license": "MIT",
+  "optionalDependencies": {
+    "playwright": "^1.65.1"
+  }
+}
