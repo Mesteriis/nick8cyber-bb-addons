@@ -2,7 +2,8 @@
 title: Usage Pro — идентичность аккаунтов и локальные ошибки квот
 status: approved
 owner: coordinator
-date: 2026-11-01
+date: 2026-11-16
+revision: 2 (§6 — карточка acp-antigravity, исключение из запрета фильтра по email)
 tags: [usage-pro, codex, accounts]
 ---
 
@@ -103,3 +104,12 @@ DI передаётся в factory ДО запуска любого prewarm: use
 Точная цель: <bb-addons>/plugins/bb-plugin-usage-pro; добавить usage-pro в .bb/plugins.json, затем bb plugin install path:<bb-addons> --plugin usage-pro --yes --json. Откат: bb plugin install path:<worktrees>/bb-addons-codex-retry-queue/plugins/bb-plugin-usage-pro --yes --json (старый источник не редактируется). Private backup: <thread-storage>/usage-display-backup; dirty-main-hashes.json содержит сохранённые отпечатки двух main artifacts, также сверять с advisor-language-backup/preexisting-dirty-hashes.json.
 
 Live: у основного хоста один healthy Codex account (Team) с одним набором окон; legacy disabled account отсутствует в виджете, сохранён в Account Pooler и не меняет machine.error. У второй машины нет скопированной Pi source карточки основного хоста. Настоящие transport ошибки включённых аккаунтов не маскировать. Сравнить quota identity/window counts с исходными sources и убедиться, что auth/settings/routes/очередь не менялись. Если подключить другой account, его карточка должна сохраняться (fake tests, без смены живого аккаунта).
+
+## 6. Нативный профиль Antigravity ACP — карточка `acp-antigravity` (ревизия 2, 16.11)
+
+Код — коммиты владельца в usage-pro (публикация PLUG-270); раздел описывает поведение, решение — владельца.
+
+1. **Источник.** Отдельный таб `acp-antigravity` для нативного ACP-профиля Antigravity: OAuth-токен профиля из каталога профиля ACP Antigravity (`~/.gemini/antigravity-acp/`), refresh grant, `loadCodeAssist`, `retrieveUserQuotaSummary`, `fetchAvailableModels`. Только чтение: креденшелы не пишутся, агенты не запускаются. Кэш, дедупликация запросов, stale-предупреждение и инвалидация при смене профиля — как у остальных источников (§3).
+2. **Окна.** Отдельно для моделей Gemini и для 3P-моделей (Claude/GPT). Модельная квота читается только с бэкенда своего тира (prod-точка у consumer-тарифов отдаёт номинальную полную долю и расход не отражает). Если сгруппированная сводка не отдаёт семейство целиком, окно семейства — минимальная доля остатка среди его моделей из `fetchAvailableModels`. Суффикс окна — по времени до сброса: ≤ 10 ч — `5h`, ≤ 40 ч — `Daily`, иначе `Weekly`. При равной доле предпочитается измерение с известным временем сброса.
+3. **Отключённые бакеты** (замороженные счётчики, пока семейство ограничено более длинным окном) на карточке не показываются.
+4. **Исключение из запрета фильтра по email (§3).** Аккаунт пула agy с `priority = 0` (выведен из ротации), чей `id_token_email` совпадает с email нативного ACP-профиля, после того как нативная карточка собрала квоты, на табе agy не показывается — его квоты уже на карточке `acp-antigravity`, иначе один аккаунт был бы виден дважды. Это единственное исключение из правила «не фильтровать по email»; остальная логика Google (§1) не меняется.
