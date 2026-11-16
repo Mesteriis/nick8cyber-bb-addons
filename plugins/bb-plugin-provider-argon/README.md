@@ -2,16 +2,22 @@
 
 ACP-провайдер «Gemini (Argon)» (`acp-argon`) для bb поверх веб-интерфейса `gemini.google.com` без API-ключей.
 
-Транспорт работает по JSON-RPC 2.0 (протокол ACP) через `acp-server.mjs` и управляет изолированными headless-профилями Chrome по Chrome DevTools Protocol (`playwright-core`).
+Транспорт работает по JSON-RPC 2.0 (протокол ACP) через `acp-server.mjs` и управляет изолированными headless-профилями Chrome по Chrome DevTools Protocol (`playwright` или `playwright-core`).
 
 Архитектурное решение и контекст: `docs/adr/0027-provider-argon-acp.md`.
 Спецификация: `docs/specs/provider-argon.md`.
+
+## Требования
+
+- Google Chrome (системный `google-chrome-stable` или путь через `GEMINI_CHROME_BIN`);
+- `playwright` или `playwright-core` (драйвер пробует сначала `playwright`, затем `playwright-core`);
+- Пул аккаунтов (`pool.json`) с авторизованными профилями.
 
 ## Архитектура
 
 1. **`index.mjs`**: манифест плагина BB (`export default function plugin(bb)`), регистрация провайдера `acp-argon` с возможностями потоковой передачи (`supportsStreaming: true`), отмены (`supportsCancel: true`), уровнями рассуждений `low`, `medium`, `high`.
 2. **`acp-server.mjs`**: JSON-RPC 2.0 ACP-сервер (stdio). Управляет пулом аккаунтов (`pool.json`), файлом состояния и эксклюзивной аренды (`accounts-state.json`), разбором времени сброса квот, ротацией и корректным завершением с освобождением аренды при закрытии или `SIGTERM`.
-3. **`src/gemini-driver.js`**: веб-драйвер на базе CDP (`playwright-core`), надёжная вставка больших промптов через `execCommand('insertText')`, отслеживание многоходовых ответов строго через `findTurnTarget` без утечки предыдущего ответа, парковка вкладки на `about:blank` в простое для нулевой фоновой нагрузки CPU.
+3. **`src/gemini-driver.js`**: веб-драйвер на базе CDP (`playwright` или `playwright-core`), надёжная вставка больших промптов через `execCommand('insertText')`, отслеживание многоходовых ответов строго через `findTurnTarget` без утечки предыдущего ответа, парковка вкладки на `about:blank` в простое для нулевой фоновой нагрузки CPU.
 4. **`src/profile-manager.js`**, **`bin/gemini.js`**, **`scripts/`**: утилиты ручного входа в аккаунты Google и управления пулом профилей.
 
 ## Настройка пула аккаунтов

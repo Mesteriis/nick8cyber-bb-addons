@@ -569,6 +569,36 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   });
   const r4 = await waitForResponse(4);
   assert.ok(r4.result.configOptions);
+  const modelOpt4 = r4.result.configOptions.find((o) => o.id === "model");
+  assert.equal(modelOpt4?.currentValue, "argon", "Model must remain 'argon' when thought_level changes on argon model");
+
+  // Verify non-argon model updates to pro when thought_level is set to high
+  sendReq({
+    jsonrpc: "2.0",
+    id: 401,
+    method: "session/set_model",
+    params: { sessionId, modelId: "fast" },
+  });
+  await waitForResponse(401);
+
+  sendReq({
+    jsonrpc: "2.0",
+    id: 402,
+    method: "session/set_config_option",
+    params: { sessionId, configId: "thought_level", value: "high" },
+  });
+  const r402 = await waitForResponse(402);
+  const modelOpt402 = r402.result.configOptions.find((o) => o.id === "model");
+  assert.equal(modelOpt402?.currentValue, "pro", "Model must update to 'pro' when thought_level is high and s.model !== 'argon'");
+
+  // Reset back to argon for the rest of the test
+  sendReq({
+    jsonrpc: "2.0",
+    id: 403,
+    method: "session/set_model",
+    params: { sessionId, modelId: "argon" },
+  });
+  await waitForResponse(403);
 
   // 5. session/prompt (streaming with lease retention check during execution)
   sendReq({
