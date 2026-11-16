@@ -585,6 +585,25 @@ async function stopGeneration(page) {
   } catch {}
 }
 
+function findTurnTarget(doc, idx, promptPrefix) {
+  const responses = doc.querySelectorAll('model-response');
+  const target = responses[idx];
+  if (!target) return null;
+  const queries = doc.querySelectorAll('user-query');
+  if (queries.length === 0) return null;
+  const lastQuery = queries[queries.length - 1];
+  if (!lastQuery) return null;
+  const queryText = (lastQuery.innerText || '').trim();
+  if (promptPrefix && !queryText.includes(promptPrefix)) {
+    return null;
+  }
+  const NodeObj = typeof Node !== 'undefined' ? Node : { DOCUMENT_POSITION_FOLLOWING: 4 };
+  if (!(lastQuery.compareDocumentPosition(target) & NodeObj.DOCUMENT_POSITION_FOLLOWING)) {
+    return null;
+  }
+  return target;
+}
+
 async function waitForHistoryStabilization(
   page,
   convId,
@@ -604,7 +623,7 @@ async function waitForHistoryStabilization(
     }
     if (throwIfCancelled) await throwIfCancelled();
     const current = (await page.$$('model-response')).length;
-    if (current > 0 && current === prevCount) {
+    if (current === prevCount) {
       stableMeasurements++;
       if (stableMeasurements >= 2) {
         return current;
@@ -639,6 +658,7 @@ async function sendPrompt({
   shouldCancel = null
 }) {
   const isStrict = Boolean(strict || strictModel);
+  const promptPrefix = prompt.trim().slice(0, 40);
   // Port-local: never read the module-global CDP_PORT here. A cancelled send
   // finishing after the queue moved on must still only touch its own backend.
   const port = cdpPort != null ? String(cdpPort) : CDP_PORT;
@@ -774,22 +794,23 @@ async function sendPrompt({
     const genDeadline = Date.now() + 120000;
     for (;;) {
       await throwIfCancelled();
-      const started = await page.evaluate((count) => {
+      const started = await page.evaluate(({ idx, promptPrefix }) => {
         const responses = document.querySelectorAll('model-response');
-        const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
-        if (stopBtn !== null) return true;
-        if (responses.length > count) {
-          const queries = document.querySelectorAll('user-query');
-          if (queries.length > 0) {
-            const userQuery = queries[count];
-            if (!userQuery || !(userQuery.compareDocumentPosition(responses[count]) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-              return false;
-            }
-          }
-          return true;
+        const target = responses[idx];
+        if (!target) return false;
+        const queries = document.querySelectorAll('user-query');
+        if (queries.length === 0) return false;
+        const lastQuery = queries[queries.length - 1];
+        if (!lastQuery) return false;
+        const queryText = (lastQuery.innerText || '').trim();
+        if (promptPrefix && !queryText.includes(promptPrefix)) {
+          return false;
         }
-        return false;
-      }, initialCount);
+        if (!(lastQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+          return false;
+        }
+        return true;
+      }, { idx: initialCount, promptPrefix });
       if (started) break;
       if (Date.now() >= genDeadline) {
         throw new Error('generation did not start within 120s (no model-response, no stop button)');
@@ -809,16 +830,20 @@ async function sendPrompt({
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
 
-      const currentText = await page.evaluate((idx) => {
+      const currentText = await page.evaluate(({ idx, promptPrefix }) => {
         const responses = document.querySelectorAll('model-response');
         const target = responses[idx];
         if (!target) return null;
         const queries = document.querySelectorAll('user-query');
-        if (queries.length > 0) {
-          const userQuery = queries[idx];
-          if (!userQuery || !(userQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-            return null;
-          }
+        if (queries.length === 0) return null;
+        const lastQuery = queries[queries.length - 1];
+        if (!lastQuery) return null;
+        const queryText = (lastQuery.innerText || '').trim();
+        if (promptPrefix && !queryText.includes(promptPrefix)) {
+          return null;
+        }
+        if (!(lastQuery.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+          return null;
         }
         const mc = target.querySelector('message-content');
         // Track which source produced the text: before message-content exists
@@ -827,7 +852,7 @@ async function sendPrompt({
         // answer's start. Reset on source switch or non-prefix text.
         const src = mc ? 'mc' : 'raw';
         return { src, text: ((mc || target).innerText || '') };
-      }, initialCount);
+      }, { idx: initialCount, promptPrefix });
 
       if (currentText !== null && currentText.text.length) {
         if (currentText.src !== lastSrc || !currentText.text.startsWith(lastText)) {
@@ -848,21 +873,25 @@ async function sendPrompt({
 
       const stopButton = await page.$('button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
 
-      const hasFinishedContent = await page.evaluate((idx) => {
+      const hasFinishedContent = await page.evaluate(({ idx, promptPrefix }) => {
         const responses = document.querySelectorAll('model-response');
         const last = responses[idx];
         if (!last) return false;
         const queries = document.querySelectorAll('user-query');
-        if (queries.length > 0) {
-          const userQuery = queries[idx];
-          if (!userQuery || !(userQuery.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-            return false;
-          }
+        if (queries.length === 0) return false;
+        const lastQuery = queries[queries.length - 1];
+        if (!lastQuery) return false;
+        const queryText = (lastQuery.innerText || '').trim();
+        if (promptPrefix && !queryText.includes(promptPrefix)) {
+          return false;
+        }
+        if (!(lastQuery.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+          return false;
         }
         const hasText = (last.querySelector('message-content')?.innerText || '').trim().length > 0;
         const hasImg = last.querySelector('img, generated-image, .image-container') !== null;
         return hasText || hasImg;
-      }, initialCount);
+      }, { idx: initialCount, promptPrefix });
 
       if (!stopButton) {
         if (hasFinishedContent) {
@@ -1459,6 +1488,7 @@ module.exports = {
   RESET_REGEX_EXTENDED,
   selectModelAndThinking,
   stopGeneration,
+  findTurnTarget,
   waitForHistoryStabilization,
   getGeminiPage,
   checkRobotVerification,

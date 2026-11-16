@@ -377,7 +377,7 @@ export function parseResetTimeMs(msg, nowMs = Date.now()) {
       const mIdx = monthNames.findIndex((m) => monthStr.toLowerCase().startsWith(m));
       if (mIdx >= 0) {
         d.setMonth(mIdx, parseInt(dayStr, 10));
-        if (d.getTime() < nowMs) {
+        if (nowMs - d.getTime() > 30 * 86_400_000) {
           d.setFullYear(d.getFullYear() + 1);
         }
       }
@@ -454,8 +454,10 @@ export function classifyFailure(err, authHint = null) {
     )
   ) {
     const now = Date.now();
-    const untilMs = parsedReset ?? now + 30 * 60_000;
-    const cooldownMs = Math.max(0, untilMs - now);
+    let untilMs = parsedReset ?? now + 30 * 60_000;
+    let cooldownMs = Math.max(0, untilMs - now);
+    cooldownMs = Math.min(cooldownMs, 7 * 86_400_000);
+    untilMs = now + cooldownMs;
     return {
       category: "rate-limit",
       cooldownMs,
@@ -953,18 +955,22 @@ async function runPrompt(id, sessionId, text) {
       throw lastErr;
     });
 
-    const isCancelled = Boolean(result && (result.cancelled || result.stopReason === "cancelled"));
-    out({
-      jsonrpc: "2.0",
-      id,
-      result: { stopReason: isCancelled ? "cancelled" : "end_turn" },
-    });
+    if (!isExiting) {
+      const isCancelled = Boolean(result && (result.cancelled || result.stopReason === "cancelled"));
+      out({
+        jsonrpc: "2.0",
+        id,
+        result: { stopReason: isCancelled ? "cancelled" : "end_turn" },
+      });
+    }
     if (s.activeGen === gen) s.activeGen = null;
   } catch (err) {
     if (s.activeGen === gen) s.activeGen = null;
-    const hint = FAKE ? null : (err.authHint ?? (s.backend ? await probeAuthHint(s.backend) : null));
-    const msg = hint ? `${hint}\n\n(driver error: ${err.message})` : `Gemini web driver error: ${err.message}`;
-    out({ jsonrpc: "2.0", id, error: { code: -32000, message: msg } });
+    if (!isExiting) {
+      const hint = FAKE ? null : (err.authHint ?? (s.backend ? await probeAuthHint(s.backend) : null));
+      const msg = hint ? `${hint}\n\n(driver error: ${err.message})` : `Gemini web driver error: ${err.message}`;
+      out({ jsonrpc: "2.0", id, error: { code: -32000, message: msg } });
+    }
   }
 }
 
@@ -980,7 +986,7 @@ async function cleanShutdown() {
     if (activeAttempt) {
       await Promise.race([
         activeAttempt.catch(() => {}),
-        sleep(12_000),
+        sleep(2_000),
       ]);
     }
     if (activeBackendId) {

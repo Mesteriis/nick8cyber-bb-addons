@@ -23,6 +23,7 @@ const {
   ModelUnavailable,
   RESET_REGEX_EXTENDED,
   waitForHistoryStabilization,
+  findTurnTarget,
 } = driver;
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -127,6 +128,20 @@ test("2. parseResetTimeMs parses English and Russian quota reset formats", () =>
   assert.equal(dYear.getHours(), 2);
   assert.equal(dYear.getMinutes(), 19);
 
+  // Past date within 30 days (today 1 minute ago) must NOT roll over to next year
+  const pastMinuteNow = new Date("2026-11-16T02:20:00.000Z").getTime();
+  const tPastMinute = parseResetTimeMs("Limit resets Nov 16, 2:19 AM", pastMinuteNow);
+  assert.ok(tPastMinute !== null);
+  const dPastMinute = new Date(tPastMinute - 2 * 60_000);
+  assert.equal(dPastMinute.getFullYear(), 2026, "Must not advance year for recent time today");
+  assert.equal(dPastMinute.getMonth(), 10);
+  assert.equal(dPastMinute.getDate(), 16);
+  assert.equal(dPastMinute.getHours(), 2);
+  assert.equal(dPastMinute.getMinutes(), 19);
+  // Cooldown from this reset time must be <= 2 minutes (or 0)
+  const diffCooldown = Math.max(0, tPastMinute - pastMinuteNow);
+  assert.ok(diffCooldown <= 2 * 60_000, `Cooldown must be <= 2 minutes, got ${diffCooldown}ms`);
+
   // Unrelated string
   assert.equal(parseResetTimeMs("Everything is normal"), null);
 });
@@ -137,6 +152,10 @@ test("3. classifyFailure correctly classifies errors", () => {
   assert.equal(c1.category, "rate-limit");
   assert.equal(c1.rotatable, true);
   assert.ok(c1.cooldownMs > 0);
+
+  // rate-limit cooldown capped at 7 days
+  const cFar = classifyFailure(new Error("Limit resets Dec 30, 10:00 AM"));
+  assert.ok(cFar.cooldownMs <= 7 * 86_400_000, "Cooldown must be capped at 7 days");
 
   // rate-limit from thinking level
   const c2 = classifyFailure(new Error("Thinking level is rate-limited"));
@@ -241,10 +260,14 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
     }
   );
 
-  // Verification that responses[idx] is validated after corresponding user-query
+  // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
-    driverSrc.includes("queries[idx]"),
-    "gemini-driver.js must check user-query[idx]"
+    driverSrc.includes("queries[queries.length - 1]"),
+    "gemini-driver.js must check last user-query"
+  );
+  assert.ok(
+    driverSrc.includes("promptPrefix"),
+    "gemini-driver.js must check promptPrefix"
   );
   assert.ok(
     driverSrc.includes("DOCUMENT_POSITION_FOLLOWING"),
@@ -278,6 +301,22 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   assert.equal(stabilizedCount, 2, "Must stabilize at 2 model-responses");
   assert.ok(historyCalls >= 5, "Must take multiple measurements to confirm stability");
 
+  // waitForHistoryStabilization stabilizes even when count === 0
+  let emptyCalls = 0;
+  const mockEmptyPage = {
+    $$: async () => {
+      emptyCalls++;
+      return [];
+    },
+    waitForTimeout: async () => {},
+  };
+  const emptyCount = await waitForHistoryStabilization(mockEmptyPage, "conv-empty", {
+    intervalMs: 5,
+    ceilingMs: 10000,
+  });
+  assert.equal(emptyCount, 0, "Must stabilize at 0 model-responses");
+  assert.ok(emptyCalls >= 3, "Must take at least 2 stable measurements before stabilizing at 0");
+
   // For a new chat (no convId), it must return immediately on the first query
   let newChatCalls = 0;
   const mockNewChatPage = {
@@ -290,6 +329,91 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   const newChatCount = await waitForHistoryStabilization(mockNewChatPage, null);
   assert.equal(newChatCount, 3);
   assert.equal(newChatCalls, 1, "Must return immediately without waiting when convId is null");
+
+  // Mock DOM test: old query + old response, new query with promptPrefix, but no new model-response yet
+  const NODE_FOLLOWING = 4;
+  const NODE_PRECEDING = 2;
+
+  const nodeQuery0 = {
+    id: "query-0",
+    innerText: "Old user question",
+    compareDocumentPosition(other) {
+      if (other.id === "resp-0" || other.id === "query-1" || other.id === "resp-1") return NODE_FOLLOWING;
+      return 0;
+    },
+  };
+
+  const nodeResp0 = {
+    id: "resp-0",
+    innerText: "Old model response",
+    querySelector(sel) {
+      if (sel === "message-content") return { innerText: "Old model response" };
+      return null;
+    },
+    compareDocumentPosition(other) {
+      if (other.id === "query-0") return NODE_PRECEDING;
+      if (other.id === "query-1" || other.id === "resp-1") return NODE_FOLLOWING;
+      return 0;
+    },
+  };
+
+  const nodeQuery1 = {
+    id: "query-1",
+    innerText: "New user prompt for turn 2",
+    compareDocumentPosition(other) {
+      if (other.id === "query-0" || other.id === "resp-0") return NODE_PRECEDING;
+      if (other.id === "resp-1") return NODE_FOLLOWING;
+      return 0;
+    },
+  };
+
+  const nodeResp1 = {
+    id: "resp-1",
+    innerText: "New model response for turn 2",
+    querySelector(sel) {
+      if (sel === "message-content") return { innerText: "New model response for turn 2" };
+      return null;
+    },
+    compareDocumentPosition(other) {
+      if (other.id === "query-0" || other.id === "resp-0" || other.id === "query-1") return NODE_PRECEDING;
+      return 0;
+    },
+  };
+
+  // State 1: only query0, resp0 and query1 exist in DOM (model-response 1 has not appeared yet)
+  const mockDocBeforeResp = {
+    querySelectorAll(sel) {
+      if (sel === "user-query") return [nodeQuery0, nodeQuery1];
+      if (sel === "model-response") return [nodeResp0];
+      return [];
+    },
+  };
+
+  const testPrefix = "New user prompt";
+
+  // Check turn target at index 1: must be null (resp1 not in DOM)
+  const targetNewTurn = findTurnTarget(mockDocBeforeResp, 1, testPrefix);
+  assert.equal(targetNewTurn, null, "Turn 1 target must be null when model-response[1] has not appeared yet");
+
+  // Check if someone checked index 0 or fallback: old response must NOT be accepted as new response
+  const targetOldFallback = findTurnTarget(mockDocBeforeResp, 0, testPrefix);
+  assert.equal(
+    targetOldFallback,
+    null,
+    "Old model-response[0] must not be accepted because it precedes the last user-query"
+  );
+
+  // State 2: resp1 appears in DOM following query1
+  const mockDocWithResp = {
+    querySelectorAll(sel) {
+      if (sel === "user-query") return [nodeQuery0, nodeQuery1];
+      if (sel === "model-response") return [nodeResp0, nodeResp1];
+      return [];
+    },
+  };
+
+  const targetSuccess = findTurnTarget(mockDocWithResp, 1, testPrefix);
+  assert.equal(targetSuccess, nodeResp1, "Turn 1 target must correctly resolve to nodeResp1 when it appears");
 });
 
 test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease retention and selective cancel", async () => {
@@ -480,34 +604,13 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const stCancel = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(stCancel.leases || {}, {}, "Leases must be empty after cancel");
 
-  // 8. Close stdin during active prompt execution with ARGON_FAKE_DELAY_MS
-  sendReq({
-    jsonrpc: "2.0",
-    id: 10,
-    method: "session/prompt",
-    params: {
-      sessionId,
-      prompt: [{ type: "text", text: "Prompt while closing stdin" }],
-    },
-  });
-  await waitForNotification("session/update");
-
-  // Verify lease is actively held before stdin close
-  assert.ok(fs.existsSync(statePath));
-  const stBeforeStdinClose = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.ok(
-    stBeforeStdinClose.leases && stBeforeStdinClose.leases["fake-acc-1"],
-    "Lease must be held during prompt execution before stdin close"
-  );
-  assert.equal(stBeforeStdinClose.leases["fake-acc-1"].pid, serverProc.pid);
-
-  // Close stdin while turn is active
+  // 8. Normal exit of test 5 server
   serverProc.stdin.end();
   await new Promise((resolve) => serverProc.on("exit", resolve));
 
   if (fs.existsSync(statePath)) {
     const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    assert.deepEqual(st.leases || {}, {}, "Leases must be empty after closing stdin during active turn");
+    assert.deepEqual(st.leases || {}, {}, "Leases must be empty after closing stdin");
   }
 
   // Cleanup tmpDir
@@ -611,6 +714,132 @@ test("6. Automatic lease release upon SIGTERM during prompt execution", async ()
     const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
     assert.deepEqual(st.leases || {}, {}, "Leases must be empty after SIGTERM");
   }
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 releases lease swiftly", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "argon-stdin-delay-test-"));
+  const poolFile = path.join(tmpDir, "pool.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [
+        {
+          id: "fake-acc-stdin",
+          email: "fakestdin@example.com",
+          profileDir: path.join(tmpDir, "p1"),
+          cdpPort: 9222,
+          priority: 10,
+        },
+      ],
+    })
+  );
+
+  const serverProc = spawn("node", ["acp-server.mjs"], {
+    cwd: PLUGIN_ROOT,
+    env: {
+      ...process.env,
+      ARGON_FAKE: "1",
+      ARGON_FAKE_DELAY_MS: "10000",
+      ARGON_STATE_DIR: tmpDir,
+      ARGON_POOL_FILE: poolFile,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const lines = [];
+  serverProc.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) {
+        try {
+          lines.push(JSON.parse(line.trim()));
+        } catch {}
+      }
+    }
+  });
+
+  function sendReq(req) {
+    serverProc.stdin.write(JSON.stringify(req) + "\n");
+  }
+
+  async function waitForResponse(id, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) {
+        return lines.splice(idx, 1)[0];
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for response id=${id}`);
+  }
+
+  async function waitForNotification(method, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.method === method);
+      if (idx >= 0) {
+        return lines.splice(idx, 1)[0];
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for notification ${method}`);
+  }
+
+  // 1. initialize
+  sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  await waitForResponse(1);
+
+  // 2. session/new
+  sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
+
+  // 3. session/prompt (long running with 10s delay)
+  sendReq({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "Long turn prompt for stdin close test" }],
+    },
+  });
+
+  // Wait for chunk notification to ensure prompt is actively running
+  await waitForNotification("session/update");
+
+  // Verify lease is actively held
+  const statePath = path.join(tmpDir, "accounts-state.json");
+  assert.ok(fs.existsSync(statePath));
+  const stDuring = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(
+    stDuring.leases && stDuring.leases["fake-acc-stdin"],
+    "Lease must be held during prompt execution before stdin close"
+  );
+  assert.equal(stDuring.leases["fake-acc-stdin"].pid, serverProc.pid);
+
+  // Close stdin during execution
+  const closeStartTime = Date.now();
+  serverProc.stdin.end();
+
+  await new Promise((resolve) => serverProc.on("exit", resolve));
+  const exitDuration = Date.now() - closeStartTime;
+
+  assert.ok(
+    exitDuration < 3000,
+    `Server must exit faster than 3000ms upon stdin close (took ${exitDuration}ms)`
+  );
+
+  if (fs.existsSync(statePath)) {
+    const stAfter = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.deepEqual(stAfter.leases || {}, {}, "Lease must be released after stdin close");
+  }
+
+  // Verify that response with stopReason 'end_turn' was NOT sent
+  const endTurnMsg = lines.find((l) => l.result?.stopReason === "end_turn");
+  assert.equal(endTurnMsg, undefined, "Response with stopReason 'end_turn' must not be sent on stdin close");
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
